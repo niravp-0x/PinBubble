@@ -1,25 +1,37 @@
 ﻿using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.InteropServices;
+using System.Threading.Tasks;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
-using Microsoft.Win32;
+using System.Windows.Media.Effects;
 
 namespace PinBubble;
 
 public partial class MainWindow : Window
 {
+    [DllImport("user32.dll")]
+    private static extern bool GetCursorPos(out POINT lpPoint);
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct POINT { public int X; public int Y; }
+
     private readonly string _textFilePath;
-    private readonly string[] _labels = { "ONE", "TWO", "THR", "FOR", "FIV", "SIX", "SEV", "EIG", "NIN", "TEN" };
-    private string[] _snippets = new string[10];
+    private string[] _labels = Array.Empty<string>();
+    private string[] _snippets = Array.Empty<string>();
     private FileSystemWatcher? _watcher;
     private System.Windows.Threading.DispatcherTimer? _reloadDebounce;
     private bool _expanded;
-    private bool _dragging;
-    private System.Windows.Point _dragStartMouse;
+    private bool _isDrag;
+    private POINT _dragStartCursor;
     private System.Windows.Point _dragStartWindow;
+
+    private static readonly SolidColorBrush BubbleDefault = new SolidColorBrush(Color.FromRgb(45, 45, 48));
+    private static readonly SolidColorBrush BubbleHover = new SolidColorBrush(Color.FromRgb(102, 185, 51));
+    private static readonly SolidColorBrush BubbleClicked = new SolidColorBrush(Color.FromRgb(0, 255, 0));
 
     public MainWindow()
     {
@@ -30,24 +42,36 @@ public partial class MainWindow : Window
         BuildBubbles();
         SetupWatcher();
         Loaded += (_, _) => SnapToNearestEdge();
+        KeyDown += (_, e) => { if (e.Key == Key.Escape && _expanded) Collapse(); };
     }
 
-    private void Window_Deactivated(object sender, EventArgs e) => Topmost = true;
+    private void Window_Deactivated(object sender, EventArgs e)
+    {
+        if (_expanded) Collapse();
+        Topmost = true;
+    }
 
     private void EnsureFileExists()
     {
         if (!File.Exists(_textFilePath))
-            File.WriteAllLines(_textFilePath, new string[10]);
+            File.WriteAllText(_textFilePath,
+                "Label1, Your first snippet text here\n" +
+                "Label2, Your second snippet text here\n");
     }
 
     private void SetupWatcher()
     {
-        _reloadDebounce = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(200) };
-        _reloadDebounce.Tick += (_, _) => { _reloadDebounce.Stop(); LoadSnippets(); };
+        _reloadDebounce = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(300) };
+        _reloadDebounce.Tick += (_, _) =>
+        {
+            _reloadDebounce.Stop();
+            LoadSnippets();
+            BuildBubbles(); // Rebuild bubbles when file changes
+        };
 
         _watcher = new FileSystemWatcher(Path.GetDirectoryName(_textFilePath)!, Path.GetFileName(_textFilePath))
         {
-            NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName
+            NotifyFilter = NotifyFilters.LastWrite
         };
         _watcher.Changed += (_, _) => Dispatcher.Invoke(() => _reloadDebounce!.Start());
         _watcher.EnableRaisingEvents = true;
@@ -57,8 +81,23 @@ public partial class MainWindow : Window
     {
         try
         {
-            var lines = File.ReadAllLines(_textFilePath);
-            _snippets = Enumerable.Range(0, 10).Select(i => i < lines.Length ? lines[i] : "").ToArray();
+            var lines = File.ReadAllLines(_textFilePath)
+                .Where(l => !string.IsNullOrWhiteSpace(l) && l.Contains(','))
+                .ToArray();
+
+            _labels = new string[lines.Length];
+            _snippets = new string[lines.Length];
+
+            for (int i = 0; i < lines.Length; i++)
+            {
+                var commaIndex = lines[i].IndexOf(',');
+                var labelFull = lines[i][..commaIndex].Trim();
+                var value = lines[i][(commaIndex + 1)..].Trim();
+
+                // Truncate label to 3 chars
+                _labels[i] = labelFull.Length > 3 ? labelFull[..3].ToUpper() : labelFull.ToUpper();
+                _snippets[i] = value;
+            }
         }
         catch { }
     }
@@ -66,33 +105,56 @@ public partial class MainWindow : Window
     private void BuildBubbles()
     {
         BubblesHost.Children.Clear();
-        for (int i = 0; i < 10; i++)
+
+        // Dynamic width based on count - 5 per row
+        int count = _labels.Length;
+        int cols = Math.Min(count, 5);
+        int rows = (int)Math.Ceiling(count / 5.0);
+        double wNeeded = 25 + cols * 56 + 20;
+        double hNeeded = 25 + rows * 64 + 20;
+
+        // Store for expand
+        _expandWidth = Math.Max(wNeeded, 100);
+        _expandHeight = Math.Max(hNeeded, 100);
+
+        for (int i = 0; i < count; i++)
         {
             var btn = new Button
             {
-                Width = 40,
-                Height = 40,
+                Width = 44,
+                Height = 44,
                 Content = _labels[i],
-                FontSize = 11,
-                FontWeight = FontWeights.SemiBold,
-                Background = new SolidColorBrush(Color.FromRgb(30, 144, 255)),
+                FontSize = 12,
+                FontWeight = FontWeights.Bold,
                 Foreground = Brushes.White,
-                BorderThickness = new Thickness(0),
+                Background = BubbleDefault,
+                BorderThickness = new Thickness(1),
+                BorderBrush = new SolidColorBrush(Color.FromRgb(80, 80, 80)),
                 Tag = i,
-                Cursor = Cursors.Hand
+                Cursor = Cursors.Hand,
+                Margin = new Thickness(4)
             };
+
             btn.Click += Bubble_Click;
+            btn.MouseEnter += (s, _) => { if (s is Button b) b.Background = BubbleHover; };
+            btn.MouseLeave += (s, _) => { if (s is Button b) b.Background = BubbleDefault; };
             btn.Template = CreateRoundButtonTemplate();
             BubblesHost.Children.Add(btn);
         }
     }
 
+    private double _expandWidth = 340;
+    private double _expandHeight = 160;
+
     private ControlTemplate CreateRoundButtonTemplate()
     {
         var template = new ControlTemplate(typeof(Button));
         var border = new FrameworkElementFactory(typeof(Border));
-        border.SetValue(Border.CornerRadiusProperty, new CornerRadius(20));
+        border.SetValue(Border.CornerRadiusProperty, new CornerRadius(22));
         border.SetValue(Border.BackgroundProperty, new TemplateBindingExtension(Button.BackgroundProperty));
+        border.SetValue(Border.BorderBrushProperty, new TemplateBindingExtension(Button.BorderBrushProperty));
+        border.SetValue(Border.BorderThicknessProperty, new TemplateBindingExtension(Button.BorderThicknessProperty));
+        border.SetValue(Border.EffectProperty, new DropShadowEffect { Color = Colors.Black, BlurRadius = 4, ShadowDepth = 1, Opacity = 0.6 });
         var presenter = new FrameworkElementFactory(typeof(ContentPresenter));
         presenter.SetValue(ContentPresenter.HorizontalAlignmentProperty, HorizontalAlignment.Center);
         presenter.SetValue(ContentPresenter.VerticalAlignmentProperty, VerticalAlignment.Center);
@@ -101,11 +163,17 @@ public partial class MainWindow : Window
         return template;
     }
 
-    private void Bubble_Click(object sender, RoutedEventArgs e)
+    private async void Bubble_Click(object sender, RoutedEventArgs e)
     {
         if (sender is Button b && b.Tag is int idx && idx < _snippets.Length)
         {
-            try { System.Windows.Clipboard.SetText(_snippets[idx]); }
+            try
+            {
+                System.Windows.Clipboard.SetText(_snippets[idx]);
+                b.Background = BubbleClicked;
+                await Task.Delay(150);
+                b.Background = BubbleDefault;
+            }
             catch { }
             Collapse();
         }
@@ -119,11 +187,12 @@ public partial class MainWindow : Window
 
     private void Expand()
     {
+        LoadSnippets();
+        BuildBubbles();
         _expanded = true;
-        Width = 320;
-        Height = 140;
-        Canvas.SetLeft(BubblesHost, 0);
-        Canvas.SetTop(BubblesHost, 0);
+        Width = _expandWidth;
+        Height = _expandHeight;
+        Pin.Opacity = 0.3;
         BubblesHost.Visibility = Visibility.Visible;
         PositionBubbles();
     }
@@ -133,43 +202,46 @@ public partial class MainWindow : Window
         _expanded = false;
         Width = 64;
         Height = 64;
+        Pin.Opacity = 1.0;
+        Pin.Background = new SolidColorBrush(Color.FromRgb(102, 185, 51));
         BubblesHost.Visibility = Visibility.Collapsed;
     }
 
     private void Root_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
-        _dragging = true;
-        _dragStartMouse = e.GetPosition(null);
+        GetCursorPos(out _dragStartCursor);
         _dragStartWindow = new System.Windows.Point(Left, Top);
+        _isDrag = false;
         CaptureMouse();
     }
 
     private void Root_MouseMove(object sender, MouseEventArgs e)
     {
-        if (!_dragging) return;
-        var cur = e.GetPosition(null);
-        Left = _dragStartWindow.X + (cur.X - _dragStartMouse.X);
-        Top = _dragStartWindow.Y + (cur.Y - _dragStartMouse.Y);
+        if (e.LeftButton != MouseButtonState.Pressed) return;
+        GetCursorPos(out POINT cur);
+        int dx = cur.X - _dragStartCursor.X;
+        int dy = cur.Y - _dragStartCursor.Y;
+        if (!_isDrag && Math.Abs(dx) < 4 && Math.Abs(dy) < 4) return;
+        _isDrag = true;
+        Left = _dragStartWindow.X + dx;
+        Top = _dragStartWindow.Y + dy;
     }
 
     private void Root_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
     {
-        if (!_dragging) return;
-        _dragging = false;
         ReleaseMouseCapture();
-        SnapToNearestEdge();
-
-        double movedDistance = Math.Abs(Left - _dragStartWindow.X) + Math.Abs(Top - _dragStartWindow.Y);
-        if (movedDistance <= 4) ToggleExpand();
+        if (_isDrag) SnapToNearestEdge();
+        else ToggleExpand();
+        _isDrag = false;
     }
 
     private void SnapToNearestEdge()
     {
         var wa = SystemParameters.WorkArea;
         double leftDist = Math.Abs(Left - wa.Left);
-        double rightDist = Math.Abs((Left + Width) - wa.Right);
+        double rightDist = Math.Abs(Left + Width - wa.Right);
         double topDist = Math.Abs(Top - wa.Top);
-        double bottomDist = Math.Abs((Top + Height) - wa.Bottom);
+        double bottomDist = Math.Abs(Top + Height - wa.Bottom);
         var minDist = Math.Min(Math.Min(leftDist, rightDist), Math.Min(topDist, bottomDist));
 
         if (minDist == leftDist) Left = wa.Left;
@@ -183,21 +255,29 @@ public partial class MainWindow : Window
 
     private void PositionBubbles()
     {
-        // 5x2 grid layout - perfectly visible
-        double startX = 20;
-        double startY = 20;
-        double spacingX = 52;
-        double spacingY = 52;
+        var wa = SystemParameters.WorkArea;
+        double startX = 25;
+        double startY = 25;
+        double spacingX = 56;
+        double spacingY = 64;
+
+        if (Math.Abs(Left + _expandWidth - wa.Right) < 50)
+            startX = _expandWidth - 5 * spacingX - 20;
 
         for (int i = 0; i < BubblesHost.Children.Count; i++)
         {
             int row = i / 5;
             int col = i % 5;
-            double x = startX + col * spacingX;
-            double y = startY + row * spacingY;
-            Canvas.SetLeft((UIElement)BubblesHost.Children[i], x);
-            Canvas.SetTop((UIElement)BubblesHost.Children[i], y);
+            Canvas.SetLeft((UIElement)BubblesHost.Children[i], startX + col * spacingX);
+            Canvas.SetTop((UIElement)BubblesHost.Children[i], startY + row * spacingY);
         }
+    }
+
+    private void OpenInVsCode_Click(object sender, RoutedEventArgs e)
+    {
+        EnsureFileExists();
+        try { Process.Start(new ProcessStartInfo("code", $"\"{_textFilePath}\"") { UseShellExecute = true }); }
+        catch { Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{_textFilePath}\"") { UseShellExecute = true }); }
     }
 
     private void OpenInNotepad_Click(object sender, RoutedEventArgs e)
@@ -206,20 +286,11 @@ public partial class MainWindow : Window
         Process.Start(new ProcessStartInfo("notepad.exe", $"\"{_textFilePath}\"") { UseShellExecute = true });
     }
 
-    private void OpenInVsCode_Click(object sender, RoutedEventArgs e)
+    private void OpenInExplorer_Click(object sender, RoutedEventArgs e)
     {
         EnsureFileExists();
-        try
-        {
-            Process.Start(new ProcessStartInfo("code", $"\"{_textFilePath}\"") { UseShellExecute = true });
-        }
-        catch
-        {
-            Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{_textFilePath}\"") { UseShellExecute = true });
-        }
+        Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{_textFilePath}\"") { UseShellExecute = true });
     }
-
-    private void Reload_Click(object sender, RoutedEventArgs e) => LoadSnippets();
 
     private void Exit_Click(object sender, RoutedEventArgs e) => Close();
 }

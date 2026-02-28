@@ -13,36 +13,36 @@
         MouseLeftButtonUp="Root_MouseLeftButtonUp"
         MouseMove="Root_MouseMove">
 
-  <Grid>
-    <!-- Pinned icon -->
-    <Border x:Name="Pin"
+    <Grid>
+        <!-- Pinned icon - Razer Green -->
+        <Border x:Name="Pin"
             Width="52" Height="52"
             CornerRadius="26"
-            Background="#FF2E2E2E"
+            Background="#FF429B00"
             BorderBrush="#55FFFFFF"
             BorderThickness="1"
             HorizontalAlignment="Center"
             VerticalAlignment="Center">
-      <TextBlock Text="🔑"
+            <TextBlock Text="🔑"
                  Foreground="White"
                  FontWeight="SemiBold"
                  HorizontalAlignment="Center"
                  VerticalAlignment="Center" Cursor="Hand"/>
-    </Border>
+        </Border>
 
-    <!-- Expanded bubbles -->
-    <Canvas x:Name="BubblesHost" Visibility="Collapsed" IsHitTestVisible="True">
-      <!-- Buttons created in code-behind -->
-    </Canvas>
+        <!-- Expanded bubbles -->
+        <Canvas x:Name="BubblesHost" Visibility="Collapsed" IsHitTestVisible="True">
+            <!-- Buttons created in code-behind -->
+        </Canvas>
 
-    <Grid.ContextMenu>
-      <ContextMenu>
-        <MenuItem Header="Open text.text in VS Code" Click="OpenInVsCode_Click"/>
-        <MenuItem Header="Open text.text in Notepad" Click="OpenInNotepad_Click"/>
-        <Separator/>
-        <MenuItem Header="Reload" Click="Reload_Click"/>
-        <MenuItem Header="Exit" Click="Exit_Click"/>
-      </ContextMenu>
-    </Grid.ContextMenu>
-  </Grid>
+        <Grid.ContextMenu>
+            <ContextMenu>
+                <MenuItem Header="Open text.text in VS Code" Click="OpenInVsCode_Click"/>
+                <MenuItem Header="Open text.text in Notepad" Click="OpenInNotepad_Click"/>
+                <MenuItem Header="Find text.text" Click="OpenInExplorer_Click"/>
+                <Separator/>
+                <MenuItem Header="Exit" Click="Exit_Click"/>
+            </ContextMenu>
+        </Grid.ContextMenu>
+    </Grid>
 </Window>

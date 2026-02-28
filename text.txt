@@ -1,10 +1,20 @@
-﻿Text 1
-Text 2
-Text 3
-Text 4
-Text 5
-Text 6
-Text 7
-Text 8
-Text 9
-Text 10
+﻿Email,darks@example.com
+Phone,+61 400 000 000
+Addr,123 Main St Melbourne VIC 3000
+URL,https://mywebsite.com
+Pass,MyP@ssw0rd123
+SQL,SELECT * FROM users WHERE active=1
+JS,console.log('Hello World');
+CSS,.btn { background: #66B933; }
+HTML,<div class="key">🔑</div>
+API,POST /api/v1/auth/login
+Git,git pull origin main
+CMD,dir /s *.txt
+NPM,npm install react@latest
+SQL2,UPDATE users SET status='active'
+PATH,C:\Users\Nirav Admin\Documents
+ENV,NODE_ENV=production
+CMD2,taskkill /f /im chrome.exe
+REG,reg add HKCU\Software\Test /v Value /t REG_SZ /d "test"
+URL2,https://razer.com/synapse
+Note,Quick note for Melbourne meeting 3pm
