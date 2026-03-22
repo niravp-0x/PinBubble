@@ -40,6 +40,7 @@ public partial class MainWindow : Window
     private bool _isDrag;
     private POINT _dragStartCursor;
     private System.Windows.Point _dragStartWindow;
+    private bool _isPinned = true; // Default to pinned
 
     private static readonly SolidColorBrush BubbleDefault = new SolidColorBrush(WpfColor.FromRgb(45, 45, 48));
     private static readonly SolidColorBrush BubbleHover = new SolidColorBrush(WpfColor.FromRgb(102, 185, 51));
@@ -60,6 +61,8 @@ public partial class MainWindow : Window
         SetupWatcher();
         SetupTrayIcon();
         Loaded += (_, _) => SnapToNearestEdge();
+        Loaded += (_, _) => UpdateTaskbarMenuText();
+        Loaded += (_, _) => UpdatePinMenuText();
         KeyDown += (_, e) => { if (e.Key == Key.Escape && _expanded) Collapse(); };
     }
 
@@ -180,8 +183,11 @@ public partial class MainWindow : Window
             _trayMenu = new WinForms.ContextMenuStrip();
             _trayMenu.Items.Add("Open", null, (_, _) =>
             {
+                ShowInTaskbar = true;
+                WindowState = WindowState.Normal;
                 Show();
                 Activate();
+                UpdateTaskbarMenuText();
             });
             _trayMenu.Items.Add("Exit", null, (_, _) => Close());
 
@@ -200,8 +206,11 @@ public partial class MainWindow : Window
 
             _trayIcon.DoubleClick += (_, _) =>
             {
+                ShowInTaskbar = true;
+                WindowState = WindowState.Normal;
                 Show();
                 Activate();
+                UpdateTaskbarMenuText();
             };
         }
         catch
@@ -213,7 +222,8 @@ public partial class MainWindow : Window
     private void Window_Deactivated(object sender, EventArgs e)
     {
         if (_expanded) Collapse();
-        Topmost = true;
+        if (_isPinned)
+            Topmost = true;
     }
 
     private void SetupWatcher()
@@ -493,70 +503,474 @@ public partial class MainWindow : Window
 
         using var dialog = new WinForms.Form
         {
-            Width = 720,
-            Height = 520,
+            Width = 800,
+            Height = 600,
             FormBorderStyle = WinForms.FormBorderStyle.Sizable,
             StartPosition = WinForms.FormStartPosition.CenterScreen,
             Text = "PinBubble - Edit Snippets",
             MinimizeBox = false,
-            TopMost = true
+            MaximizeBox = false,
+            TopMost = true,
+            KeyPreview = true
         };
 
-        var infoLabel = new WinForms.Label
+        var isDecrypted = false;
+        var originalLines = plaintext.Split('\n');
+        var hasChanges = false;
+        var isUpdatingProgrammatically = false;
+        
+        // Session-level storage for decrypted line values (maps label to full line content)
+        var lineContentMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+
+        // Toolbar panel
+        var toolbar = new WinForms.Panel
         {
-            Left = 12,
-            Top = 10,
-            Width = 680,
-            Text = "One snippet per line: Label, Your snippet text"
+            Dock = WinForms.DockStyle.Top,
+            Height = 70,
+            BorderStyle = WinForms.BorderStyle.FixedSingle,
+            BackColor = Drawing.Color.FromArgb(240, 240, 240)
         };
 
-        var editor = new WinForms.TextBox
+        // Status indicator - Circle
+        var statusCircle = new WinForms.Panel
         {
-            Left = 12,
-            Top = 32,
-            Width = 680,
-            Height = 410,
-            Multiline = true,
-            ScrollBars = WinForms.ScrollBars.Vertical,
-            AcceptsReturn = true,
-            AcceptsTab = true,
-            WordWrap = true,
-            Font = new Drawing.Font("Consolas", 10),
-            Text = NormalizeForEditor(plaintext)
+            Left = 30,
+            Top = 20,
+            Width = 30,
+            Height = 30,
+            BackColor = Drawing.Color.Green
         };
+        // Create circular appearance
+        var circlePath = new System.Drawing.Drawing2D.GraphicsPath();
+        circlePath.AddEllipse(0, 0, statusCircle.Width, statusCircle.Height);
+        statusCircle.Region = new System.Drawing.Region(circlePath);
+        toolbar.Controls.Add(statusCircle);
 
-        var saveButton = new WinForms.Button
+        // Button: Decrypt All (toggle) - only visible when Control key is held
+        var btnDecryptAll = new WinForms.Button
+        {
+            Text = "Show All",
+            Left = 80,
+            Top = 12,
+            Width = 110,
+            Height = 46,
+            FlatStyle = WinForms.FlatStyle.Flat,
+            BackColor = Drawing.Color.White,
+            Font = new Drawing.Font("Segoe UI", 9, Drawing.FontStyle.Bold),
+            Cursor = WinForms.Cursors.Hand,
+            Visible = false,
+            Enabled = false
+        };
+        btnDecryptAll.FlatAppearance.BorderColor = Drawing.Color.Gray;
+
+        // Button: Toggle Current Line
+        var btnToggleCurrent = new WinForms.Button
+        {
+            Text = "Toggle Line",
+            Left = 205,
+            Top = 12,
+            Width = 120,
+            Height = 46,
+            FlatStyle = WinForms.FlatStyle.Flat,
+            BackColor = Drawing.Color.White,
+            Font = new Drawing.Font("Segoe UI", 9, Drawing.FontStyle.Bold),
+            Cursor = WinForms.Cursors.Hand
+        };
+        btnToggleCurrent.FlatAppearance.BorderColor = Drawing.Color.Gray;
+
+        // Button: Save - only visible when changes are made
+        var btnSave = new WinForms.Button
         {
             Text = "Save",
-            Left = 536,
-            Width = 75,
-            Top = 450,
-            DialogResult = WinForms.DialogResult.OK
+            Left = 580,
+            Top = 12,
+            Width = 90,
+            Height = 46,
+            FlatStyle = WinForms.FlatStyle.Flat,
+            BackColor = Drawing.Color.LightGreen,
+            Font = new Drawing.Font("Segoe UI", 9, Drawing.FontStyle.Bold),
+            Cursor = WinForms.Cursors.Hand,
+            DialogResult = WinForms.DialogResult.OK,
+            Visible = false
         };
+        btnSave.FlatAppearance.BorderColor = Drawing.Color.DarkGreen;
 
-        var cancelButton = new WinForms.Button
+        // Button: Cancel
+        var btnCancel = new WinForms.Button
         {
             Text = "Cancel",
-            Left = 617,
-            Width = 75,
-            Top = 450,
-            DialogResult = WinForms.DialogResult.Cancel
+            Left = 680,
+            Top = 12,
+            Width = 90,
+            Height = 46,
+            FlatStyle = WinForms.FlatStyle.Flat,
+            BackColor = Drawing.Color.LightCoral,
+            Font = new Drawing.Font("Segoe UI", 9, Drawing.FontStyle.Bold),
+            Cursor = WinForms.Cursors.Hand
+        };
+        btnCancel.FlatAppearance.BorderColor = Drawing.Color.DarkRed;
+
+        toolbar.Controls.Add(btnDecryptAll);
+        toolbar.Controls.Add(btnToggleCurrent);
+        toolbar.Controls.Add(btnSave);
+        toolbar.Controls.Add(btnCancel);
+
+        // Format instruction label (below toolbar)
+        var lblFormat = new WinForms.Label
+        {
+            Text = "#Comment: Format > Label, Snippet text",
+            Dock = WinForms.DockStyle.Top,
+            Height = 25,
+            TextAlign = Drawing.ContentAlignment.MiddleLeft,
+            BackColor = Drawing.Color.FromArgb(250, 250, 250),
+            ForeColor = Drawing.Color.FromArgb(100, 100, 100),
+            Font = new Drawing.Font("Segoe UI", 9, Drawing.FontStyle.Italic),
+            Padding = new WinForms.Padding(10, 0, 0, 0),
+            BorderStyle = WinForms.BorderStyle.FixedSingle
         };
 
-        dialog.Controls.Add(infoLabel);
+        // Prepare editor text (no format example in the text itself)
+        var editorInitialText = EncryptLines(plaintext, lineContentMap);
+
+        // Editor
+        var editor = new WinForms.RichTextBox
+        {
+            Dock = WinForms.DockStyle.Fill,
+            ScrollBars = WinForms.RichTextBoxScrollBars.Vertical,
+            AcceptsTab = true,
+            WordWrap = false,
+            Font = new Drawing.Font("Consolas", 10),
+            Text = NormalizeForEditor(editorInitialText)
+        };
+
+        // Function to update status circle color
+        void UpdateStatusColor()
+        {
+            var lines = editor.Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+            bool hasDecrypted = false;
+            foreach (var line in lines)
+            {
+                if (!line.StartsWith("#") && !line.StartsWith("🔒") && !string.IsNullOrWhiteSpace(line) && line.Contains(","))
+                {
+                    hasDecrypted = true;
+                    break;
+                }
+            }
+            
+            statusCircle.BackColor = hasDecrypted ? Drawing.Color.Red : Drawing.Color.Green;
+        }
+
+        // Decrypt All button click handler
+        btnDecryptAll.Click += (s, ev) =>
+        {
+            // Check if there are unsaved changes
+            if (hasChanges)
+            {
+                var result = WinForms.MessageBox.Show(
+                    "You have unsaved changes. Save before showing all?",
+                    "PinBubble - Unsaved Changes",
+                    WinForms.MessageBoxButtons.YesNoCancel,
+                    WinForms.MessageBoxIcon.Question);
+                
+                if (result == WinForms.DialogResult.Cancel)
+                    return;
+                
+                if (result == WinForms.DialogResult.Yes)
+                {
+                    // Save the changes first
+                    try
+                    {
+                        var editorText = NormalizeForStorage(editor.Text);
+                        var lines = editorText.Split('\n').Where(l => !l.TrimStart().StartsWith("#")).ToArray();
+                        editorText = string.Join("\n", lines).Trim();
+                        var finalText = DecryptAllLines(editorText, lineContentMap);
+                        EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, finalText);
+                        
+                        // Reload plaintext with saved changes
+                        if (EncryptedTextStore.TryDecrypt(_textFilePath, _masterPassword, out plaintext))
+                        {
+                            hasChanges = false;
+                            btnSave.Visible = false;
+                            lineContentMap.Clear(); // Clear old mappings
+                        }
+                    }
+                    catch
+                    {
+                        WinForms.MessageBox.Show("Failed to save changes.", "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Error);
+                        return;
+                    }
+                }
+                else if (result == WinForms.DialogResult.No)
+                {
+                    // User chose not to save, reset the change flag
+                    hasChanges = false;
+                    btnSave.Visible = false;
+                }
+            }
+            
+            isDecrypted = !isDecrypted;
+            if (isDecrypted)
+            {
+                // Show decrypted
+                isUpdatingProgrammatically = true;
+                btnDecryptAll.Text = "Hide All";
+                btnDecryptAll.Visible = true; // Hide All should always be visible
+                btnDecryptAll.Enabled = true;
+                editor.Text = NormalizeForEditor(plaintext);
+                isUpdatingProgrammatically = false;
+            }
+            else
+            {
+                // Show encrypted
+                isUpdatingProgrammatically = true;
+                btnDecryptAll.Text = "Show All";
+                btnDecryptAll.Visible = false; // Show All requires Control key
+                btnDecryptAll.Enabled = false;
+                var currentText = NormalizeForStorage(editor.Text);
+                if (!string.IsNullOrEmpty(currentText.Trim()))
+                    editor.Text = NormalizeForEditor(EncryptLines(currentText, lineContentMap));
+                isUpdatingProgrammatically = false;
+            }
+            UpdateStatusColor();
+        };
+
+        // Toggle Current Line button click handler
+        btnToggleCurrent.Click += (s, ev) =>
+        {
+            var selectionStart = editor.SelectionStart;
+            var lines = editor.Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+            
+            // Find current line
+            int currentPos = 0;
+            int lineIndex = 0;
+            for (int i = 0; i < lines.Length; i++)
+            {
+                int lineLength = lines[i].Length + Environment.NewLine.Length;
+                if (currentPos + lines[i].Length >= selectionStart)
+                {
+                    lineIndex = i;
+                    break;
+                }
+                currentPos += lineLength;
+            }
+
+            if (lineIndex < lines.Length && !lines[lineIndex].StartsWith("#"))
+            {
+                var line = lines[lineIndex];
+                if (line.StartsWith("🔒 "))
+                {
+                    // Decrypt this line
+                    lines[lineIndex] = DecryptLine(line, lineContentMap);
+                }
+                else if (!string.IsNullOrWhiteSpace(line))
+                {
+                    // Encrypt this line
+                    lines[lineIndex] = EncryptLine(line, lineContentMap);
+                }
+
+                isUpdatingProgrammatically = true;
+                editor.Text = string.Join(Environment.NewLine, lines);
+                editor.SelectionStart = selectionStart;
+                editor.ScrollToCaret();
+                isUpdatingProgrammatically = false;
+                UpdateStatusColor();
+            }
+        };
+
+        // Track text changes
+        editor.TextChanged += (s, ev) =>
+        {
+            if (!isUpdatingProgrammatically)
+            {
+                hasChanges = true;
+                btnSave.Visible = true;
+            }
+            UpdateStatusColor();
+        };
+
+        // Cancel button click handler
+        btnCancel.Click += (s, ev) =>
+        {
+            if (hasChanges)
+            {
+                var result = WinForms.MessageBox.Show(
+                    "You have unsaved changes. Do you want to save before closing?",
+                    "PinBubble - Unsaved Changes",
+                    WinForms.MessageBoxButtons.YesNoCancel,
+                    WinForms.MessageBoxIcon.Question);
+                
+                if (result == WinForms.DialogResult.Cancel)
+                    return;
+                
+                if (result == WinForms.DialogResult.Yes)
+                {
+                    // Save before closing
+                    try
+                    {
+                        var editorText = NormalizeForStorage(editor.Text);
+                        var lines = editorText.Split('\n').Where(l => !l.TrimStart().StartsWith("#")).ToArray();
+                        editorText = string.Join("\n", lines).Trim();
+                        var finalText = DecryptAllLines(editorText, lineContentMap);
+                        EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, finalText);
+                        hasChanges = false; // Prevent FormClosing from prompting again
+                        dialog.DialogResult = WinForms.DialogResult.Cancel;
+                        dialog.Close();
+                    }
+                    catch
+                    {
+                        WinForms.MessageBox.Show("Failed to save changes.", "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Error);
+                        return;
+                    }
+                }
+                else
+                {
+                    // User chose No, close without saving
+                    hasChanges = false; // Prevent FormClosing from prompting again
+                    dialog.DialogResult = WinForms.DialogResult.Cancel;
+                    dialog.Close();
+                }
+            }
+            else
+            {
+                // No changes, just close
+                dialog.DialogResult = WinForms.DialogResult.Cancel;
+                dialog.Close();
+            }
+        };
+
+        // Control key handling for Show All button visibility
+        dialog.KeyDown += (s, ev) =>
+        {
+            // Handle Ctrl+S to save first (before showing the button)
+            if (ev.Control && ev.KeyCode == WinForms.Keys.S)
+            {
+                ev.SuppressKeyPress = true; // Prevent beep sound
+                
+                // Hide Show All button to prevent glitch during save dialog
+                btnDecryptAll.Visible = false;
+                btnDecryptAll.Enabled = false;
+                
+                if (hasChanges)
+                {
+                    // Trigger save
+                    try
+                    {
+                        var editorText = NormalizeForStorage(editor.Text);
+                        var lines = editorText.Split('\n').Where(l => !l.TrimStart().StartsWith("#")).ToArray();
+                        editorText = string.Join("\n", lines).Trim();
+                        var finalText = DecryptAllLines(editorText, lineContentMap);
+                        EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, finalText);
+                        
+                        // Reload plaintext with saved changes
+                        if (EncryptedTextStore.TryDecrypt(_textFilePath, _masterPassword, out plaintext))
+                        {
+                            hasChanges = false;
+                            btnSave.Visible = false;
+                            lineContentMap.Clear();
+                            
+                            // Reload the editor content with updated data
+                            isUpdatingProgrammatically = true;
+                            if (isDecrypted)
+                            {
+                                editor.Text = NormalizeForEditor(plaintext);
+                            }
+                            else
+                            {
+                                editor.Text = NormalizeForEditor(EncryptLines(plaintext, lineContentMap));
+                            }
+                            isUpdatingProgrammatically = false;
+                            
+                            WinForms.MessageBox.Show("Saved successfully.", "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Information);
+                        }
+                    }
+                    catch
+                    {
+                        WinForms.MessageBox.Show("Failed to save changes.", "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Error);
+                    }
+                }
+                return; // Don't process other Control key logic
+            }
+            
+            // Handle Escape key to cancel/close
+            if (ev.KeyCode == WinForms.Keys.Escape)
+            {
+                ev.SuppressKeyPress = true;
+                btnCancel.PerformClick(); // Trigger the Cancel button click which handles unsaved changes
+                return;
+            }
+            
+            // Only show the button when Control is pressed AND it's in "Show All" mode
+            if (ev.Control && !ev.Alt && !ev.Shift && btnDecryptAll.Text == "Show All")
+            {
+                btnDecryptAll.Visible = true;
+                btnDecryptAll.Enabled = true;
+            }
+        };
+
+        dialog.KeyUp += (s, ev) =>
+        {
+            // Hide Show All button when Control is released (but keep Hide All visible)
+            if (ev.KeyCode == WinForms.Keys.ControlKey && btnDecryptAll.Text == "Show All")
+            {
+                btnDecryptAll.Visible = false;
+                btnDecryptAll.Enabled = false;
+            }
+        };
+
+        // Handle form closing to prompt for unsaved changes
+        dialog.FormClosing += (s, ev) =>
+        {
+            if (hasChanges && ((WinForms.FormClosingEventArgs)ev).CloseReason == WinForms.CloseReason.UserClosing)
+            {
+                var result = WinForms.MessageBox.Show(
+                    "You have unsaved changes. Do you want to save before closing?",
+                    "PinBubble - Unsaved Changes",
+                    WinForms.MessageBoxButtons.YesNoCancel,
+                    WinForms.MessageBoxIcon.Question);
+                
+                if (result == WinForms.DialogResult.Cancel)
+                {
+                    ((WinForms.FormClosingEventArgs)ev).Cancel = true;
+                    return;
+                }
+                
+                if (result == WinForms.DialogResult.Yes)
+                {
+                    // Save before closing
+                    try
+                    {
+                        var editorText = NormalizeForStorage(editor.Text);
+                        var lines = editorText.Split('\n').Where(l => !l.TrimStart().StartsWith("#")).ToArray();
+                        editorText = string.Join("\n", lines).Trim();
+                        var finalText = DecryptAllLines(editorText, lineContentMap);
+                        EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, finalText);
+                    }
+                    catch
+                    {
+                        WinForms.MessageBox.Show("Failed to save changes.", "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Error);
+                        ((WinForms.FormClosingEventArgs)ev).Cancel = true;
+                    }
+                }
+            }
+        };
+
         dialog.Controls.Add(editor);
-        dialog.Controls.Add(saveButton);
-        dialog.Controls.Add(cancelButton);
-        dialog.AcceptButton = saveButton;
-        dialog.CancelButton = cancelButton;
+        dialog.Controls.Add(lblFormat);
+        dialog.Controls.Add(toolbar);
+        dialog.AcceptButton = btnSave;
 
         if (dialog.ShowDialog() != WinForms.DialogResult.OK)
             return;
 
         try
         {
-            var normalized = NormalizeForStorage(editor.Text);
-            EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, normalized);
+            var editorText = NormalizeForStorage(editor.Text);
+            // Remove all comment lines (lines starting with #)
+            var lines = editorText.Split('\n').Where(l => !l.TrimStart().StartsWith("#")).ToArray();
+            editorText = string.Join("\n", lines).Trim();
+            // Decrypt any encrypted lines before saving
+            var finalText = DecryptAllLines(editorText, lineContentMap);
+            EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, finalText);
             LoadSnippets();
             BuildBubbles();
         }
@@ -564,6 +978,90 @@ public partial class MainWindow : Window
         {
             System.Windows.MessageBox.Show("Failed to save encrypted snippets.", "PinBubble", MessageBoxButton.OK, MessageBoxImage.Error);
         }
+    }
+
+    private string EncryptLines(string text, Dictionary<string, string> lineContentMap)
+    {
+        var lines = text.Split('\n');
+        var encrypted = new StringBuilder();
+        foreach (var line in lines)
+        {
+            if (!string.IsNullOrWhiteSpace(line))
+                encrypted.AppendLine(EncryptLine(line.Trim(), lineContentMap));
+            else
+                encrypted.AppendLine();
+        }
+        return encrypted.ToString().TrimEnd('\r', '\n');
+    }
+
+    private string EncryptLine(string line, Dictionary<string, string> lineContentMap)
+    {
+        if (string.IsNullOrWhiteSpace(line)) return line;
+        if (line.StartsWith("🔒 ")) return line; // Already encrypted
+        
+        // Store the original line in the map before encrypting
+        var commaIndex = line.IndexOf(',');
+        if (commaIndex > 0)
+        {
+            var label = line[..commaIndex].Trim();
+            lineContentMap[label] = line; // Store the full line
+            return $"🔒 {label}, ••••••••";
+        }
+        return $"🔒 {line}";
+    }
+
+    private string DecryptLine(string line, Dictionary<string, string> lineContentMap)
+    {
+        if (!line.StartsWith("🔒 ")) return line;
+        
+        var withoutLock = line.Substring(2).Trim();
+        var commaIndex = withoutLock.IndexOf(',');
+        if (commaIndex > 0)
+        {
+            var label = withoutLock[..commaIndex].Trim();
+            
+            // First check the session dictionary
+            if (lineContentMap.TryGetValue(label, out var storedLine))
+                return storedLine;
+            
+            // Fall back to reading from file (for lines that existed before this session)
+            if (!string.IsNullOrEmpty(_masterPassword))
+            {
+                if (EncryptedTextStore.TryDecrypt(_textFilePath, _masterPassword, out var plaintext))
+                {
+                    var originalLines = plaintext.Split('\n');
+                    foreach (var origLine in originalLines)
+                    {
+                        if (origLine.Trim().StartsWith(label + ","))
+                        {
+                            var decryptedLine = origLine.Trim();
+                            lineContentMap[label] = decryptedLine; // Cache it
+                            return decryptedLine;
+                        }
+                    }
+                }
+            }
+        }
+        return withoutLock;
+    }
+
+    private string DecryptAllLines(string text, Dictionary<string, string> lineContentMap)
+    {
+        var lines = text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+        var decrypted = new StringBuilder();
+        
+        foreach (var line in lines)
+        {
+            if (line.StartsWith("🔒 "))
+            {
+                decrypted.AppendLine(DecryptLine(line, lineContentMap));
+            }
+            else
+            {
+                decrypted.AppendLine(line);
+            }
+        }
+        return decrypted.ToString().TrimEnd('\r', '\n');
     }
 
     private static string NormalizeForEditor(string value)
@@ -577,20 +1075,40 @@ public partial class MainWindow : Window
         return value.Replace("\r\n", "\n");
     }
 
-    private void OpenInVsCode_Click(object sender, RoutedEventArgs e)
+    private void ToggleTaskbar_Click(object sender, RoutedEventArgs e)
     {
-        try { Process.Start(new ProcessStartInfo("code", $"\"{_textFilePath}\"") { UseShellExecute = true }); }
-        catch { Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{_textFilePath}\"") { UseShellExecute = true }); }
+        ShowInTaskbar = !ShowInTaskbar;
+        UpdateTaskbarMenuText();
+        
+        if (!ShowInTaskbar && _trayIcon != null)
+        {
+            _trayIcon.BalloonTipTitle = "PinBubble";
+            _trayIcon.BalloonTipText = "Taskbar icon hidden. App is still running and pinned on screen.";
+            _trayIcon.ShowBalloonTip(2000);
+        }
     }
 
-    private void OpenInNotepad_Click(object sender, RoutedEventArgs e)
+    private void UpdateTaskbarMenuText()
     {
-        Process.Start(new ProcessStartInfo("notepad.exe", $"\"{_textFilePath}\"") { UseShellExecute = true });
+        TaskbarToggleMenuItem.Header = ShowInTaskbar ? "Hide from Taskbar" : "Show in Taskbar";
     }
 
-    private void OpenInExplorer_Click(object sender, RoutedEventArgs e)
+    private void TogglePin_Click(object sender, RoutedEventArgs e)
     {
-        Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{_textFilePath}\"") { UseShellExecute = true });
+        _isPinned = !_isPinned;
+        Topmost = _isPinned;
+        UpdatePinMenuText();
+    }
+
+    private void UpdatePinMenuText()
+    {
+        PinToggleMenuItem.Header = _isPinned ? "Unpin the Bubble" : "Pin the Bubble";
+    }
+
+    private void Window_StateChanged(object? sender, EventArgs e)
+    {
+        // Allow normal minimize/restore behavior when clicking taskbar icon
+        // Window will minimize when clicked, and restore when clicked again
     }
 
     protected override void OnClosed(EventArgs e)

@@ -7,9 +7,10 @@
         AllowsTransparency="True"
         Background="Transparent"
         ResizeMode="NoResize"
-        ShowInTaskbar="False"
+        ShowInTaskbar="True"
         Topmost="True"
         Deactivated="Window_Deactivated"
+        StateChanged="Window_StateChanged"
         MouseLeftButtonDown="Root_MouseLeftButtonDown"
         MouseLeftButtonUp="Root_MouseLeftButtonUp"
         MouseMove="Root_MouseMove">
@@ -40,9 +41,8 @@
             <ContextMenu>
                 <MenuItem Header="Edit snippets" Click="EditSnippets_Click"/>
                 <Separator/>
-                <MenuItem Header="Open text.text in VS Code" Click="OpenInVsCode_Click"/>
-                <MenuItem Header="Open text.text in Notepad" Click="OpenInNotepad_Click"/>
-                <MenuItem Header="Find text.text" Click="OpenInExplorer_Click"/>
+                <MenuItem x:Name="TaskbarToggleMenuItem" Header="Hide from Taskbar" Click="ToggleTaskbar_Click"/>
+                <MenuItem x:Name="PinToggleMenuItem" Header="Unpin the Bubble" Click="TogglePin_Click"/>
                 <Separator/>
                 <MenuItem Header="Exit" Click="Exit_Click"/>
             </ContextMenu>
