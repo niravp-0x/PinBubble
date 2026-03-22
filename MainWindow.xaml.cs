@@ -41,6 +41,7 @@ public partial class MainWindow : Window
     private POINT _dragStartCursor;
     private System.Windows.Point _dragStartWindow;
     private bool _isPinned = true; // Default to pinned
+    private bool _isDarkTheme = true; // Default to dark theme
 
     private static readonly SolidColorBrush BubbleDefault = new SolidColorBrush(WpfColor.FromRgb(45, 45, 48));
     private static readonly SolidColorBrush BubbleHover = new SolidColorBrush(WpfColor.FromRgb(102, 185, 51));
@@ -121,57 +122,204 @@ public partial class MainWindow : Window
     {
         using var dialog = new WinForms.Form
         {
-            Width = 360,
-            Height = 170,
-            FormBorderStyle = WinForms.FormBorderStyle.FixedDialog,
+            Width = 420,
+            Height = 220,
+            FormBorderStyle = WinForms.FormBorderStyle.None,
             StartPosition = WinForms.FormStartPosition.CenterScreen,
-            Text = "PinBubble - Master Password",
+            BackColor = System.Drawing.Color.FromArgb(30, 30, 35),
             MaximizeBox = false,
             MinimizeBox = false,
             ShowInTaskbar = false,
             TopMost = true
         };
 
-        var label = new WinForms.Label
+        // Add a subtle border
+        dialog.Paint += (s, e) =>
         {
-            Left = 15,
-            Top = 15,
-            Width = 315,
-            Text = "Enter master password"
+            using var pen = new System.Drawing.Pen(System.Drawing.Color.FromArgb(70, 70, 75), 1);
+            e.Graphics.DrawRectangle(pen, 0, 0, dialog.Width - 1, dialog.Height - 1);
+        };
+
+        // Title bar panel
+        var titlePanel = new WinForms.Panel
+        {
+            Left = 0,
+            Top = 0,
+            Width = 420,
+            Height = 45,
+            BackColor = System.Drawing.Color.FromArgb(25, 25, 28)
+        };
+
+        // Lock icon using PictureBox with custom drawing
+        var lockIcon = new WinForms.PictureBox
+        {
+            Left = 20,
+            Top = 10,
+            Width = 24,
+            Height = 24,
+            BackColor = System.Drawing.Color.Transparent
+        };
+        
+        // Draw a lock icon
+        var lockBitmap = new System.Drawing.Bitmap(24, 24);
+        using (var g = System.Drawing.Graphics.FromImage(lockBitmap))
+        {
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            
+            // Draw lock body (rectangle)
+            using (var brush = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(200, 200, 205)))
+            {
+                g.FillRectangle(brush, 6, 12, 12, 10);
+            }
+            
+            // Draw lock shackle (arc)
+            using (var pen = new System.Drawing.Pen(System.Drawing.Color.FromArgb(200, 200, 205), 2.5f))
+            {
+                g.DrawArc(pen, 8, 4, 8, 10, 180, 180);
+            }
+            
+            // Draw keyhole
+            using (var brush = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(30, 30, 35)))
+            {
+                g.FillEllipse(brush, 10, 15, 4, 4);
+                g.FillRectangle(brush, 11, 18, 2, 3);
+            }
+        }
+        lockIcon.Image = lockBitmap;
+
+        var titleLabel = new WinForms.Label
+        {
+            Left = 50,
+            Top = 12,
+            Width = 300,
+            Height = 25,
+            Text = "MASTER PASSWORD",
+            ForeColor = System.Drawing.Color.FromArgb(200, 200, 205),
+            Font = new System.Drawing.Font("Segoe UI", 10.5f, System.Drawing.FontStyle.Bold),
+            BackColor = System.Drawing.Color.Transparent
+        };
+
+        var instructionLabel = new WinForms.Label
+        {
+            Left = 20,
+            Top = 58,
+            Width = 380,
+            Height = 25,
+            Text = "Enter your master password to unlock",
+            ForeColor = System.Drawing.Color.FromArgb(160, 160, 165),
+            Font = new System.Drawing.Font("Segoe UI", 9f),
+            BackColor = System.Drawing.Color.Transparent,
+            AutoSize = false
+        };
+
+        // Custom styled textbox with panel background
+        var textBoxPanel = new WinForms.Panel
+        {
+            Left = 20,
+            Top = 93,
+            Width = 380,
+            Height = 42,
+            BackColor = System.Drawing.Color.FromArgb(45, 45, 50)
         };
 
         var textBox = new WinForms.TextBox
         {
-            Left = 15,
-            Top = 40,
-            Width = 315,
-            UseSystemPasswordChar = true
+            Left = 2,
+            Top = 2,
+            Width = 376,
+            Height = 38,
+            UseSystemPasswordChar = true,
+            BorderStyle = WinForms.BorderStyle.None,
+            BackColor = System.Drawing.Color.FromArgb(45, 45, 50),
+            ForeColor = System.Drawing.Color.FromArgb(220, 220, 225),
+            Font = new System.Drawing.Font("Segoe UI", 12f)
         };
+
+        textBoxPanel.Controls.Add(textBox);
+
+        // Paint border on textbox panel
+        textBoxPanel.Paint += (s, e) =>
+        {
+            var borderColor = textBox.Focused ? 
+                System.Drawing.Color.FromArgb(0, 120, 212) : 
+                System.Drawing.Color.FromArgb(70, 70, 75);
+            using var pen = new System.Drawing.Pen(borderColor, 2);
+            e.Graphics.DrawRectangle(pen, 0, 0, textBoxPanel.Width - 1, textBoxPanel.Height - 1);
+        };
+
+        textBox.Enter += (s, e) => textBoxPanel.Invalidate();
+        textBox.Leave += (s, e) => textBoxPanel.Invalidate();
 
         var okButton = new WinForms.Button
         {
-            Text = "OK",
-            Left = 174,
-            Width = 75,
-            Top = 78,
-            DialogResult = WinForms.DialogResult.OK
+            Text = "UNLOCK",
+            Left = 205,
+            Width = 95,
+            Height = 38,
+            Top = 155,
+            DialogResult = WinForms.DialogResult.OK,
+            FlatStyle = WinForms.FlatStyle.Flat,
+            BackColor = System.Drawing.Color.FromArgb(0, 120, 212),
+            ForeColor = System.Drawing.Color.White,
+            Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold),
+            Cursor = WinForms.Cursors.Hand
         };
+        okButton.FlatAppearance.BorderSize = 0;
+        okButton.FlatAppearance.MouseOverBackColor = System.Drawing.Color.FromArgb(0, 100, 192);
+        okButton.FlatAppearance.MouseDownBackColor = System.Drawing.Color.FromArgb(0, 80, 172);
 
         var cancelButton = new WinForms.Button
         {
-            Text = "Cancel",
-            Left = 255,
-            Width = 75,
-            Top = 78,
-            DialogResult = WinForms.DialogResult.Cancel
+            Text = "CANCEL",
+            Left = 305,
+            Width = 95,
+            Height = 38,
+            Top = 155,
+            DialogResult = WinForms.DialogResult.Cancel,
+            FlatStyle = WinForms.FlatStyle.Flat,
+            BackColor = System.Drawing.Color.FromArgb(55, 55, 60),
+            ForeColor = System.Drawing.Color.FromArgb(200, 200, 205),
+            Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold),
+            Cursor = WinForms.Cursors.Hand
+        };
+        cancelButton.FlatAppearance.BorderSize = 0;
+        cancelButton.FlatAppearance.MouseOverBackColor = System.Drawing.Color.FromArgb(70, 70, 75);
+        cancelButton.FlatAppearance.MouseDownBackColor = System.Drawing.Color.FromArgb(85, 85, 90);
+
+        // Make dialog draggable
+        bool dragging = false;
+        System.Drawing.Point dragCursor = System.Drawing.Point.Empty;
+        System.Drawing.Point dragForm = System.Drawing.Point.Empty;
+
+        titlePanel.MouseDown += (s, e) =>
+        {
+            dragging = true;
+            dragCursor = System.Windows.Forms.Cursor.Position;
+            dragForm = dialog.Location;
         };
 
-        dialog.Controls.Add(label);
-        dialog.Controls.Add(textBox);
+        titlePanel.MouseMove += (s, e) =>
+        {
+            if (dragging)
+            {
+                var diff = System.Drawing.Point.Subtract(System.Windows.Forms.Cursor.Position, new System.Drawing.Size(dragCursor));
+                dialog.Location = System.Drawing.Point.Add(dragForm, new System.Drawing.Size(diff));
+            }
+        };
+
+        titlePanel.MouseUp += (s, e) => dragging = false;
+
+        titlePanel.Controls.Add(lockIcon);
+        titlePanel.Controls.Add(titleLabel);
+        dialog.Controls.Add(titlePanel);
+        dialog.Controls.Add(instructionLabel);
+        dialog.Controls.Add(textBoxPanel);
         dialog.Controls.Add(okButton);
         dialog.Controls.Add(cancelButton);
         dialog.AcceptButton = okButton;
         dialog.CancelButton = cancelButton;
+
+        textBox.Select();
 
         return dialog.ShowDialog() == WinForms.DialogResult.OK ? textBox.Text : null;
     }
@@ -511,7 +659,9 @@ public partial class MainWindow : Window
             MinimizeBox = false,
             MaximizeBox = false,
             TopMost = true,
-            KeyPreview = true
+            KeyPreview = true,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White,
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black
         };
 
         var isDecrypted = false;
@@ -528,7 +678,7 @@ public partial class MainWindow : Window
             Dock = WinForms.DockStyle.Top,
             Height = 70,
             BorderStyle = WinForms.BorderStyle.FixedSingle,
-            BackColor = Drawing.Color.FromArgb(240, 240, 240)
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 48) : Drawing.Color.FromArgb(240, 240, 240)
         };
 
         // Status indicator - Circle
@@ -555,13 +705,14 @@ public partial class MainWindow : Window
             Width = 110,
             Height = 46,
             FlatStyle = WinForms.FlatStyle.Flat,
-            BackColor = Drawing.Color.White,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(55, 55, 60) : Drawing.Color.White,
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
             Font = new Drawing.Font("Segoe UI", 9, Drawing.FontStyle.Bold),
             Cursor = WinForms.Cursors.Hand,
             Visible = false,
             Enabled = false
         };
-        btnDecryptAll.FlatAppearance.BorderColor = Drawing.Color.Gray;
+        btnDecryptAll.FlatAppearance.BorderColor = _isDarkTheme ? Drawing.Color.FromArgb(80, 80, 85) : Drawing.Color.Gray;
 
         // Button: Toggle Current Line
         var btnToggleCurrent = new WinForms.Button
@@ -572,11 +723,12 @@ public partial class MainWindow : Window
             Width = 120,
             Height = 46,
             FlatStyle = WinForms.FlatStyle.Flat,
-            BackColor = Drawing.Color.White,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(55, 55, 60) : Drawing.Color.White,
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
             Font = new Drawing.Font("Segoe UI", 9, Drawing.FontStyle.Bold),
             Cursor = WinForms.Cursors.Hand
         };
-        btnToggleCurrent.FlatAppearance.BorderColor = Drawing.Color.Gray;
+        btnToggleCurrent.FlatAppearance.BorderColor = _isDarkTheme ? Drawing.Color.FromArgb(80, 80, 85) : Drawing.Color.Gray;
 
         // Button: Save - only visible when changes are made
         var btnSave = new WinForms.Button
@@ -587,13 +739,14 @@ public partial class MainWindow : Window
             Width = 90,
             Height = 46,
             FlatStyle = WinForms.FlatStyle.Flat,
-            BackColor = Drawing.Color.LightGreen,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(0, 100, 70) : Drawing.Color.LightGreen,
+            ForeColor = _isDarkTheme ? Drawing.Color.White : Drawing.Color.Black,
             Font = new Drawing.Font("Segoe UI", 9, Drawing.FontStyle.Bold),
             Cursor = WinForms.Cursors.Hand,
             DialogResult = WinForms.DialogResult.OK,
             Visible = false
         };
-        btnSave.FlatAppearance.BorderColor = Drawing.Color.DarkGreen;
+        btnSave.FlatAppearance.BorderColor = _isDarkTheme ? Drawing.Color.FromArgb(0, 120, 80) : Drawing.Color.DarkGreen;
 
         // Button: Cancel
         var btnCancel = new WinForms.Button
@@ -604,11 +757,12 @@ public partial class MainWindow : Window
             Width = 90,
             Height = 46,
             FlatStyle = WinForms.FlatStyle.Flat,
-            BackColor = Drawing.Color.LightCoral,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(80, 40, 40) : Drawing.Color.LightCoral,
+            ForeColor = _isDarkTheme ? Drawing.Color.White : Drawing.Color.Black,
             Font = new Drawing.Font("Segoe UI", 9, Drawing.FontStyle.Bold),
             Cursor = WinForms.Cursors.Hand
         };
-        btnCancel.FlatAppearance.BorderColor = Drawing.Color.DarkRed;
+        btnCancel.FlatAppearance.BorderColor = _isDarkTheme ? Drawing.Color.FromArgb(100, 50, 50) : Drawing.Color.DarkRed;
 
         toolbar.Controls.Add(btnDecryptAll);
         toolbar.Controls.Add(btnToggleCurrent);
@@ -622,8 +776,8 @@ public partial class MainWindow : Window
             Dock = WinForms.DockStyle.Top,
             Height = 25,
             TextAlign = Drawing.ContentAlignment.MiddleLeft,
-            BackColor = Drawing.Color.FromArgb(250, 250, 250),
-            ForeColor = Drawing.Color.FromArgb(100, 100, 100),
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(35, 35, 40) : Drawing.Color.FromArgb(250, 250, 250),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(140, 140, 145) : Drawing.Color.FromArgb(100, 100, 100),
             Font = new Drawing.Font("Segoe UI", 9, Drawing.FontStyle.Italic),
             Padding = new WinForms.Padding(10, 0, 0, 0),
             BorderStyle = WinForms.BorderStyle.FixedSingle
@@ -640,6 +794,8 @@ public partial class MainWindow : Window
             AcceptsTab = true,
             WordWrap = false,
             Font = new Drawing.Font("Consolas", 10),
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White,
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
             Text = NormalizeForEditor(editorInitialText)
         };
 
@@ -1105,6 +1261,12 @@ public partial class MainWindow : Window
         PinToggleMenuItem.Header = _isPinned ? "Unpin the Bubble" : "Pin the Bubble";
     }
 
+    private void ToggleDarkTheme_Click(object sender, RoutedEventArgs e)
+    {
+        _isDarkTheme = !_isDarkTheme;
+        DarkThemeMenuItem.IsChecked = _isDarkTheme;
+    }
+
     private void Window_StateChanged(object? sender, EventArgs e)
     {
         // Allow normal minimize/restore behavior when clicking taskbar icon
@@ -1118,6 +1280,274 @@ public partial class MainWindow : Window
         _watcher?.Dispose();
         _reloadDebounce?.Stop();
         base.OnClosed(e);
+    }
+
+    private void About_Click(object sender, RoutedEventArgs e)
+    {
+        using var aboutDialog = new WinForms.Form
+        {
+            Width = 500,
+            Height = 520,
+            FormBorderStyle = WinForms.FormBorderStyle.FixedDialog,
+            StartPosition = WinForms.FormStartPosition.CenterScreen,
+            Text = "About PinBubble",
+            MaximizeBox = false,
+            MinimizeBox = false,
+            ShowInTaskbar = false,
+            TopMost = true,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White,
+            KeyPreview = true
+        };
+
+        aboutDialog.KeyDown += (s, e) =>
+        {
+            if (e.KeyCode == WinForms.Keys.Escape)
+                aboutDialog.Close();
+        };
+
+        // Pin icon using custom drawing
+        var pinIcon = new WinForms.PictureBox
+        {
+            Left = 210,
+            Top = 15,
+            Width = 60,
+            Height = 60,
+            BackColor = Drawing.Color.Transparent
+        };
+        
+        var pinBitmap = new System.Drawing.Bitmap(60, 60);
+        using (var g = System.Drawing.Graphics.FromImage(pinBitmap))
+        {
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            var pinColor = _isDarkTheme ? Drawing.Color.FromArgb(102, 185, 51) : Drawing.Color.FromArgb(80, 150, 40);
+            
+            // Draw pin head (circle)
+            using (var brush = new System.Drawing.SolidBrush(pinColor))
+            {
+                g.FillEllipse(brush, 15, 5, 30, 30);
+            }
+            
+            // Draw pin point (triangle)
+            using (var brush = new System.Drawing.SolidBrush(pinColor))
+            {
+                var points = new System.Drawing.Point[] 
+                {
+                    new System.Drawing.Point(26, 35),
+                    new System.Drawing.Point(34, 35),
+                    new System.Drawing.Point(30, 52)
+                };
+                g.FillPolygon(brush, points);
+            }
+        }
+        pinIcon.Image = pinBitmap;
+
+        // Title
+        var titleLabel = new WinForms.Label
+        {
+            Left = 20,
+            Top = 80,
+            Width = 460,
+            Height = 35,
+            Text = "PinBubble",
+            Font = new Drawing.Font("Segoe UI", 24f, Drawing.FontStyle.Bold),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.MiddleCenter
+        };
+
+        // Version
+        var versionLabel = new WinForms.Label
+        {
+            Left = 20,
+            Top = 118,
+            Width = 460,
+            Height = 20,
+            Text = "Version 1.0.0",
+            Font = new Drawing.Font("Segoe UI", 9f),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(160, 160, 165) : Drawing.Color.FromArgb(100, 100, 100),
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.MiddleCenter
+        };
+
+        // Separator line
+        var separator1 = new WinForms.Panel
+        {
+            Left = 20,
+            Top = 148,
+            Width = 440,
+            Height = 1,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(70, 70, 75) : Drawing.Color.FromArgb(200, 200, 200)
+        };
+
+        // Description
+        var descriptionLabel = new WinForms.Label
+        {
+            Left = 30,
+            Top = 158,
+            Width = 440,
+            Height = 45,
+            Text = "A lightweight, always-on-screen snippet manager\nthat keeps your frequently used text snippets\nat your fingertips.",
+            Font = new Drawing.Font("Segoe UI", 9f),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.TopCenter
+        };
+
+        // Features header - more spacing above
+        var featuresLabel = new WinForms.Label
+        {
+            Left = 40,
+            Top = 225,
+            Width = 420,
+            Height = 20,
+            Text = "KEY FEATURES",
+            Font = new Drawing.Font("Segoe UI", 8.5f, Drawing.FontStyle.Bold),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(102, 185, 51) : Drawing.Color.FromArgb(80, 150, 40),
+            BackColor = Drawing.Color.Transparent
+        };
+
+        // Features list with better spacing - increased height to 22px each
+        var feature1 = new WinForms.Label
+        {
+            Left = 60,
+            Top = 253,
+            Width = 420,
+            Height = 22,
+            Text = "> Encrypted snippet storage with master password",
+            Font = new Drawing.Font("Segoe UI", 8.5f),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
+            BackColor = Drawing.Color.Transparent
+        };
+
+        var feature2 = new WinForms.Label
+        {
+            Left = 60,
+            Top = 280,
+            Width = 420,
+            Height = 22,
+            Text = "> Pin/unpin to stay on top of other windows",
+            Font = new Drawing.Font("Segoe UI", 8.5f),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
+            BackColor = Drawing.Color.Transparent
+        };
+
+        var feature3 = new WinForms.Label
+        {
+            Left = 60,
+            Top = 307,
+            Width = 420,
+            Height = 22,
+            Text = "> Dark theme support for comfortable viewing",
+            Font = new Drawing.Font("Segoe UI", 8.5f),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
+            BackColor = Drawing.Color.Transparent
+        };
+
+        var feature4 = new WinForms.Label
+        {
+            Left = 60,
+            Top = 334,
+            Width = 420,
+            Height = 22,
+            Text = "> Quick copy snippets with a single click",
+            Font = new Drawing.Font("Segoe UI", 8.5f),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
+            BackColor = Drawing.Color.Transparent
+        };
+
+        var feature5 = new WinForms.Label
+        {
+            Left = 60,
+            Top = 361,
+            Width = 420,
+            Height = 22,
+            Text = "> Line-by-line encryption controls",
+            Font = new Drawing.Font("Segoe UI", 8.5f),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
+            BackColor = Drawing.Color.Transparent
+        };
+
+        // Separator line 2
+        var separator2 = new WinForms.Panel
+        {
+            Left = 20,
+            Top = 400,
+            Width = 440,
+            Height = 1,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(70, 70, 75) : Drawing.Color.FromArgb(200, 200, 200)
+        };
+
+        // Robot icon for copilot
+        var robotIcon = new WinForms.PictureBox
+        {
+            Left = 75,
+            Top = 425,
+            Width = 18,
+            Height = 18,
+            BackColor = Drawing.Color.Transparent
+        };
+        
+        var robotBitmap = new System.Drawing.Bitmap(18, 18);
+        using (var g = System.Drawing.Graphics.FromImage(robotBitmap))
+        {
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            var robotColor = _isDarkTheme ? Drawing.Color.FromArgb(140, 140, 145) : Drawing.Color.FromArgb(120, 120, 120);
+            
+            // Draw robot head (rectangle)
+            using (var brush = new System.Drawing.SolidBrush(robotColor))
+            {
+                g.FillRectangle(brush, 3, 5, 12, 10);
+            }
+            
+            // Draw robot eyes (two small circles)
+            using (var brush = new System.Drawing.SolidBrush(_isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White))
+            {
+                g.FillEllipse(brush, 6, 8, 3, 3);
+                g.FillEllipse(brush, 11, 8, 3, 3);
+            }
+            
+            // Draw antenna
+            using (var pen = new System.Drawing.Pen(robotColor, 1.5f))
+            {
+                g.DrawLine(pen, 9, 2, 9, 5);
+            }
+            using (var brush = new System.Drawing.SolidBrush(robotColor))
+            {
+                g.FillEllipse(brush, 7, 0, 4, 4);
+            }
+        }
+        robotIcon.Image = robotBitmap;
+
+        // Copilot credit
+        var copilotLabel = new WinForms.Label
+        {
+            Left = 98,
+            Top = 425,
+            Width = 330,
+            Height = 22,
+            Text = "Proudly vibecoded with GitHub Copilot",
+            Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Italic),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(140, 140, 145) : Drawing.Color.FromArgb(120, 120, 120),
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.MiddleLeft
+        };
+
+        aboutDialog.Controls.Add(pinIcon);
+        aboutDialog.Controls.Add(titleLabel);
+        aboutDialog.Controls.Add(versionLabel);
+        aboutDialog.Controls.Add(separator1);
+        aboutDialog.Controls.Add(descriptionLabel);
+        aboutDialog.Controls.Add(featuresLabel);
+        aboutDialog.Controls.Add(feature1);
+        aboutDialog.Controls.Add(feature2);
+        aboutDialog.Controls.Add(feature3);
+        aboutDialog.Controls.Add(feature4);
+        aboutDialog.Controls.Add(feature5);
+        aboutDialog.Controls.Add(separator2);
+        aboutDialog.Controls.Add(robotIcon);
+        aboutDialog.Controls.Add(copilotLabel);
+
+        aboutDialog.ShowDialog();
     }
 
     private void Exit_Click(object sender, RoutedEventArgs e) => Close();

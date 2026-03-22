@@ -42,8 +42,10 @@
                 <MenuItem Header="Edit snippets" Click="EditSnippets_Click"/>
                 <Separator/>
                 <MenuItem x:Name="TaskbarToggleMenuItem" Header="Hide from Taskbar" Click="ToggleTaskbar_Click"/>
+                <MenuItem x:Name="DarkThemeMenuItem" Header="Dark Theme" IsCheckable="True" IsChecked="True" Click="ToggleDarkTheme_Click"/>
                 <MenuItem x:Name="PinToggleMenuItem" Header="Unpin the Bubble" Click="TogglePin_Click"/>
                 <Separator/>
+                <MenuItem Header="About" Click="About_Click"/>
                 <MenuItem Header="Exit" Click="Exit_Click"/>
             </ContextMenu>
         </Grid.ContextMenu>
