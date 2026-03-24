@@ -26,6 +26,9 @@ class SnippetRow
     public string Value { get; set; } = string.Empty;
     public string ActualValue { get; set; } = string.Empty; // Always stores the real value
     public bool IsEncrypted { get; set;} = true;
+    public DateTime Created { get; set; } = DateTime.Now;
+    public DateTime Modified { get; set; } = DateTime.Now;
+    public DateTime ExpiryDate { get; set; } = DateTime.Now.AddDays(30);
 }
 
 public partial class MainWindow : Window
@@ -60,6 +63,11 @@ public partial class MainWindow : Window
     {
         InitializeComponent();
         _textFilePath = Path.Combine(AppContext.BaseDirectory, "text.text");
+        
+        // Ensure window is topmost from the start (in case pinned by default)
+        if (_isPinned)
+            Topmost = true;
+        
         if (!InitializeSecureStore())
         {
             Close();
@@ -380,7 +388,14 @@ public partial class MainWindow : Window
     {
         if (_expanded) Collapse();
         if (_isPinned)
-            Topmost = true;
+        {
+            // Ensure MainWindow stays topmost when pinned
+            Dispatcher.BeginInvoke(new Action(() => 
+            {
+                if (_isPinned)
+                    Topmost = true;
+            }), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+        }
     }
 
     private void SetupWatcher()
@@ -811,17 +826,35 @@ public partial class MainWindow : Window
             if (string.IsNullOrWhiteSpace(trimmed) || trimmed.StartsWith("#"))
                 continue;
                 
-            var commaIndex = trimmed.IndexOf(',');
-            if (commaIndex > 0)
+            var parts = trimmed.Split(',');
+            if (parts.Length >= 2)
             {
-                var label = trimmed[..commaIndex].Trim();
-                var value = trimmed[(commaIndex + 1)..].Trim();
+                var label = parts[0].Trim();
+                var value = parts[1].Trim();
+                DateTime created = DateTime.Now;
+                DateTime modified = DateTime.Now;
+                DateTime expiry = DateTime.Now.AddDays(30);
+                
+                // Try to parse timestamps if they exist (backward compatible)
+                if (parts.Length >= 4)
+                {
+                    DateTime.TryParse(parts[2].Trim(), out created);
+                    DateTime.TryParse(parts[3].Trim(), out modified);
+                }
+                if (parts.Length >= 5)
+                {
+                    DateTime.TryParse(parts[4].Trim(), out expiry);
+                }
+                
                 snippetRows.Add(new SnippetRow
                 {
                     Label = label,
                     Value = "••••••••",
                     ActualValue = value,
-                    IsEncrypted = true
+                    IsEncrypted = true,
+                    Created = created,
+                    Modified = modified,
+                    ExpiryDate = expiry
                 });
             }
         }
@@ -841,7 +874,7 @@ public partial class MainWindow : Window
             AutoSizeColumnsMode = WinForms.DataGridViewAutoSizeColumnsMode.Fill,
             SelectionMode = WinForms.DataGridViewSelectionMode.FullRowSelect,
             MultiSelect = false,
-            RowHeadersVisible = true,
+            RowHeadersVisible = false,
             RowHeadersWidth = 25,
             Font = new Drawing.Font("Consolas", 10)
         };
@@ -857,6 +890,16 @@ public partial class MainWindow : Window
         grid.RowHeadersDefaultCellStyle.BackColor = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 48) : Drawing.Color.FromArgb(240, 240, 240);
 
         // Add columns
+        var colAge = new WinForms.DataGridViewTextBoxColumn
+        {
+            HeaderText = "",
+            Name = "Age",
+            FillWeight = 5,
+            Width = 50,
+            ReadOnly = true,
+            SortMode = WinForms.DataGridViewColumnSortMode.NotSortable
+        };
+        
         var colLabel = new WinForms.DataGridViewTextBoxColumn
         {
             HeaderText = "Label",
@@ -883,6 +926,7 @@ public partial class MainWindow : Window
             SortMode = WinForms.DataGridViewColumnSortMode.NotSortable
         };
 
+        grid.Columns.Add(colAge);
         grid.Columns.Add(colLabel);
         grid.Columns.Add(colValue);
         grid.Columns.Add(colToggle);
@@ -890,10 +934,10 @@ public partial class MainWindow : Window
         // Increase header height for cleaner look
         grid.ColumnHeadersHeight = 35;
 
-        // Populate grid
+        // Populate grid - Age column will be empty, clock icon shown via painting
         foreach (var row in snippetRows)
         {
-            grid.Rows.Add(row.Label, row.Value);
+            grid.Rows.Add("", row.Label, row.Value);
             grid.Rows[grid.Rows.Count - 2].Tag = row; // Store the SnippetRow in Tag
         }
 
@@ -939,10 +983,62 @@ public partial class MainWindow : Window
         int hoveredRowIndex = -1;
         int hoveredColumnIndex = -1;
         
-        // Custom paint for eye icon column
+        // Enable tooltips on the grid
+        grid.ShowCellToolTips = true;
+        
+        // Custom paint for age column (clock icon) and eye icon column
         grid.CellPainting += (s, ev) =>
         {
-            if (ev.ColumnIndex == 2 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count - 1) // Toggle column, not new row
+            // Age column (column 0) - show clock icon with color based on days until expiry
+            if (ev.ColumnIndex == 0 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count - 1)
+            {
+                ev.Paint(ev.CellBounds, WinForms.DataGridViewPaintParts.All);
+                
+                var row = grid.Rows[ev.RowIndex];
+                if (row.Tag is SnippetRow snippetRow && ev.Graphics != null)
+                {
+                    var daysUntilExpiry = (int)(snippetRow.ExpiryDate - DateTime.Now).TotalDays;
+                    bool shouldShowClock = false;
+                    Drawing.Color clockColor = Drawing.Color.FromArgb(100, 150, 200); // Default blue
+                    
+                    if (daysUntilExpiry < 7)
+                    {
+                        // Less than 7 days - Red and always visible
+                        shouldShowClock = true;
+                        clockColor = Drawing.Color.FromArgb(220, 0, 0);
+                    }
+                    else if (daysUntilExpiry < 14)
+                    {
+                        // Less than 14 days - Yellow and always visible
+                        shouldShowClock = true;
+                        clockColor = Drawing.Color.FromArgb(220, 180, 0);
+                    }
+                    else if (daysUntilExpiry >= 15)
+                    {
+                        // 15 days or more - Blue and only on hover
+                        shouldShowClock = (hoveredRowIndex == ev.RowIndex && hoveredColumnIndex == ev.ColumnIndex);
+                        clockColor = Drawing.Color.FromArgb(100, 150, 200);
+                    }
+                    
+                    if (shouldShowClock)
+                    {
+                        var clockFont = new Drawing.Font("Segoe UI Emoji", 14f);
+                        var clockBrush = new System.Drawing.SolidBrush(clockColor);
+                        var sf = new System.Drawing.StringFormat
+                        {
+                            Alignment = System.Drawing.StringAlignment.Center,
+                            LineAlignment = System.Drawing.StringAlignment.Center
+                        };
+                        ev.Graphics.DrawString("⏰", clockFont, clockBrush, ev.CellBounds, sf);
+                        clockBrush.Dispose();
+                        clockFont.Dispose();
+                    }
+                }
+                
+                ev.Handled = true;
+            }
+            // Toggle column (column 3) - eye icon
+            else if (ev.ColumnIndex == 3 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count - 1)
             {
                 ev.Paint(ev.CellBounds, WinForms.DataGridViewPaintParts.Background | WinForms.DataGridViewPaintParts.Border);
                 
@@ -984,10 +1080,25 @@ public partial class MainWindow : Window
             }
         };
         
-        // Track mouse movement for hover effect
+        // Track mouse movement for hover effect and tooltip
         grid.CellMouseEnter += (s, ev) =>
         {
-            if (ev.ColumnIndex == 2 && ev.RowIndex >= 0)
+            // Set tooltip directly on cells for age column (0) only
+            if (ev.ColumnIndex == 0 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count)
+            {
+                var row = grid.Rows[ev.RowIndex];
+                if (!row.IsNewRow && row.Tag is SnippetRow snippetRow)
+                {
+                    var daysUntilExpiry = (int)(snippetRow.ExpiryDate - DateTime.Now).TotalDays;
+                    var expiryText = daysUntilExpiry >= 0 ? $"Expires in {daysUntilExpiry} days" : $"Expired {Math.Abs(daysUntilExpiry)} days ago";
+                    var tooltipText = $"Entry: {snippetRow.Label}\n\nFirst Added: {snippetRow.Created:yyyy-MM-dd HH:mm}\nLast Modified: {snippetRow.Modified:yyyy-MM-dd HH:mm}\nExpiry: {snippetRow.ExpiryDate:yyyy-MM-dd}\n\n{expiryText}";
+                    
+                    // Set tooltip text directly on the cell
+                    row.Cells[ev.ColumnIndex].ToolTipText = tooltipText;
+                }
+            }
+            
+            if ((ev.ColumnIndex == 0 || ev.ColumnIndex == 3) && ev.RowIndex >= 0)
             {
                 hoveredRowIndex = ev.RowIndex;
                 hoveredColumnIndex = ev.ColumnIndex;
@@ -997,7 +1108,7 @@ public partial class MainWindow : Window
         
         grid.CellMouseLeave += (s, ev) =>
         {
-            if (ev.ColumnIndex == 2 && ev.RowIndex >= 0)
+            if ((ev.ColumnIndex == 0 || ev.ColumnIndex == 3) && ev.RowIndex >= 0)
             {
                 hoveredRowIndex = -1;
                 hoveredColumnIndex = -1;
@@ -1014,22 +1125,23 @@ public partial class MainWindow : Window
             var row = grid.Rows[ev.RowIndex];
             if (row.Tag is not SnippetRow snippetRow)
             {
-                // New row - create SnippetRow
-                snippetRow = new SnippetRow { IsEncrypted = true };
+                // New row - create SnippetRow with 30 days default expiry
+                snippetRow = new SnippetRow { IsEncrypted = true, Created = DateTime.Now, Modified = DateTime.Now, ExpiryDate = DateTime.Now.AddDays(30) };
                 row.Tag = snippetRow;
             }
 
             hasChanges = true;
             btnSave.Visible = true;
+            snippetRow.Modified = DateTime.Now; // Update modified timestamp
 
             // Update the SnippetRow based on which column changed
-            if (ev.ColumnIndex == 0) // Label column
+            if (ev.ColumnIndex == 1) // Label column (shifted from 0 to 1)
             {
-                snippetRow.Label = row.Cells[0].Value?.ToString() ?? string.Empty;
+                snippetRow.Label = row.Cells[1].Value?.ToString() ?? string.Empty;
             }
-            else if (ev.ColumnIndex == 1) // Value column
+            else if (ev.ColumnIndex == 2) // Value column (shifted from 1 to 2)
             {
-                var newValue = row.Cells[1].Value?.ToString() ?? string.Empty;
+                var newValue = row.Cells[2].Value?.ToString() ?? string.Empty;
                 
                 // If encrypted and user types non-dots, store actual value and re-encrypt display
                 if (snippetRow.IsEncrypted && newValue != "••••••••" && !newValue.All(c => c == '•'))
@@ -1045,7 +1157,7 @@ public partial class MainWindow : Window
                         if (!isUpdatingProgrammatically && row.Index < grid.Rows.Count)
                         {
                             isUpdatingProgrammatically = true;
-                            row.Cells[1].Value = "••••••••";
+                            row.Cells[2].Value = "••••••••";
                             isUpdatingProgrammatically = false;
                         }
                     };
@@ -1069,10 +1181,166 @@ public partial class MainWindow : Window
             btnSave.Visible = true;
         };
 
-        // Handle clicks on eye icon column
+        // Handle clicks on clock icon column and eye icon column
         grid.CellClick += (s, ev) =>
         {
-            if (ev.ColumnIndex == 2 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count - 1) // Toggle column, not new row
+            // Clock icon column - set expiry date
+            if (ev.ColumnIndex == 0 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count - 1)
+            {
+                var row = grid.Rows[ev.RowIndex];
+                if (row.Tag is SnippetRow snippetRow)
+                {
+                    var daysUntilExpiry = (int)(snippetRow.ExpiryDate - DateTime.Now).TotalDays;
+                    var expiryText = daysUntilExpiry >= 0 ? $"Expires in {daysUntilExpiry} days" : $"Expired {Math.Abs(daysUntilExpiry)} days ago";
+                    
+                    // Show a dialog with summary and date picker
+                    using var inputForm = new WinForms.Form
+                    {
+                        Width = 450,
+                        Height = 420,
+                        FormBorderStyle = WinForms.FormBorderStyle.FixedDialog,
+                        Text = "Expiry Date",
+                        StartPosition = WinForms.FormStartPosition.CenterParent,
+                        MaximizeBox = false,
+                        MinimizeBox = false,
+                        TopMost = true,
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White,
+                        Padding = new WinForms.Padding(25)
+                    };
+                    
+                    // Entry label
+                    var entryLabel = new WinForms.Label
+                    {
+                        Left = 30,
+                        Top = 30,
+                        Width = 380,
+                        Height = 35,
+                        Text = $"Entry: {snippetRow.Label}",
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
+                        Font = new Drawing.Font("Segoe UI", 11f, Drawing.FontStyle.Bold),
+                        AutoSize = false
+                    };
+                    
+                    var label1 = new WinForms.Label
+                    {
+                        Left = 30,
+                        Top = 75,
+                        Width = 380,
+                        Height = 30,
+                        Text = $"First Added: {snippetRow.Created:yyyy-MM-dd HH:mm}",
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
+                        Font = new Drawing.Font("Segoe UI", 10f),
+                        AutoSize = false
+                    };
+                    
+                    var label2 = new WinForms.Label
+                    {
+                        Left = 30,
+                        Top = 110,
+                        Width = 380,
+                        Height = 30,
+                        Text = $"Last Modified: {snippetRow.Modified:yyyy-MM-dd HH:mm}",
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
+                        Font = new Drawing.Font("Segoe UI", 10f),
+                        AutoSize = false
+                    };
+                    
+                    var label3 = new WinForms.Label
+                    {
+                        Left = 30,
+                        Top = 145,
+                        Width = 380,
+                        Height = 30,
+                        Text = expiryText,
+                        ForeColor = daysUntilExpiry < 7 ? Drawing.Color.FromArgb(255, 100, 100) : 
+                                   (daysUntilExpiry < 14 ? Drawing.Color.FromArgb(255, 200, 100) : 
+                                   Drawing.Color.FromArgb(100, 200, 100)),
+                        Font = new Drawing.Font("Segoe UI", 10f, Drawing.FontStyle.Bold),
+                        AutoSize = false
+                    };
+                    
+                    var separatorLabel = new WinForms.Label
+                    {
+                        Left = 30,
+                        Top = 195,
+                        Width = 380,
+                        Height = 30,
+                        Text = "Set new expiry date:",
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(160, 160, 165) : Drawing.Color.DarkGray,
+                        Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold)
+                    };
+                    
+                    var datePicker = new WinForms.DateTimePicker
+                    {
+                        Left = 30,
+                        Top = 235,
+                        Width = 380,
+                        Height = 35,
+                        Font = new Drawing.Font("Segoe UI", 11f),
+                        Format = WinForms.DateTimePickerFormat.Short,
+                        Value = snippetRow.ExpiryDate < DateTime.Now ? DateTime.Now.AddDays(30) : snippetRow.ExpiryDate,
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 50) : Drawing.Color.White,
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
+                        CalendarForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
+                        CalendarMonthBackground = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 50) : Drawing.Color.White
+                    };
+                    
+                    var btnOk = new WinForms.Button
+                    {
+                        Text = "Update",
+                        Left = 220,
+                        Top = 300,
+                        Width = 90,
+                        Height = 45,
+                        DialogResult = WinForms.DialogResult.OK,
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(0, 120, 80) : Drawing.Color.LightGreen,
+                        ForeColor = Drawing.Color.White,
+                        FlatStyle = WinForms.FlatStyle.Flat,
+                        Font = new Drawing.Font("Segoe UI", 10f, Drawing.FontStyle.Bold),
+                        Cursor = WinForms.Cursors.Hand
+                    };
+                    btnOk.FlatAppearance.BorderSize = 0;
+                    
+                    var btnCancel = new WinForms.Button
+                    {
+                        Text = "Cancel",
+                        Left = 320,
+                        Top = 300,
+                        Width = 90,
+                        Height = 45,
+                        DialogResult = WinForms.DialogResult.Cancel,
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(80, 40, 40) : Drawing.Color.LightCoral,
+                        ForeColor = Drawing.Color.White,
+                        FlatStyle = WinForms.FlatStyle.Flat,
+                        Font = new Drawing.Font("Segoe UI", 10f, Drawing.FontStyle.Bold),
+                        Cursor = WinForms.Cursors.Hand
+                    };
+                    btnCancel.FlatAppearance.BorderSize = 0;
+                    
+                    inputForm.Controls.Add(entryLabel);
+                    inputForm.Controls.Add(label1);
+                    inputForm.Controls.Add(label2);
+                    inputForm.Controls.Add(label3);
+                    inputForm.Controls.Add(separatorLabel);
+                    inputForm.Controls.Add(datePicker);
+                    inputForm.Controls.Add(btnOk);
+                    inputForm.Controls.Add(btnCancel);
+                    inputForm.AcceptButton = btnOk;
+                    inputForm.CancelButton = btnCancel;
+                    
+                    if (inputForm.ShowDialog() == WinForms.DialogResult.OK)
+                    {
+                        snippetRow.ExpiryDate = datePicker.Value.Date.AddHours(23).AddMinutes(59).AddSeconds(59); // Set to end of day
+                        hasChanges = true;
+                        btnSave.Visible = true;
+                        
+                        // Refresh the clock icon to update color if needed
+                        grid.InvalidateCell(0, ev.RowIndex);
+                    }
+                }
+            }
+            // Eye icon column - toggle encryption
+            else if (ev.ColumnIndex == 3 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count - 1) // Toggle column (now column 3), not new row
             {
                 var row = grid.Rows[ev.RowIndex];
                 if (row.Tag is SnippetRow snippetRow)
@@ -1083,18 +1351,18 @@ public partial class MainWindow : Window
                     if (snippetRow.IsEncrypted)
                     {
                         // Switching to encrypted - show dots
-                        row.Cells[1].Value = "••••••••";
+                        row.Cells[2].Value = "••••••••";
                     }
                     else
                     {
                         // Switching to decrypted - show actual value
-                        row.Cells[1].Value = snippetRow.ActualValue;
+                        row.Cells[2].Value = snippetRow.ActualValue;
                     }
                     
                     isUpdatingProgrammatically = false;
                     UpdateStatusColor();
                     // Refresh the eye icon display
-                    grid.InvalidateCell(2, ev.RowIndex);
+                    grid.InvalidateCell(3, ev.RowIndex);
                 }
             }
         };
@@ -1125,7 +1393,7 @@ public partial class MainWindow : Window
                             if (gridRow.IsNewRow) continue;
                             if (gridRow.Tag is SnippetRow snippetRow && !string.IsNullOrWhiteSpace(snippetRow.Label))
                             {
-                                textToSave.AppendLine($"{snippetRow.Label}, {snippetRow.ActualValue}");
+                                textToSave.AppendLine($"{snippetRow.Label}, {snippetRow.ActualValue}, {snippetRow.Created:o}, {snippetRow.Modified:o}, {snippetRow.ExpiryDate:o}");
                             }
                         }
                         
@@ -1163,8 +1431,8 @@ public partial class MainWindow : Window
                     if (gridRow.Tag is SnippetRow snippetRow)
                     {
                         snippetRow.IsEncrypted = false;
-                        gridRow.Cells[1].Value = snippetRow.ActualValue;
-                        grid.InvalidateCell(2, gridRow.Index); // Refresh eye icon
+                        gridRow.Cells[2].Value = snippetRow.ActualValue;
+                        grid.InvalidateCell(3, gridRow.Index); // Refresh eye icon
                     }
                 }
             }
@@ -1181,8 +1449,8 @@ public partial class MainWindow : Window
                     if (gridRow.Tag is SnippetRow snippetRow)
                     {
                         snippetRow.IsEncrypted = true;
-                        gridRow.Cells[1].Value = "••••••••";
-                        grid.InvalidateCell(2, gridRow.Index); // Refresh eye icon
+                        gridRow.Cells[2].Value = "••••••••";
+                        grid.InvalidateCell(3, gridRow.Index); // Refresh eye icon
                     }
                 }
             }
@@ -1216,7 +1484,7 @@ public partial class MainWindow : Window
                             if (gridRow.IsNewRow) continue;
                             if (gridRow.Tag is SnippetRow snippetRow && !string.IsNullOrWhiteSpace(snippetRow.Label))
                             {
-                                textToSave.AppendLine($"{snippetRow.Label}, {snippetRow.ActualValue}");
+                                textToSave.AppendLine($"{snippetRow.Label}, {snippetRow.ActualValue}, {snippetRow.Created:o}, {snippetRow.Modified:o}, {snippetRow.ExpiryDate:o}");
                             }
                         }
                         
@@ -1270,7 +1538,7 @@ public partial class MainWindow : Window
                             if (gridRow.IsNewRow) continue;
                             if (gridRow.Tag is SnippetRow snippetRow && !string.IsNullOrWhiteSpace(snippetRow.Label))
                             {
-                                textToSave.AppendLine($"{snippetRow.Label}, {snippetRow.ActualValue}");
+                                textToSave.AppendLine($"{snippetRow.Label}, {snippetRow.ActualValue}, {snippetRow.Created:o}, {snippetRow.Modified:o}, {snippetRow.ExpiryDate:o}");
                             }
                         }
                         
@@ -1342,7 +1610,7 @@ public partial class MainWindow : Window
                             if (gridRow.IsNewRow) continue;
                             if (gridRow.Tag is SnippetRow snippetRow && !string.IsNullOrWhiteSpace(snippetRow.Label))
                             {
-                                textToSave.AppendLine($"{snippetRow.Label}, {snippetRow.ActualValue}");
+                                textToSave.AppendLine($"{snippetRow.Label}, {snippetRow.ActualValue}, {snippetRow.Created:o}, {snippetRow.Modified:o}, {snippetRow.ExpiryDate:o}");
                             }
                         }
                         
@@ -1372,7 +1640,7 @@ public partial class MainWindow : Window
                 if (gridRow.IsNewRow) continue;
                 if (gridRow.Tag is SnippetRow snippetRow && !string.IsNullOrWhiteSpace(snippetRow.Label))
                 {
-                    textToSave.AppendLine($"{snippetRow.Label}, {snippetRow.ActualValue}");
+                    textToSave.AppendLine($"{snippetRow.Label}, {snippetRow.ActualValue}, {snippetRow.Created:o}, {snippetRow.Modified:o}, {snippetRow.ExpiryDate:o}");
                 }
             }
             
