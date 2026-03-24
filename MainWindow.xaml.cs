@@ -19,6 +19,15 @@ using WpfHorizontalAlignment = System.Windows.HorizontalAlignment;
 
 namespace PinBubble;
 
+// Row data class to track encrypted state per row
+class SnippetRow
+{
+    public string Label { get; set; } = string.Empty;
+    public string Value { get; set; } = string.Empty;
+    public string ActualValue { get; set; } = string.Empty; // Always stores the real value
+    public bool IsEncrypted { get; set;} = true;
+}
+
 public partial class MainWindow : Window
 {
     [DllImport("user32.dll")]
@@ -669,9 +678,6 @@ public partial class MainWindow : Window
         var hasChanges = false;
         var isUpdatingProgrammatically = false;
         
-        // Session-level storage for decrypted line values (maps label to full line content)
-        var lineContentMap = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-
         // Toolbar panel
         var toolbar = new WinForms.Panel
         {
@@ -681,20 +687,65 @@ public partial class MainWindow : Window
             BackColor = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 48) : Drawing.Color.FromArgb(240, 240, 240)
         };
 
-        // Status indicator - Circle
-        var statusCircle = new WinForms.Panel
+        // Status indicator - LED Light
+        var statusLED = new WinForms.PictureBox
         {
             Left = 30,
             Top = 20,
             Width = 30,
             Height = 30,
-            BackColor = Drawing.Color.Green
+            BackColor = Drawing.Color.Transparent
         };
-        // Create circular appearance
-        var circlePath = new System.Drawing.Drawing2D.GraphicsPath();
-        circlePath.AddEllipse(0, 0, statusCircle.Width, statusCircle.Height);
-        statusCircle.Region = new System.Drawing.Region(circlePath);
-        toolbar.Controls.Add(statusCircle);
+        
+        // Function to draw LED with given color
+        void DrawLED(Drawing.Color color)
+        {
+            var ledBitmap = new System.Drawing.Bitmap(30, 30);
+            using (var g = System.Drawing.Graphics.FromImage(ledBitmap))
+            {
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                
+                // Outer dark ring
+                using (var brush = new System.Drawing.SolidBrush(Drawing.Color.FromArgb(40, 40, 45)))
+                {
+                    g.FillEllipse(brush, 0, 0, 30, 30);
+                }
+                
+                // Main LED body
+                using (var brush = new System.Drawing.SolidBrush(color))
+                {
+                    g.FillEllipse(brush, 3, 3, 24, 24);
+                }
+                
+                // Inner glow effect
+                using (var path = new System.Drawing.Drawing2D.GraphicsPath())
+                {
+                    path.AddEllipse(6, 6, 18, 18);
+                    using (var pgb = new System.Drawing.Drawing2D.PathGradientBrush(path))
+                    {
+                        pgb.CenterPoint = new System.Drawing.PointF(15, 15);
+                        pgb.CenterColor = Drawing.Color.FromArgb(180, 255, 255, 255);
+                        pgb.SurroundColors = new[] { Drawing.Color.FromArgb(0, 255, 255, 255) };
+                        g.FillEllipse(pgb, 6, 6, 18, 18);
+                    }
+                }
+                
+                // Highlight (glossy effect)
+                using (var brush = new System.Drawing.Drawing2D.LinearGradientBrush(
+                    new System.Drawing.Rectangle(8, 8, 10, 8),
+                    Drawing.Color.FromArgb(200, 255, 255, 255),
+                    Drawing.Color.FromArgb(0, 255, 255, 255),
+                    45f))
+                {
+                    g.FillEllipse(brush, 8, 8, 10, 8);
+                }
+            }
+            statusLED.Image = ledBitmap;
+        }
+        
+        // Initialize with green LED
+        DrawLED(Drawing.Color.FromArgb(0, 220, 0));
+        toolbar.Controls.Add(statusLED);
 
         // Button: Decrypt All (toggle) - only visible when Control key is held
         var btnDecryptAll = new WinForms.Button
@@ -713,22 +764,6 @@ public partial class MainWindow : Window
             Enabled = false
         };
         btnDecryptAll.FlatAppearance.BorderColor = _isDarkTheme ? Drawing.Color.FromArgb(80, 80, 85) : Drawing.Color.Gray;
-
-        // Button: Toggle Current Line
-        var btnToggleCurrent = new WinForms.Button
-        {
-            Text = "Toggle Line",
-            Left = 205,
-            Top = 12,
-            Width = 120,
-            Height = 46,
-            FlatStyle = WinForms.FlatStyle.Flat,
-            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(55, 55, 60) : Drawing.Color.White,
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
-            Font = new Drawing.Font("Segoe UI", 9, Drawing.FontStyle.Bold),
-            Cursor = WinForms.Cursors.Hand
-        };
-        btnToggleCurrent.FlatAppearance.BorderColor = _isDarkTheme ? Drawing.Color.FromArgb(80, 80, 85) : Drawing.Color.Gray;
 
         // Button: Save - only visible when changes are made
         var btnSave = new WinForms.Button
@@ -765,56 +800,304 @@ public partial class MainWindow : Window
         btnCancel.FlatAppearance.BorderColor = _isDarkTheme ? Drawing.Color.FromArgb(100, 50, 50) : Drawing.Color.DarkRed;
 
         toolbar.Controls.Add(btnDecryptAll);
-        toolbar.Controls.Add(btnToggleCurrent);
         toolbar.Controls.Add(btnSave);
         toolbar.Controls.Add(btnCancel);
 
-        // Format instruction label (below toolbar)
-        var lblFormat = new WinForms.Label
+        // Parse snippets into rows
+        var snippetRows = new List<SnippetRow>();
+        foreach (var line in originalLines)
         {
-            Text = "#Comment: Format > Label, Snippet text",
-            Dock = WinForms.DockStyle.Top,
-            Height = 25,
-            TextAlign = Drawing.ContentAlignment.MiddleLeft,
-            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(35, 35, 40) : Drawing.Color.FromArgb(250, 250, 250),
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(140, 140, 145) : Drawing.Color.FromArgb(100, 100, 100),
-            Font = new Drawing.Font("Segoe UI", 9, Drawing.FontStyle.Italic),
-            Padding = new WinForms.Padding(10, 0, 0, 0),
-            BorderStyle = WinForms.BorderStyle.FixedSingle
-        };
+            var trimmed = line.Trim();
+            if (string.IsNullOrWhiteSpace(trimmed) || trimmed.StartsWith("#"))
+                continue;
+                
+            var commaIndex = trimmed.IndexOf(',');
+            if (commaIndex > 0)
+            {
+                var label = trimmed[..commaIndex].Trim();
+                var value = trimmed[(commaIndex + 1)..].Trim();
+                snippetRows.Add(new SnippetRow
+                {
+                    Label = label,
+                    Value = "••••••••",
+                    ActualValue = value,
+                    IsEncrypted = true
+                });
+            }
+        }
 
-        // Prepare editor text (no format example in the text itself)
-        var editorInitialText = EncryptLines(plaintext, lineContentMap);
-
-        // Editor
-        var editor = new WinForms.RichTextBox
+        // Create DataGridView
+        var grid = new WinForms.DataGridView
         {
             Dock = WinForms.DockStyle.Fill,
-            ScrollBars = WinForms.RichTextBoxScrollBars.Vertical,
-            AcceptsTab = true,
-            WordWrap = false,
-            Font = new Drawing.Font("Consolas", 10),
-            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White,
+            BackgroundColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White,
             ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
-            Text = NormalizeForEditor(editorInitialText)
+            GridColor = _isDarkTheme ? Drawing.Color.FromArgb(60, 60, 65) : Drawing.Color.Gray,
+            BorderStyle = WinForms.BorderStyle.None,
+            AllowUserToResizeRows = false,
+            AllowUserToAddRows = true,
+            AllowUserToDeleteRows = true,
+            ColumnHeadersHeightSizeMode = WinForms.DataGridViewColumnHeadersHeightSizeMode.AutoSize,
+            AutoSizeColumnsMode = WinForms.DataGridViewAutoSizeColumnsMode.Fill,
+            SelectionMode = WinForms.DataGridViewSelectionMode.FullRowSelect,
+            MultiSelect = false,
+            RowHeadersVisible = true,
+            RowHeadersWidth = 25,
+            Font = new Drawing.Font("Consolas", 10)
         };
+
+        // Style the grid
+        grid.ColumnHeadersDefaultCellStyle.BackColor = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 48) : Drawing.Color.FromArgb(240, 240, 240);
+        grid.ColumnHeadersDefaultCellStyle.ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black;
+        grid.EnableHeadersVisualStyles = false;
+        grid.DefaultCellStyle.BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White;
+        grid.DefaultCellStyle.ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black;
+        grid.DefaultCellStyle.SelectionBackColor = _isDarkTheme ? Drawing.Color.FromArgb(0, 100, 150) : Drawing.Color.LightBlue;
+        grid.DefaultCellStyle.SelectionForeColor = Drawing.Color.White;
+        grid.RowHeadersDefaultCellStyle.BackColor = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 48) : Drawing.Color.FromArgb(240, 240, 240);
+
+        // Add columns
+        var colLabel = new WinForms.DataGridViewTextBoxColumn
+        {
+            HeaderText = "Label",
+            Name = "Label",
+            FillWeight = 30,
+            SortMode = WinForms.DataGridViewColumnSortMode.NotSortable
+        };
+        
+        var colValue = new WinForms.DataGridViewTextBoxColumn
+        {
+            HeaderText = "Value",
+            Name = "Value",
+            FillWeight = 60,
+            SortMode = WinForms.DataGridViewColumnSortMode.NotSortable
+        };
+        
+        var colToggle = new WinForms.DataGridViewTextBoxColumn
+        {
+            HeaderText = "",
+            Name = "Toggle",
+            FillWeight = 10,
+            Width = 50,
+            ReadOnly = true,
+            SortMode = WinForms.DataGridViewColumnSortMode.NotSortable
+        };
+
+        grid.Columns.Add(colLabel);
+        grid.Columns.Add(colValue);
+        grid.Columns.Add(colToggle);
+        
+        // Increase header height for cleaner look
+        grid.ColumnHeadersHeight = 35;
+
+        // Populate grid
+        foreach (var row in snippetRows)
+        {
+            grid.Rows.Add(row.Label, row.Value);
+            grid.Rows[grid.Rows.Count - 2].Tag = row; // Store the SnippetRow in Tag
+        }
 
         // Function to update status circle color
         void UpdateStatusColor()
         {
-            var lines = editor.Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
             bool hasDecrypted = false;
-            foreach (var line in lines)
+            int totalRows = 0;
+            int encryptedRows = 0;
+            
+            foreach (WinForms.DataGridViewRow gridRow in grid.Rows)
             {
-                if (!line.StartsWith("#") && !line.StartsWith("🔒") && !string.IsNullOrWhiteSpace(line) && line.Contains(","))
+                if (gridRow.IsNewRow) continue;
+                if (gridRow.Tag is SnippetRow snippetRow)
                 {
-                    hasDecrypted = true;
-                    break;
+                    totalRows++;
+                    if (!snippetRow.IsEncrypted)
+                    {
+                        hasDecrypted = true;
+                    }
+                    else
+                    {
+                        encryptedRows++;
+                    }
                 }
             }
             
-            statusCircle.BackColor = hasDecrypted ? Drawing.Color.Red : Drawing.Color.Green;
+            // Update LED color
+            DrawLED(hasDecrypted ? Drawing.Color.FromArgb(220, 0, 0) : Drawing.Color.FromArgb(0, 220, 0));
+            
+            // Auto-hide "Hide All" button if all entries are manually encrypted
+            bool allEncrypted = (totalRows > 0 && encryptedRows == totalRows);
+            if (allEncrypted && btnDecryptAll.Text == "Hide All")
+            {
+                isDecrypted = false;
+                btnDecryptAll.Text = "Show All";
+                btnDecryptAll.Visible = false;
+                btnDecryptAll.Enabled = false;
+            }
         }
+
+        // Track hovered cell for eye icon display
+        int hoveredRowIndex = -1;
+        int hoveredColumnIndex = -1;
+        
+        // Custom paint for eye icon column
+        grid.CellPainting += (s, ev) =>
+        {
+            if (ev.ColumnIndex == 2 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count - 1) // Toggle column, not new row
+            {
+                ev.Paint(ev.CellBounds, WinForms.DataGridViewPaintParts.Background | WinForms.DataGridViewPaintParts.Border);
+                
+                var row = grid.Rows[ev.RowIndex];
+                if (row.Tag is SnippetRow snippetRow)
+                {
+                    bool shouldShowEye = false;
+                    var eyeColor = Drawing.Color.Gray;
+                    
+                    if (!snippetRow.IsEncrypted)
+                    {
+                        // Decrypted: show persistent red eye
+                        shouldShowEye = true;
+                        eyeColor = Drawing.Color.FromArgb(220, 0, 0);
+                    }
+                    else if (hoveredRowIndex == ev.RowIndex && hoveredColumnIndex == ev.ColumnIndex)
+                    {
+                        // Encrypted but hovering: show gray eye
+                        shouldShowEye = true;
+                        eyeColor = Drawing.Color.FromArgb(120, 120, 125);
+                    }
+                    
+                    if (shouldShowEye && ev.Graphics != null)
+                    {
+                        var eyeFont = new Drawing.Font("Segoe UI Emoji", 12f);
+                        var eyeBrush = new System.Drawing.SolidBrush(eyeColor);
+                        var sf = new System.Drawing.StringFormat
+                        {
+                            Alignment = System.Drawing.StringAlignment.Center,
+                            LineAlignment = System.Drawing.StringAlignment.Center
+                        };
+                        ev.Graphics.DrawString("👁", eyeFont, eyeBrush, ev.CellBounds, sf);
+                        eyeBrush.Dispose();
+                        eyeFont.Dispose();
+                    }
+                }
+                
+                ev.Handled = true;
+            }
+        };
+        
+        // Track mouse movement for hover effect
+        grid.CellMouseEnter += (s, ev) =>
+        {
+            if (ev.ColumnIndex == 2 && ev.RowIndex >= 0)
+            {
+                hoveredRowIndex = ev.RowIndex;
+                hoveredColumnIndex = ev.ColumnIndex;
+                grid.InvalidateCell(ev.ColumnIndex, ev.RowIndex);
+            }
+        };
+        
+        grid.CellMouseLeave += (s, ev) =>
+        {
+            if (ev.ColumnIndex == 2 && ev.RowIndex >= 0)
+            {
+                hoveredRowIndex = -1;
+                hoveredColumnIndex = -1;
+                grid.InvalidateCell(ev.ColumnIndex, ev.RowIndex);
+            }
+        };
+
+        // Handle cell value changes
+        grid.CellValueChanged += (s, ev) =>
+        {
+            if (isUpdatingProgrammatically || ev.RowIndex < 0 || ev.RowIndex >= grid.Rows.Count)
+                return;
+
+            var row = grid.Rows[ev.RowIndex];
+            if (row.Tag is not SnippetRow snippetRow)
+            {
+                // New row - create SnippetRow
+                snippetRow = new SnippetRow { IsEncrypted = true };
+                row.Tag = snippetRow;
+            }
+
+            hasChanges = true;
+            btnSave.Visible = true;
+
+            // Update the SnippetRow based on which column changed
+            if (ev.ColumnIndex == 0) // Label column
+            {
+                snippetRow.Label = row.Cells[0].Value?.ToString() ?? string.Empty;
+            }
+            else if (ev.ColumnIndex == 1) // Value column
+            {
+                var newValue = row.Cells[1].Value?.ToString() ?? string.Empty;
+                
+                // If encrypted and user types non-dots, store actual value and re-encrypt display
+                if (snippetRow.IsEncrypted && newValue != "••••••••" && !newValue.All(c => c == '•'))
+                {
+                    snippetRow.ActualValue = newValue;
+                    
+                    // Re-encrypt display after a brief delay
+                    var timer = new System.Windows.Forms.Timer { Interval = 150 };
+                    timer.Tick += (ts, te) =>
+                    {
+                        timer.Stop();
+                        timer.Dispose();
+                        if (!isUpdatingProgrammatically && row.Index < grid.Rows.Count)
+                        {
+                            isUpdatingProgrammatically = true;
+                            row.Cells[1].Value = "••••••••";
+                            isUpdatingProgrammatically = false;
+                        }
+                    };
+                    timer.Start();
+                }
+                else if (!snippetRow.IsEncrypted)
+                {
+                    // Decrypted - just update actual value
+                    snippetRow.ActualValue = newValue;
+                }
+            }
+        };
+
+        // Handle end edit to commit changes
+        grid.CellEndEdit += (s, ev) =>
+        {
+            if (ev.RowIndex < 0 || ev.RowIndex >= grid.Rows.Count)
+                return;
+                
+            hasChanges = true;
+            btnSave.Visible = true;
+        };
+
+        // Handle clicks on eye icon column
+        grid.CellClick += (s, ev) =>
+        {
+            if (ev.ColumnIndex == 2 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count - 1) // Toggle column, not new row
+            {
+                var row = grid.Rows[ev.RowIndex];
+                if (row.Tag is SnippetRow snippetRow)
+                {
+                    isUpdatingProgrammatically = true;
+                    snippetRow.IsEncrypted = !snippetRow.IsEncrypted;
+                    
+                    if (snippetRow.IsEncrypted)
+                    {
+                        // Switching to encrypted - show dots
+                        row.Cells[1].Value = "••••••••";
+                    }
+                    else
+                    {
+                        // Switching to decrypted - show actual value
+                        row.Cells[1].Value = snippetRow.ActualValue;
+                    }
+                    
+                    isUpdatingProgrammatically = false;
+                    UpdateStatusColor();
+                    // Refresh the eye icon display
+                    grid.InvalidateCell(2, ev.RowIndex);
+                }
+            }
+        };
 
         // Decrypt All button click handler
         btnDecryptAll.Click += (s, ev) =>
@@ -836,19 +1119,19 @@ public partial class MainWindow : Window
                     // Save the changes first
                     try
                     {
-                        var editorText = NormalizeForStorage(editor.Text);
-                        var lines = editorText.Split('\n').Where(l => !l.TrimStart().StartsWith("#")).ToArray();
-                        editorText = string.Join("\n", lines).Trim();
-                        var finalText = DecryptAllLines(editorText, lineContentMap);
-                        EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, finalText);
-                        
-                        // Reload plaintext with saved changes
-                        if (EncryptedTextStore.TryDecrypt(_textFilePath, _masterPassword, out plaintext))
+                        var textToSave = new StringBuilder();
+                        foreach (WinForms.DataGridViewRow gridRow in grid.Rows)
                         {
-                            hasChanges = false;
-                            btnSave.Visible = false;
-                            lineContentMap.Clear(); // Clear old mappings
+                            if (gridRow.IsNewRow) continue;
+                            if (gridRow.Tag is SnippetRow snippetRow && !string.IsNullOrWhiteSpace(snippetRow.Label))
+                            {
+                                textToSave.AppendLine($"{snippetRow.Label}, {snippetRow.ActualValue}");
+                            }
                         }
+                        
+                        EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, textToSave.ToString().Trim());
+                        hasChanges = false;
+                        btnSave.Visible = false;
                     }
                     catch
                     {
@@ -865,82 +1148,46 @@ public partial class MainWindow : Window
             }
             
             isDecrypted = !isDecrypted;
+            isUpdatingProgrammatically = true;
+            
             if (isDecrypted)
             {
-                // Show decrypted
-                isUpdatingProgrammatically = true;
+                // Show all decrypted
                 btnDecryptAll.Text = "Hide All";
-                btnDecryptAll.Visible = true; // Hide All should always be visible
+                btnDecryptAll.Visible = true;
                 btnDecryptAll.Enabled = true;
-                editor.Text = NormalizeForEditor(plaintext);
-                isUpdatingProgrammatically = false;
+                
+                foreach (WinForms.DataGridViewRow gridRow in grid.Rows)
+                {
+                    if (gridRow.IsNewRow) continue;
+                    if (gridRow.Tag is SnippetRow snippetRow)
+                    {
+                        snippetRow.IsEncrypted = false;
+                        gridRow.Cells[1].Value = snippetRow.ActualValue;
+                        grid.InvalidateCell(2, gridRow.Index); // Refresh eye icon
+                    }
+                }
             }
             else
             {
-                // Show encrypted
-                isUpdatingProgrammatically = true;
+                // Show all encrypted
                 btnDecryptAll.Text = "Show All";
-                btnDecryptAll.Visible = false; // Show All requires Control key
+                btnDecryptAll.Visible = false;
                 btnDecryptAll.Enabled = false;
-                var currentText = NormalizeForStorage(editor.Text);
-                if (!string.IsNullOrEmpty(currentText.Trim()))
-                    editor.Text = NormalizeForEditor(EncryptLines(currentText, lineContentMap));
-                isUpdatingProgrammatically = false;
+                
+                foreach (WinForms.DataGridViewRow gridRow in grid.Rows)
+                {
+                    if (gridRow.IsNewRow) continue;
+                    if (gridRow.Tag is SnippetRow snippetRow)
+                    {
+                        snippetRow.IsEncrypted = true;
+                        gridRow.Cells[1].Value = "••••••••";
+                        grid.InvalidateCell(2, gridRow.Index); // Refresh eye icon
+                    }
+                }
             }
-            UpdateStatusColor();
-        };
-
-        // Toggle Current Line button click handler
-        btnToggleCurrent.Click += (s, ev) =>
-        {
-            var selectionStart = editor.SelectionStart;
-            var lines = editor.Text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
             
-            // Find current line
-            int currentPos = 0;
-            int lineIndex = 0;
-            for (int i = 0; i < lines.Length; i++)
-            {
-                int lineLength = lines[i].Length + Environment.NewLine.Length;
-                if (currentPos + lines[i].Length >= selectionStart)
-                {
-                    lineIndex = i;
-                    break;
-                }
-                currentPos += lineLength;
-            }
-
-            if (lineIndex < lines.Length && !lines[lineIndex].StartsWith("#"))
-            {
-                var line = lines[lineIndex];
-                if (line.StartsWith("🔒 "))
-                {
-                    // Decrypt this line
-                    lines[lineIndex] = DecryptLine(line, lineContentMap);
-                }
-                else if (!string.IsNullOrWhiteSpace(line))
-                {
-                    // Encrypt this line
-                    lines[lineIndex] = EncryptLine(line, lineContentMap);
-                }
-
-                isUpdatingProgrammatically = true;
-                editor.Text = string.Join(Environment.NewLine, lines);
-                editor.SelectionStart = selectionStart;
-                editor.ScrollToCaret();
-                isUpdatingProgrammatically = false;
-                UpdateStatusColor();
-            }
-        };
-
-        // Track text changes
-        editor.TextChanged += (s, ev) =>
-        {
-            if (!isUpdatingProgrammatically)
-            {
-                hasChanges = true;
-                btnSave.Visible = true;
-            }
+            isUpdatingProgrammatically = false;
             UpdateStatusColor();
         };
 
@@ -963,12 +1210,18 @@ public partial class MainWindow : Window
                     // Save before closing
                     try
                     {
-                        var editorText = NormalizeForStorage(editor.Text);
-                        var lines = editorText.Split('\n').Where(l => !l.TrimStart().StartsWith("#")).ToArray();
-                        editorText = string.Join("\n", lines).Trim();
-                        var finalText = DecryptAllLines(editorText, lineContentMap);
-                        EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, finalText);
-                        hasChanges = false; // Prevent FormClosing from prompting again
+                        var textToSave = new StringBuilder();
+                        foreach (WinForms.DataGridViewRow gridRow in grid.Rows)
+                        {
+                            if (gridRow.IsNewRow) continue;
+                            if (gridRow.Tag is SnippetRow snippetRow && !string.IsNullOrWhiteSpace(snippetRow.Label))
+                            {
+                                textToSave.AppendLine($"{snippetRow.Label}, {snippetRow.ActualValue}");
+                            }
+                        }
+                        
+                        EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, textToSave.ToString().Trim());
+                        hasChanges = false;
                         dialog.DialogResult = WinForms.DialogResult.Cancel;
                         dialog.Close();
                     }
@@ -981,7 +1234,7 @@ public partial class MainWindow : Window
                 else
                 {
                     // User chose No, close without saving
-                    hasChanges = false; // Prevent FormClosing from prompting again
+                    hasChanges = false;
                     dialog.DialogResult = WinForms.DialogResult.Cancel;
                     dialog.Close();
                 }
@@ -994,7 +1247,7 @@ public partial class MainWindow : Window
             }
         };
 
-        // Control key handling for Show All button visibility
+        // Control key handling for Show All button visibility and Ctrl+S save
         dialog.KeyDown += (s, ev) =>
         {
             // Handle Ctrl+S to save first (before showing the button)
@@ -1011,47 +1264,35 @@ public partial class MainWindow : Window
                     // Trigger save
                     try
                     {
-                        var editorText = NormalizeForStorage(editor.Text);
-                        var lines = editorText.Split('\n').Where(l => !l.TrimStart().StartsWith("#")).ToArray();
-                        editorText = string.Join("\n", lines).Trim();
-                        var finalText = DecryptAllLines(editorText, lineContentMap);
-                        EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, finalText);
-                        
-                        // Reload plaintext with saved changes
-                        if (EncryptedTextStore.TryDecrypt(_textFilePath, _masterPassword, out plaintext))
+                        var textToSave = new StringBuilder();
+                        foreach (WinForms.DataGridViewRow gridRow in grid.Rows)
                         {
-                            hasChanges = false;
-                            btnSave.Visible = false;
-                            lineContentMap.Clear();
-                            
-                            // Reload the editor content with updated data
-                            isUpdatingProgrammatically = true;
-                            if (isDecrypted)
+                            if (gridRow.IsNewRow) continue;
+                            if (gridRow.Tag is SnippetRow snippetRow && !string.IsNullOrWhiteSpace(snippetRow.Label))
                             {
-                                editor.Text = NormalizeForEditor(plaintext);
+                                textToSave.AppendLine($"{snippetRow.Label}, {snippetRow.ActualValue}");
                             }
-                            else
-                            {
-                                editor.Text = NormalizeForEditor(EncryptLines(plaintext, lineContentMap));
-                            }
-                            isUpdatingProgrammatically = false;
-                            
-                            WinForms.MessageBox.Show("Saved successfully.", "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Information);
                         }
+                        
+                        EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, textToSave.ToString().Trim());
+                        hasChanges = false;
+                        btnSave.Visible = false;
+                        
+                        WinForms.MessageBox.Show("Saved successfully.", "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Information);
                     }
                     catch
                     {
                         WinForms.MessageBox.Show("Failed to save changes.", "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Error);
                     }
                 }
-                return; // Don't process other Control key logic
+                return;
             }
             
             // Handle Escape key to cancel/close
             if (ev.KeyCode == WinForms.Keys.Escape)
             {
                 ev.SuppressKeyPress = true;
-                btnCancel.PerformClick(); // Trigger the Cancel button click which handles unsaved changes
+                btnCancel.PerformClick();
                 return;
             }
             
@@ -1095,11 +1336,17 @@ public partial class MainWindow : Window
                     // Save before closing
                     try
                     {
-                        var editorText = NormalizeForStorage(editor.Text);
-                        var lines = editorText.Split('\n').Where(l => !l.TrimStart().StartsWith("#")).ToArray();
-                        editorText = string.Join("\n", lines).Trim();
-                        var finalText = DecryptAllLines(editorText, lineContentMap);
-                        EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, finalText);
+                        var textToSave = new StringBuilder();
+                        foreach (WinForms.DataGridViewRow gridRow in grid.Rows)
+                        {
+                            if (gridRow.IsNewRow) continue;
+                            if (gridRow.Tag is SnippetRow snippetRow && !string.IsNullOrWhiteSpace(snippetRow.Label))
+                            {
+                                textToSave.AppendLine($"{snippetRow.Label}, {snippetRow.ActualValue}");
+                            }
+                        }
+                        
+                        EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, textToSave.ToString().Trim());
                     }
                     catch
                     {
@@ -1110,8 +1357,7 @@ public partial class MainWindow : Window
             }
         };
 
-        dialog.Controls.Add(editor);
-        dialog.Controls.Add(lblFormat);
+        dialog.Controls.Add(grid);
         dialog.Controls.Add(toolbar);
         dialog.AcceptButton = btnSave;
 
@@ -1120,13 +1366,17 @@ public partial class MainWindow : Window
 
         try
         {
-            var editorText = NormalizeForStorage(editor.Text);
-            // Remove all comment lines (lines starting with #)
-            var lines = editorText.Split('\n').Where(l => !l.TrimStart().StartsWith("#")).ToArray();
-            editorText = string.Join("\n", lines).Trim();
-            // Decrypt any encrypted lines before saving
-            var finalText = DecryptAllLines(editorText, lineContentMap);
-            EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, finalText);
+            var textToSave = new StringBuilder();
+            foreach (WinForms.DataGridViewRow gridRow in grid.Rows)
+            {
+                if (gridRow.IsNewRow) continue;
+                if (gridRow.Tag is SnippetRow snippetRow && !string.IsNullOrWhiteSpace(snippetRow.Label))
+                {
+                    textToSave.AppendLine($"{snippetRow.Label}, {snippetRow.ActualValue}");
+                }
+            }
+            
+            EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, textToSave.ToString().Trim());
             LoadSnippets();
             BuildBubbles();
         }
@@ -1134,101 +1384,6 @@ public partial class MainWindow : Window
         {
             System.Windows.MessageBox.Show("Failed to save encrypted snippets.", "PinBubble", MessageBoxButton.OK, MessageBoxImage.Error);
         }
-    }
-
-    private string EncryptLines(string text, Dictionary<string, string> lineContentMap)
-    {
-        var lines = text.Split('\n');
-        var encrypted = new StringBuilder();
-        foreach (var line in lines)
-        {
-            if (!string.IsNullOrWhiteSpace(line))
-                encrypted.AppendLine(EncryptLine(line.Trim(), lineContentMap));
-            else
-                encrypted.AppendLine();
-        }
-        return encrypted.ToString().TrimEnd('\r', '\n');
-    }
-
-    private string EncryptLine(string line, Dictionary<string, string> lineContentMap)
-    {
-        if (string.IsNullOrWhiteSpace(line)) return line;
-        if (line.StartsWith("🔒 ")) return line; // Already encrypted
-        
-        // Store the original line in the map before encrypting
-        var commaIndex = line.IndexOf(',');
-        if (commaIndex > 0)
-        {
-            var label = line[..commaIndex].Trim();
-            lineContentMap[label] = line; // Store the full line
-            return $"🔒 {label}, ••••••••";
-        }
-        return $"🔒 {line}";
-    }
-
-    private string DecryptLine(string line, Dictionary<string, string> lineContentMap)
-    {
-        if (!line.StartsWith("🔒 ")) return line;
-        
-        var withoutLock = line.Substring(2).Trim();
-        var commaIndex = withoutLock.IndexOf(',');
-        if (commaIndex > 0)
-        {
-            var label = withoutLock[..commaIndex].Trim();
-            
-            // First check the session dictionary
-            if (lineContentMap.TryGetValue(label, out var storedLine))
-                return storedLine;
-            
-            // Fall back to reading from file (for lines that existed before this session)
-            if (!string.IsNullOrEmpty(_masterPassword))
-            {
-                if (EncryptedTextStore.TryDecrypt(_textFilePath, _masterPassword, out var plaintext))
-                {
-                    var originalLines = plaintext.Split('\n');
-                    foreach (var origLine in originalLines)
-                    {
-                        if (origLine.Trim().StartsWith(label + ","))
-                        {
-                            var decryptedLine = origLine.Trim();
-                            lineContentMap[label] = decryptedLine; // Cache it
-                            return decryptedLine;
-                        }
-                    }
-                }
-            }
-        }
-        return withoutLock;
-    }
-
-    private string DecryptAllLines(string text, Dictionary<string, string> lineContentMap)
-    {
-        var lines = text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
-        var decrypted = new StringBuilder();
-        
-        foreach (var line in lines)
-        {
-            if (line.StartsWith("🔒 "))
-            {
-                decrypted.AppendLine(DecryptLine(line, lineContentMap));
-            }
-            else
-            {
-                decrypted.AppendLine(line);
-            }
-        }
-        return decrypted.ToString().TrimEnd('\r', '\n');
-    }
-
-    private static string NormalizeForEditor(string value)
-    {
-        // WinForms multiline text boxes reliably display CRLF line endings.
-        return value.Replace("\r\n", "\n").Replace("\n", Environment.NewLine);
-    }
-
-    private static string NormalizeForStorage(string value)
-    {
-        return value.Replace("\r\n", "\n");
     }
 
     private void ToggleTaskbar_Click(object sender, RoutedEventArgs e)
