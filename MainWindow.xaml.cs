@@ -447,9 +447,9 @@ public partial class MainWindow : Window
 
             for (int i = 0; i < lines.Length; i++)
             {
-                var commaIndex = lines[i].IndexOf(',');
-                var labelFull = lines[i][..commaIndex].Trim();
-                var value = lines[i][(commaIndex + 1)..].Trim();
+                var parts = lines[i].Split(',');
+                var labelFull = parts[0].Trim();
+                var value = parts.Length >= 2 ? parts[1].Trim() : string.Empty;
 
                 // Bubble text: uppercase A-Z and 0-9 only, max 6 chars.
                 var displayLabel = BuildBubbleLabel(labelFull);
