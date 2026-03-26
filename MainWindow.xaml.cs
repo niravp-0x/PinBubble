@@ -50,7 +50,7 @@ public partial class MainWindow : Window
     private WinForms.ContextMenuStrip? _trayMenu;
     private bool _expanded;
     private bool _isDrag;
-    private POINT _dragStartCursor;
+    private System.Windows.Point _dragStartCursor;
     private System.Windows.Point _dragStartWindow;
     private bool _isPinned = true; // Default to pinned
     private bool _isDarkTheme = true; // Default to dark theme
@@ -578,6 +578,12 @@ public partial class MainWindow : Window
         _expanded = true;
         Width = _expandWidth;
         Height = _expandHeight;
+
+        // Keep expanded UI on the monitor where the user is currently interacting.
+        var activeWorkArea = GetWorkAreaForActiveScreen();
+        Left = Math.Max(activeWorkArea.Left, Math.Min(Left, activeWorkArea.Right - Width));
+        Top = Math.Max(activeWorkArea.Top, Math.Min(Top, activeWorkArea.Bottom - Height));
+
         Pin.Opacity = 0.3;
         BubblesHost.Visibility = Visibility.Visible;
         PositionBubbles();
@@ -588,6 +594,7 @@ public partial class MainWindow : Window
         _expanded = false;
         Width = 64;
         Height = 64;
+        SnapToNearestEdge();
         Pin.Opacity = 1.0;
         Pin.Background = new SolidColorBrush(WpfColor.FromRgb(102, 185, 51));
         BubblesHost.Visibility = Visibility.Collapsed;
@@ -595,7 +602,7 @@ public partial class MainWindow : Window
 
     private void Root_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
-        GetCursorPos(out _dragStartCursor);
+        _dragStartCursor = GetCursorPositionInWpfUnits();
         _dragStartWindow = new System.Windows.Point(Left, Top);
         _isDrag = false;
         CaptureMouse();
@@ -604,13 +611,26 @@ public partial class MainWindow : Window
     private void Root_MouseMove(object sender, System.Windows.Input.MouseEventArgs e)
     {
         if (e.LeftButton != MouseButtonState.Pressed) return;
-        GetCursorPos(out POINT cur);
-        int dx = cur.X - _dragStartCursor.X;
-        int dy = cur.Y - _dragStartCursor.Y;
+        var cur = GetCursorPositionInWpfUnits();
+        double dx = cur.X - _dragStartCursor.X;
+        double dy = cur.Y - _dragStartCursor.Y;
         if (!_isDrag && Math.Abs(dx) < 4 && Math.Abs(dy) < 4) return;
         _isDrag = true;
         Left = _dragStartWindow.X + dx;
         Top = _dragStartWindow.Y + dy;
+    }
+
+    private System.Windows.Point GetCursorPositionInWpfUnits()
+    {
+        if (!GetCursorPos(out POINT cursorPoint))
+            return new System.Windows.Point(Left, Top);
+
+        var source = PresentationSource.FromVisual(this);
+        if (source?.CompositionTarget is null)
+            return new System.Windows.Point(cursorPoint.X, cursorPoint.Y);
+
+        var fromDevice = source.CompositionTarget.TransformFromDevice;
+        return fromDevice.Transform(new System.Windows.Point(cursorPoint.X, cursorPoint.Y));
     }
 
     private void Root_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
@@ -621,9 +641,90 @@ public partial class MainWindow : Window
         _isDrag = false;
     }
 
+    private Rect GetWorkAreaForActiveScreen()
+    {
+        if (!GetCursorPos(out POINT cursorPoint))
+            return SystemParameters.WorkArea;
+
+        var activeScreen = WinForms.Screen.FromPoint(new Drawing.Point(cursorPoint.X, cursorPoint.Y));
+        return ConvertDeviceRectToWpfRect(activeScreen.WorkingArea);
+    }
+
+    private Rect GetWorkAreaForCurrentWindowScreen()
+    {
+        var windowRect = ConvertWpfRectToDeviceRect(new Rect(
+            Left,
+            Top,
+            Math.Max(1, Width),
+            Math.Max(1, Height)));
+
+        var screen = WinForms.Screen.FromRectangle(windowRect);
+        return ConvertDeviceRectToWpfRect(screen.WorkingArea);
+    }
+
+    private bool IsWindowOffAllScreens()
+    {
+        var windowRect = new Rect(Left, Top, Width, Height);
+        foreach (var screen in WinForms.Screen.AllScreens)
+        {
+            var screenRect = ConvertDeviceRectToWpfRect(screen.WorkingArea);
+            if (windowRect.IntersectsWith(screenRect))
+                return false;
+        }
+
+        return true;
+    }
+
+    private Rect ConvertDeviceRectToWpfRect(Drawing.Rectangle deviceRect)
+    {
+        var source = PresentationSource.FromVisual(this);
+        if (source?.CompositionTarget is null)
+            return new Rect(deviceRect.Left, deviceRect.Top, deviceRect.Width, deviceRect.Height);
+
+        var fromDevice = source.CompositionTarget.TransformFromDevice;
+        var topLeft = fromDevice.Transform(new System.Windows.Point(deviceRect.Left, deviceRect.Top));
+        var bottomRight = fromDevice.Transform(new System.Windows.Point(deviceRect.Right, deviceRect.Bottom));
+        return new Rect(topLeft, bottomRight);
+    }
+
+    private Drawing.Rectangle ConvertWpfRectToDeviceRect(Rect wpfRect)
+    {
+        var source = PresentationSource.FromVisual(this);
+        if (source?.CompositionTarget is null)
+        {
+            return new Drawing.Rectangle(
+                (int)Math.Round(wpfRect.Left),
+                (int)Math.Round(wpfRect.Top),
+                (int)Math.Round(wpfRect.Width),
+                (int)Math.Round(wpfRect.Height));
+        }
+
+        var toDevice = source.CompositionTarget.TransformToDevice;
+        var topLeft = toDevice.Transform(new System.Windows.Point(wpfRect.Left, wpfRect.Top));
+        var bottomRight = toDevice.Transform(new System.Windows.Point(wpfRect.Right, wpfRect.Bottom));
+
+        return Drawing.Rectangle.FromLTRB(
+            (int)Math.Round(topLeft.X),
+            (int)Math.Round(topLeft.Y),
+            (int)Math.Round(bottomRight.X),
+            (int)Math.Round(bottomRight.Y));
+    }
+
+    private void MoveToActiveScreenIfOffscreen()
+    {
+        if (!IsWindowOffAllScreens())
+            return;
+
+        var activeWorkArea = GetWorkAreaForActiveScreen();
+        Left = Math.Max(activeWorkArea.Left, Math.Min(Left, activeWorkArea.Right - Width));
+        Top = Math.Max(activeWorkArea.Top, Math.Min(Top, activeWorkArea.Bottom - Height));
+    }
+
     private void SnapToNearestEdge()
     {
-        var wa = SystemParameters.WorkArea;
+        MoveToActiveScreenIfOffscreen();
+
+        var wa = GetWorkAreaForCurrentWindowScreen();
         double leftDist = Math.Abs(Left - wa.Left);
         double rightDist = Math.Abs(Left + Width - wa.Right);
         double topDist = Math.Abs(Top - wa.Top);
@@ -641,7 +742,7 @@ public partial class MainWindow : Window
 
     private void PositionBubbles()
     {
-        var wa = SystemParameters.WorkArea;
+        var wa = GetWorkAreaForCurrentWindowScreen();
         double startX = 25;
         double startY = 25;
         double spacingX = 56;
