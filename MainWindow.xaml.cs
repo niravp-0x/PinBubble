@@ -67,10 +67,15 @@ public partial class MainWindow : Window
     private double? _savedWindowTop;
     private string? _savedMonitorDeviceName;
 
-    private static readonly SolidColorBrush BubbleDefault = new SolidColorBrush(WpfColor.FromRgb(45, 45, 48));
-    private static readonly SolidColorBrush BubbleHover = new SolidColorBrush(WpfColor.FromRgb(102, 185, 51));
+    private static readonly WpfColor BubbleDefaultColorDark = WpfColor.FromRgb(45, 45, 48);
+    private static readonly WpfColor BubbleDefaultColorLight = WpfColor.FromRgb(230, 233, 237);
+    private static readonly WpfColor BubbleBorderColorDark = WpfColor.FromRgb(80, 80, 80);
+    private static readonly WpfColor BubbleBorderColorLight = WpfColor.FromRgb(176, 181, 188);
+    private static readonly WpfColor BubbleHoverColorDark = WpfColor.FromRgb(102, 185, 51);
+    private static readonly WpfColor BubbleHoverColorLight = WpfColor.FromRgb(125, 190, 90);
     private static readonly SolidColorBrush BubbleClicked = new SolidColorBrush(WpfColor.FromRgb(0, 255, 0));
-    private static readonly WpfColor BackdropBaseColor = WpfColor.FromRgb(16, 18, 22);
+    private static readonly WpfColor BackdropBaseColorDark = WpfColor.FromRgb(16, 18, 22);
+    private static readonly WpfColor BackdropBaseColorLight = WpfColor.FromRgb(245, 247, 250);
 
     private sealed class UiSettings
     {
@@ -93,7 +98,7 @@ public partial class MainWindow : Window
             "settings.json");
 
         LoadUiSettings();
-        ApplyBackdropOpacity();
+        ApplyExpandedPanelTheme();
         UpdateBackdropOpacityMenuChecks();
         DarkThemeMenuItem.IsChecked = _isDarkTheme;
         
@@ -522,6 +527,10 @@ public partial class MainWindow : Window
     private void BuildBubbles()
     {
         BubblesHost.Children.Clear();
+        var bubbleDefault = new SolidColorBrush(_isDarkTheme ? BubbleDefaultColorDark : BubbleDefaultColorLight);
+        var bubbleHover = new SolidColorBrush(_isDarkTheme ? BubbleHoverColorDark : BubbleHoverColorLight);
+        var bubbleBorder = new SolidColorBrush(_isDarkTheme ? BubbleBorderColorDark : BubbleBorderColorLight);
+        var bubbleForeground = _isDarkTheme ? WpfBrushes.White : WpfBrushes.Black;
 
         // Dynamic width based on count - 5 per row
         int count = _labels.Length;
@@ -543,10 +552,10 @@ public partial class MainWindow : Window
                 Content = _labels[i],
                 FontSize = _labels[i].Length <= 3 ? 12 : 9,
                 FontWeight = FontWeights.Bold,
-                Foreground = WpfBrushes.White,
-                Background = BubbleDefault,
+                Foreground = bubbleForeground,
+                Background = bubbleDefault,
                 BorderThickness = new Thickness(1),
-                BorderBrush = new SolidColorBrush(WpfColor.FromRgb(80, 80, 80)),
+                BorderBrush = bubbleBorder,
                 Tag = i,
                 ToolTip = i < _fullLabels.Length ? _fullLabels[i] : _labels[i],
                 Cursor = WpfCursors.Hand,
@@ -554,8 +563,8 @@ public partial class MainWindow : Window
             };
 
             btn.Click += Bubble_Click;
-            btn.MouseEnter += (s, _) => { if (s is WpfButton b) b.Background = BubbleHover; };
-            btn.MouseLeave += (s, _) => { if (s is WpfButton b) b.Background = BubbleDefault; };
+            btn.MouseEnter += (s, _) => { if (s is WpfButton b) b.Background = bubbleHover; };
+            btn.MouseLeave += (s, _) => { if (s is WpfButton b) b.Background = bubbleDefault; };
             btn.Template = CreateRoundButtonTemplate();
             BubblesHost.Children.Add(btn);
         }
@@ -590,7 +599,7 @@ public partial class MainWindow : Window
                 System.Windows.Clipboard.SetText(_snippets[idx]);
                 b.Background = BubbleClicked;
                 await Task.Delay(150);
-                b.Background = BubbleDefault;
+                b.Background = new SolidColorBrush(_isDarkTheme ? BubbleDefaultColorDark : BubbleDefaultColorLight);
             }
             catch { }
             Collapse();
@@ -1859,6 +1868,8 @@ public partial class MainWindow : Window
     {
         _isDarkTheme = !_isDarkTheme;
         DarkThemeMenuItem.IsChecked = _isDarkTheme;
+        ApplyExpandedPanelTheme();
+        BuildBubbles();
         SaveUiSettings();
     }
 
@@ -1880,7 +1891,8 @@ public partial class MainWindow : Window
 
         Topmost = _isPinned;
         DarkThemeMenuItem.IsChecked = _isDarkTheme;
-        ApplyBackdropOpacity();
+        ApplyExpandedPanelTheme();
+        BuildBubbles();
         UpdateBackdropOpacityMenuChecks();
         UpdatePinMenuText();
         UpdateTaskbarMenuText();
@@ -1903,9 +1915,18 @@ public partial class MainWindow : Window
 
     private void ApplyBackdropOpacity()
     {
+        var baseColor = _isDarkTheme ? BackdropBaseColorDark : BackdropBaseColorLight;
         var alpha = (byte)Math.Round(Math.Clamp(_backdropOpacity, 0.0, 1.0) * 255);
         ExpandedBackdrop.Background = new SolidColorBrush(
-            WpfColor.FromArgb(alpha, BackdropBaseColor.R, BackdropBaseColor.G, BackdropBaseColor.B));
+            WpfColor.FromArgb(alpha, baseColor.R, baseColor.G, baseColor.B));
+    }
+
+    private void ApplyExpandedPanelTheme()
+    {
+        ApplyBackdropOpacity();
+        ExpandedBackdrop.BorderBrush = new SolidColorBrush(_isDarkTheme
+            ? WpfColor.FromArgb(85, 255, 255, 255)
+            : WpfColor.FromArgb(120, 45, 55, 70));
     }
 
     private void UpdateBackdropOpacityMenuChecks()
