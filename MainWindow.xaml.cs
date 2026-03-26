@@ -1,9 +1,11 @@
 ﻿using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Text;
+using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -33,6 +35,11 @@ class SnippetRow
 
 public partial class MainWindow : Window
 {
+    private const double DefaultBackdropOpacity = 0.50;
+    private const bool DefaultIsPinned = true;
+    private const bool DefaultIsDarkTheme = true;
+    private const bool DefaultShowInTaskbar = true;
+
     [DllImport("user32.dll")]
     private static extern bool GetCursorPos(out POINT lpPoint);
 
@@ -40,6 +47,7 @@ public partial class MainWindow : Window
     private struct POINT { public int X; public int Y; }
 
     private readonly string _textFilePath;
+    private readonly string _settingsFilePath;
     private string? _masterPassword;
     private string[] _labels = Array.Empty<string>();
     private string[] _fullLabels = Array.Empty<string>();
@@ -52,21 +60,45 @@ public partial class MainWindow : Window
     private bool _isDrag;
     private System.Windows.Point _dragStartCursor;
     private System.Windows.Point _dragStartWindow;
-    private bool _isPinned = true; // Default to pinned
-    private bool _isDarkTheme = true; // Default to dark theme
+    private bool _isPinned = DefaultIsPinned;
+    private bool _isDarkTheme = DefaultIsDarkTheme;
+    private double _backdropOpacity = DefaultBackdropOpacity;
+    private double? _savedWindowLeft;
+    private double? _savedWindowTop;
+    private string? _savedMonitorDeviceName;
 
     private static readonly SolidColorBrush BubbleDefault = new SolidColorBrush(WpfColor.FromRgb(45, 45, 48));
     private static readonly SolidColorBrush BubbleHover = new SolidColorBrush(WpfColor.FromRgb(102, 185, 51));
     private static readonly SolidColorBrush BubbleClicked = new SolidColorBrush(WpfColor.FromRgb(0, 255, 0));
+    private static readonly WpfColor BackdropBaseColor = WpfColor.FromRgb(16, 18, 22);
+
+    private sealed class UiSettings
+    {
+        public double BackdropOpacity { get; set; } = DefaultBackdropOpacity;
+        public bool IsPinned { get; set; } = DefaultIsPinned;
+        public bool IsDarkTheme { get; set; } = DefaultIsDarkTheme;
+        public bool ShowInTaskbar { get; set; } = DefaultShowInTaskbar;
+        public double? WindowLeft { get; set; }
+        public double? WindowTop { get; set; }
+        public string? MonitorDeviceName { get; set; }
+    }
 
     public MainWindow()
     {
         InitializeComponent();
         _textFilePath = Path.Combine(AppContext.BaseDirectory, "text.text");
+        _settingsFilePath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "PinBubble",
+            "settings.json");
+
+        LoadUiSettings();
+        ApplyBackdropOpacity();
+        UpdateBackdropOpacityMenuChecks();
+        DarkThemeMenuItem.IsChecked = _isDarkTheme;
         
-        // Ensure window is topmost from the start (in case pinned by default)
-        if (_isPinned)
-            Topmost = true;
+        // Ensure window topmost behavior follows saved pin state.
+        Topmost = _isPinned;
         
         if (!InitializeSecureStore())
         {
@@ -78,7 +110,7 @@ public partial class MainWindow : Window
         BuildBubbles();
         SetupWatcher();
         SetupTrayIcon();
-        Loaded += (_, _) => SnapToNearestEdge();
+        Loaded += (_, _) => RestoreWindowPlacement();
         Loaded += (_, _) => UpdateTaskbarMenuText();
         Loaded += (_, _) => UpdatePinMenuText();
         KeyDown += (_, e) => { if (e.Key == Key.Escape && _expanded) Collapse(); };
@@ -585,6 +617,7 @@ public partial class MainWindow : Window
         Top = Math.Max(activeWorkArea.Top, Math.Min(Top, activeWorkArea.Bottom - Height));
 
         Pin.Opacity = 0.3;
+        ExpandedBackdrop.Visibility = Visibility.Visible;
         BubblesHost.Visibility = Visibility.Visible;
         PositionBubbles();
     }
@@ -597,6 +630,7 @@ public partial class MainWindow : Window
         SnapToNearestEdge();
         Pin.Opacity = 1.0;
         Pin.Background = new SolidColorBrush(WpfColor.FromRgb(102, 185, 51));
+        ExpandedBackdrop.Visibility = Visibility.Collapsed;
         BubblesHost.Visibility = Visibility.Collapsed;
     }
 
@@ -636,7 +670,11 @@ public partial class MainWindow : Window
     private void Root_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
     {
         ReleaseMouseCapture();
-        if (_isDrag) SnapToNearestEdge();
+        if (_isDrag)
+        {
+            SnapToNearestEdge();
+            SaveUiSettings();
+        }
         else ToggleExpand();
         _isDrag = false;
     }
@@ -738,6 +776,36 @@ public partial class MainWindow : Window
 
         Left = Math.Max(wa.Left, Math.Min(Left, wa.Right - Width));
         Top = Math.Max(wa.Top, Math.Min(Top, wa.Bottom - Height));
+    }
+
+    private void RestoreWindowPlacement()
+    {
+        if (_savedWindowLeft is null || _savedWindowTop is null)
+        {
+            SnapToNearestEdge();
+            return;
+        }
+
+        Left = _savedWindowLeft.Value;
+        Top = _savedWindowTop.Value;
+
+        if (!string.IsNullOrWhiteSpace(_savedMonitorDeviceName))
+        {
+            var savedScreen = WinForms.Screen.AllScreens.FirstOrDefault(s =>
+                string.Equals(s.DeviceName, _savedMonitorDeviceName, StringComparison.OrdinalIgnoreCase));
+
+            if (savedScreen is not null)
+            {
+                var wa = ConvertDeviceRectToWpfRect(savedScreen.WorkingArea);
+                Left = Math.Max(wa.Left, Math.Min(Left, wa.Right - Width));
+                Top = Math.Max(wa.Top, Math.Min(Top, wa.Bottom - Height));
+            }
+        }
+
+        if (IsWindowOffAllScreens())
+            MoveToActiveScreenIfOffscreen();
+
+        SnapToNearestEdge();
     }
 
     private void PositionBubbles()
@@ -1759,6 +1827,7 @@ public partial class MainWindow : Window
     {
         ShowInTaskbar = !ShowInTaskbar;
         UpdateTaskbarMenuText();
+        SaveUiSettings();
         
         if (!ShowInTaskbar && _trayIcon != null)
         {
@@ -1778,6 +1847,7 @@ public partial class MainWindow : Window
         _isPinned = !_isPinned;
         Topmost = _isPinned;
         UpdatePinMenuText();
+        SaveUiSettings();
     }
 
     private void UpdatePinMenuText()
@@ -1789,6 +1859,122 @@ public partial class MainWindow : Window
     {
         _isDarkTheme = !_isDarkTheme;
         DarkThemeMenuItem.IsChecked = _isDarkTheme;
+        SaveUiSettings();
+    }
+
+    private void ResetPreferences_Click(object sender, RoutedEventArgs e)
+    {
+        var result = System.Windows.MessageBox.Show(
+            "Reset UI preferences to defaults? This does not affect snippets.",
+            "PinBubble",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Question);
+
+        if (result != MessageBoxResult.Yes)
+            return;
+
+        _backdropOpacity = DefaultBackdropOpacity;
+        _isPinned = DefaultIsPinned;
+        _isDarkTheme = DefaultIsDarkTheme;
+        ShowInTaskbar = DefaultShowInTaskbar;
+
+        Topmost = _isPinned;
+        DarkThemeMenuItem.IsChecked = _isDarkTheme;
+        ApplyBackdropOpacity();
+        UpdateBackdropOpacityMenuChecks();
+        UpdatePinMenuText();
+        UpdateTaskbarMenuText();
+        SaveUiSettings();
+    }
+
+    private void BackdropOpacity_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not MenuItem menuItem || menuItem.Tag is not string tagValue)
+            return;
+
+        if (!double.TryParse(tagValue, NumberStyles.Float, CultureInfo.InvariantCulture, out var opacity))
+            return;
+
+        _backdropOpacity = Math.Clamp(opacity, 0.0, 1.0);
+        ApplyBackdropOpacity();
+        UpdateBackdropOpacityMenuChecks();
+        SaveUiSettings();
+    }
+
+    private void ApplyBackdropOpacity()
+    {
+        var alpha = (byte)Math.Round(Math.Clamp(_backdropOpacity, 0.0, 1.0) * 255);
+        ExpandedBackdrop.Background = new SolidColorBrush(
+            WpfColor.FromArgb(alpha, BackdropBaseColor.R, BackdropBaseColor.G, BackdropBaseColor.B));
+    }
+
+    private void UpdateBackdropOpacityMenuChecks()
+    {
+        BackdropOpacity20MenuItem.IsChecked = Math.Abs(_backdropOpacity - 0.20) < 0.01;
+        BackdropOpacity35MenuItem.IsChecked = Math.Abs(_backdropOpacity - 0.35) < 0.01;
+        BackdropOpacity50MenuItem.IsChecked = Math.Abs(_backdropOpacity - 0.50) < 0.01;
+        BackdropOpacity65MenuItem.IsChecked = Math.Abs(_backdropOpacity - 0.65) < 0.01;
+        BackdropOpacity80MenuItem.IsChecked = Math.Abs(_backdropOpacity - 0.80) < 0.01;
+    }
+
+    private void LoadUiSettings()
+    {
+        try
+        {
+            if (!File.Exists(_settingsFilePath))
+                return;
+
+            var json = File.ReadAllText(_settingsFilePath);
+            var settings = JsonSerializer.Deserialize<UiSettings>(json);
+            if (settings is not null)
+            {
+                _backdropOpacity = Math.Clamp(settings.BackdropOpacity, 0.0, 1.0);
+                _isPinned = settings.IsPinned;
+                _isDarkTheme = settings.IsDarkTheme;
+                ShowInTaskbar = settings.ShowInTaskbar;
+                _savedWindowLeft = settings.WindowLeft;
+                _savedWindowTop = settings.WindowTop;
+                _savedMonitorDeviceName = settings.MonitorDeviceName;
+            }
+        }
+        catch
+        {
+            // Invalid or inaccessible settings should not block app startup.
+        }
+    }
+
+    private void SaveUiSettings()
+    {
+        try
+        {
+            var settingsDir = Path.GetDirectoryName(_settingsFilePath);
+            if (!string.IsNullOrWhiteSpace(settingsDir))
+                Directory.CreateDirectory(settingsDir);
+
+            var windowRect = ConvertWpfRectToDeviceRect(new Rect(
+                Left,
+                Top,
+                Math.Max(1, Width),
+                Math.Max(1, Height)));
+            var currentScreen = WinForms.Screen.FromRectangle(windowRect);
+
+            var settings = new UiSettings
+            {
+                BackdropOpacity = _backdropOpacity,
+                IsPinned = _isPinned,
+                IsDarkTheme = _isDarkTheme,
+                ShowInTaskbar = ShowInTaskbar,
+                WindowLeft = Left,
+                WindowTop = Top,
+                MonitorDeviceName = currentScreen.DeviceName
+            };
+            var json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(_settingsFilePath, json);
+        }
+        catch
+        {
+            // Failing to save UI preferences should be non-fatal.
+        }
     }
 
     private void Window_StateChanged(object? sender, EventArgs e)
@@ -1799,6 +1985,7 @@ public partial class MainWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
+        SaveUiSettings();
         _trayIcon?.Dispose();
         _trayMenu?.Dispose();
         _watcher?.Dispose();
