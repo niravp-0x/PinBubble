@@ -93,11 +93,24 @@ public partial class MainWindow : Window
     public MainWindow()
     {
         InitializeComponent();
-        _textFilePath = Path.Combine(AppContext.BaseDirectory, "text.text");
         _settingsFilePath = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
             "PinBubble",
             "settings.json");
+
+        var appDataDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "PinBubble");
+        Directory.CreateDirectory(appDataDir);
+        _textFilePath = Path.Combine(appDataDir, "snippets.bin");
+
+        // One-time migration: move old text.text from the install directory if present
+        var legacyPath = Path.Combine(AppContext.BaseDirectory, "text.text");
+        if (!File.Exists(_textFilePath) && File.Exists(legacyPath))
+        {
+            try { File.Move(legacyPath, _textFilePath); }
+            catch { /* non-fatal; a new file will be created on first save */ }
+        }
 
         LoadUiSettings();
         ApplyExpandedPanelTheme();
