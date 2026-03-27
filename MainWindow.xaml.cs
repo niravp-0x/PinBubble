@@ -33,8 +33,114 @@ class SnippetRow
     public DateTime ExpiryDate { get; set; } = DateTime.Now.AddDays(30);
 }
 
+// Lightweight DTO for JSON persistence (no UI-only fields)
+class SnippetEntry
+{
+    public string Label { get; set; } = string.Empty;
+    public string Value { get; set; } = string.Empty;
+    public DateTime Created { get; set; } = DateTime.Now;
+    public DateTime Modified { get; set; } = DateTime.Now;
+    public DateTime ExpiryDate { get; set; } = DateTime.Now.AddDays(30);
+}
+
 public partial class MainWindow : Window
 {
+    private static readonly JsonSerializerOptions s_jsonOptions = new()
+    {
+        WriteIndented = true,
+        PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+    };
+
+    private static string SerializeSnippetsToJson(IEnumerable<SnippetRow> rows)
+    {
+        var entries = rows
+            .Where(r => !string.IsNullOrWhiteSpace(r.Label))
+            .Select(r => new SnippetEntry
+            {
+                Label = r.Label,
+                Value = r.ActualValue,
+                Created = r.Created,
+                Modified = r.Modified,
+                ExpiryDate = r.ExpiryDate
+            })
+            .ToList();
+        return JsonSerializer.Serialize(entries, s_jsonOptions);
+    }
+
+    private static List<SnippetRow> ParseSnippets(string plaintext)
+    {
+        var trimmed = plaintext.TrimStart();
+        if (trimmed.StartsWith('['))
+        {
+            // JSON format
+            var entries = JsonSerializer.Deserialize<List<SnippetEntry>>(trimmed, s_jsonOptions) ?? new();
+            return entries.Select(e => new SnippetRow
+            {
+                Label = e.Label,
+                Value = "••••••••",
+                ActualValue = e.Value,
+                IsEncrypted = true,
+                Created = e.Created,
+                Modified = e.Modified,
+                ExpiryDate = e.ExpiryDate
+            }).ToList();
+        }
+
+        // Legacy comma-delimited format – split on first comma for the label,
+        // then try to extract ISO-8601 timestamps from the end.
+        var rows = new List<SnippetRow>();
+        foreach (var line in plaintext.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None))
+        {
+            var l = line.Trim();
+            if (string.IsNullOrWhiteSpace(l) || l.StartsWith('#'))
+                continue;
+
+            var commaIdx = l.IndexOf(',');
+            if (commaIdx < 0) continue;
+
+            var label = l[..commaIdx].Trim();
+            var rest = l[(commaIdx + 1)..].Trim();
+
+            DateTime created = DateTime.Now;
+            DateTime modified = DateTime.Now;
+            DateTime expiry = DateTime.Now.AddDays(30);
+            string value = rest;
+
+            // Try to peel off 3 ISO timestamps from the end
+            var segments = rest.Split(',');
+            if (segments.Length >= 4 &&
+                DateTime.TryParse(segments[^1].Trim(), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var eDate) &&
+                DateTime.TryParse(segments[^2].Trim(), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var mDate) &&
+                DateTime.TryParse(segments[^3].Trim(), CultureInfo.InvariantCulture, DateTimeStyles.RoundtripKind, out var cDate))
+            {
+                created = cDate;
+                modified = mDate;
+                expiry = eDate;
+                value = string.Join(",", segments[..^3]).Trim();
+            }
+
+            rows.Add(new SnippetRow
+            {
+                Label = label,
+                Value = "••••••••",
+                ActualValue = value,
+                IsEncrypted = true,
+                Created = created,
+                Modified = modified,
+                ExpiryDate = expiry
+            });
+        }
+        return rows;
+    }
+
+    private static string BuildGridSaveJson(WinForms.DataGridView grid)
+    {
+        var rows = grid.Rows.Cast<WinForms.DataGridViewRow>()
+            .Where(r => !r.IsNewRow && r.Tag is SnippetRow)
+            .Select(r => (SnippetRow)r.Tag!);
+        return SerializeSnippetsToJson(rows);
+    }
+
     private const double DefaultBackdropOpacity = 0.50;
     private const bool DefaultIsPinned = true;
     private const bool DefaultIsDarkTheme = true;
@@ -172,9 +278,11 @@ public partial class MainWindow : Window
 
             if (!File.Exists(_textFilePath))
             {
-                var defaultContent =
-                    "Label1, Your first snippet text here\n" +
-                    "Label2, Your second snippet text here\n";
+                var defaultContent = SerializeSnippetsToJson(new[]
+                {
+                    new SnippetRow { Label = "Label1", ActualValue = "Your first snippet text here" },
+                    new SnippetRow { Label = "Label2", ActualValue = "Your second snippet text here" }
+                });
                 EncryptedTextStore.EncryptAndSave(_textFilePath, password, defaultContent);
                 _masterPassword = password;
                 MaybeOfferBiometricUnlock(password);
@@ -652,26 +760,18 @@ public partial class MainWindow : Window
                 return;
             }
 
-            var lines = plaintext
-                .Split(new[] { "\r\n", "\n" }, StringSplitOptions.None)
-                .Where(l => !string.IsNullOrWhiteSpace(l) && l.Contains(','))
-                .ToArray();
+            var parsed = ParseSnippets(plaintext);
 
-            _labels = new string[lines.Length];
-            _fullLabels = new string[lines.Length];
-            _snippets = new string[lines.Length];
+            _labels = new string[parsed.Count];
+            _fullLabels = new string[parsed.Count];
+            _snippets = new string[parsed.Count];
 
-            for (int i = 0; i < lines.Length; i++)
+            for (int i = 0; i < parsed.Count; i++)
             {
-                var parts = lines[i].Split(',');
-                var labelFull = parts[0].Trim();
-                var value = parts.Length >= 2 ? parts[1].Trim() : string.Empty;
-
-                // Bubble text: uppercase A-Z and 0-9 only, max 6 chars.
-                var displayLabel = BuildBubbleLabel(labelFull);
-                _fullLabels[i] = labelFull;
+                var displayLabel = BuildBubbleLabel(parsed[i].Label);
+                _fullLabels[i] = parsed[i].Label;
                 _labels[i] = displayLabel;
-                _snippets[i] = value;
+                _snippets[i] = parsed[i].ActualValue;
             }
         }
         catch { }
@@ -1059,7 +1159,6 @@ public partial class MainWindow : Window
         };
 
         var isDecrypted = false;
-        var originalLines = plaintext.Split('\n');
         var hasChanges = false;
         var isUpdatingProgrammatically = false;
         
@@ -1188,46 +1287,8 @@ public partial class MainWindow : Window
         toolbar.Controls.Add(btnSave);
         toolbar.Controls.Add(btnCancel);
 
-        // Parse snippets into rows
-        var snippetRows = new List<SnippetRow>();
-        foreach (var line in originalLines)
-        {
-            var trimmed = line.Trim();
-            if (string.IsNullOrWhiteSpace(trimmed) || trimmed.StartsWith("#"))
-                continue;
-                
-            var parts = trimmed.Split(',');
-            if (parts.Length >= 2)
-            {
-                var label = parts[0].Trim();
-                var value = parts[1].Trim();
-                DateTime created = DateTime.Now;
-                DateTime modified = DateTime.Now;
-                DateTime expiry = DateTime.Now.AddDays(30);
-                
-                // Try to parse timestamps if they exist (backward compatible)
-                if (parts.Length >= 4)
-                {
-                    DateTime.TryParse(parts[2].Trim(), out created);
-                    DateTime.TryParse(parts[3].Trim(), out modified);
-                }
-                if (parts.Length >= 5)
-                {
-                    DateTime.TryParse(parts[4].Trim(), out expiry);
-                }
-                
-                snippetRows.Add(new SnippetRow
-                {
-                    Label = label,
-                    Value = "••••••••",
-                    ActualValue = value,
-                    IsEncrypted = true,
-                    Created = created,
-                    Modified = modified,
-                    ExpiryDate = expiry
-                });
-            }
-        }
+        // Parse snippets from JSON (or legacy comma-delimited format)
+        var snippetRows = ParseSnippets(plaintext);
 
         // Create DataGridView
         var grid = new WinForms.DataGridView
@@ -1757,17 +1818,7 @@ public partial class MainWindow : Window
                     // Save the changes first
                     try
                     {
-                        var textToSave = new StringBuilder();
-                        foreach (WinForms.DataGridViewRow gridRow in grid.Rows)
-                        {
-                            if (gridRow.IsNewRow) continue;
-                            if (gridRow.Tag is SnippetRow snippetRow && !string.IsNullOrWhiteSpace(snippetRow.Label))
-                            {
-                                textToSave.AppendLine($"{snippetRow.Label}, {snippetRow.ActualValue}, {snippetRow.Created:o}, {snippetRow.Modified:o}, {snippetRow.ExpiryDate:o}");
-                            }
-                        }
-                        
-                        EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, textToSave.ToString().Trim());
+                        EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword!, BuildGridSaveJson(grid));
                         hasChanges = false;
                         btnSave.Visible = false;
                     }
@@ -1848,17 +1899,7 @@ public partial class MainWindow : Window
                     // Save before closing
                     try
                     {
-                        var textToSave = new StringBuilder();
-                        foreach (WinForms.DataGridViewRow gridRow in grid.Rows)
-                        {
-                            if (gridRow.IsNewRow) continue;
-                            if (gridRow.Tag is SnippetRow snippetRow && !string.IsNullOrWhiteSpace(snippetRow.Label))
-                            {
-                                textToSave.AppendLine($"{snippetRow.Label}, {snippetRow.ActualValue}, {snippetRow.Created:o}, {snippetRow.Modified:o}, {snippetRow.ExpiryDate:o}");
-                            }
-                        }
-                        
-                        EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, textToSave.ToString().Trim());
+                        EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword!, BuildGridSaveJson(grid));
                         hasChanges = false;
                         dialog.DialogResult = WinForms.DialogResult.Cancel;
                         dialog.Close();
@@ -1902,17 +1943,7 @@ public partial class MainWindow : Window
                     // Trigger save
                     try
                     {
-                        var textToSave = new StringBuilder();
-                        foreach (WinForms.DataGridViewRow gridRow in grid.Rows)
-                        {
-                            if (gridRow.IsNewRow) continue;
-                            if (gridRow.Tag is SnippetRow snippetRow && !string.IsNullOrWhiteSpace(snippetRow.Label))
-                            {
-                                textToSave.AppendLine($"{snippetRow.Label}, {snippetRow.ActualValue}, {snippetRow.Created:o}, {snippetRow.Modified:o}, {snippetRow.ExpiryDate:o}");
-                            }
-                        }
-                        
-                        EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, textToSave.ToString().Trim());
+                        EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword!, BuildGridSaveJson(grid));
                         hasChanges = false;
                         btnSave.Visible = false;
                         
@@ -1974,17 +2005,7 @@ public partial class MainWindow : Window
                     // Save before closing
                     try
                     {
-                        var textToSave = new StringBuilder();
-                        foreach (WinForms.DataGridViewRow gridRow in grid.Rows)
-                        {
-                            if (gridRow.IsNewRow) continue;
-                            if (gridRow.Tag is SnippetRow snippetRow && !string.IsNullOrWhiteSpace(snippetRow.Label))
-                            {
-                                textToSave.AppendLine($"{snippetRow.Label}, {snippetRow.ActualValue}, {snippetRow.Created:o}, {snippetRow.Modified:o}, {snippetRow.ExpiryDate:o}");
-                            }
-                        }
-                        
-                        EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, textToSave.ToString().Trim());
+                        EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword!, BuildGridSaveJson(grid));
                     }
                     catch
                     {
@@ -2004,17 +2025,7 @@ public partial class MainWindow : Window
 
         try
         {
-            var textToSave = new StringBuilder();
-            foreach (WinForms.DataGridViewRow gridRow in grid.Rows)
-            {
-                if (gridRow.IsNewRow) continue;
-                if (gridRow.Tag is SnippetRow snippetRow && !string.IsNullOrWhiteSpace(snippetRow.Label))
-                {
-                    textToSave.AppendLine($"{snippetRow.Label}, {snippetRow.ActualValue}, {snippetRow.Created:o}, {snippetRow.Modified:o}, {snippetRow.ExpiryDate:o}");
-                }
-            }
-            
-            EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, textToSave.ToString().Trim());
+            EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword!, BuildGridSaveJson(grid));
             LoadSnippets();
             BuildBubbles();
         }
