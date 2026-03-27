@@ -66,6 +66,8 @@ public partial class MainWindow : Window
     private double? _savedWindowLeft;
     private double? _savedWindowTop;
     private string? _savedMonitorDeviceName;
+    private double? _preExpandWindowLeft;
+    private double? _preExpandWindowTop;
 
     private static readonly WpfColor BubbleDefaultColorDark = WpfColor.FromRgb(45, 45, 48);
     private static readonly WpfColor BubbleDefaultColorLight = WpfColor.FromRgb(230, 233, 237);
@@ -780,6 +782,8 @@ public partial class MainWindow : Window
     {
         LoadSnippets();
         BuildBubbles();
+        _preExpandWindowLeft = Left;
+        _preExpandWindowTop = Top;
         _expanded = true;
         Width = _expandWidth;
         Height = _expandHeight;
@@ -800,7 +804,18 @@ public partial class MainWindow : Window
         _expanded = false;
         Width = 64;
         Height = 64;
-        SnapToNearestEdge();
+
+        if (_preExpandWindowLeft is double originalLeft)
+            Left = originalLeft;
+
+        if (_preExpandWindowTop is double originalTop)
+            Top = originalTop;
+
+        if (_preExpandWindowLeft is not double || _preExpandWindowTop is not double)
+            SnapToNearestEdge();
+
+        _preExpandWindowLeft = null;
+        _preExpandWindowTop = null;
         Pin.Opacity = 1.0;
         Pin.Background = new SolidColorBrush(WpfColor.FromRgb(102, 185, 51));
         ExpandedBackdrop.Visibility = Visibility.Collapsed;
