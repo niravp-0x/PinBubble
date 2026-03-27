@@ -1438,13 +1438,13 @@ public partial class MainWindow : Window
                         shouldShowClock = true;
                         clockColor = Drawing.Color.FromArgb(220, 0, 0);
                     }
-                    else if (daysUntilExpiry < 14)
+                    else if (daysUntilExpiry <= 14)
                     {
-                        // Less than 14 days - Yellow and always visible
+                        // 7-14 days - Yellow and always visible
                         shouldShowClock = true;
                         clockColor = Drawing.Color.FromArgb(220, 180, 0);
                     }
-                    else if (daysUntilExpiry >= 15)
+                    else
                     {
                         // 15 days or more - Blue and only on hover
                         shouldShowClock = (hoveredRowIndex == ev.RowIndex && hoveredColumnIndex == ev.ColumnIndex);
@@ -1684,7 +1684,7 @@ public partial class MainWindow : Window
                         Height = 30,
                         Text = expiryText,
                         ForeColor = daysUntilExpiry < 7 ? Drawing.Color.FromArgb(255, 100, 100) : 
-                                   (daysUntilExpiry < 14 ? Drawing.Color.FromArgb(255, 200, 100) : 
+                                   (daysUntilExpiry <= 14 ? Drawing.Color.FromArgb(255, 200, 100) : 
                                    Drawing.Color.FromArgb(100, 200, 100)),
                         Font = new Drawing.Font("Segoe UI", 10f, Drawing.FontStyle.Bold),
                         AutoSize = false
