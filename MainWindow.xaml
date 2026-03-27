@@ -53,6 +53,7 @@
                 <MenuItem x:Name="TaskbarToggleMenuItem" Header="Hide from Taskbar" Click="ToggleTaskbar_Click"/>
                 <MenuItem x:Name="DarkThemeMenuItem" Header="Dark Theme" IsCheckable="True" IsChecked="True" Click="ToggleDarkTheme_Click"/>
                 <MenuItem x:Name="PinToggleMenuItem" Header="Unpin the Bubble" Click="TogglePin_Click"/>
+                <MenuItem x:Name="BiometricToggleMenuItem" Header="Enable Fingerprint Unlock" Click="ToggleBiometricUnlock_Click"/>
                 <MenuItem Header="Backdrop Opacity">
                     <MenuItem x:Name="BackdropOpacity20MenuItem" Header="20%" Tag="0.20" IsCheckable="True" Click="BackdropOpacity_Click"/>
                     <MenuItem x:Name="BackdropOpacity35MenuItem" Header="35%" Tag="0.35" IsCheckable="True" Click="BackdropOpacity_Click"/>

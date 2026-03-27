@@ -100,6 +100,7 @@ public partial class MainWindow : Window
         LoadUiSettings();
         ApplyExpandedPanelTheme();
         UpdateBackdropOpacityMenuChecks();
+        UpdateBiometricUi();
         DarkThemeMenuItem.IsChecked = _isDarkTheme;
         
         // Ensure window topmost behavior follows saved pin state.
@@ -118,11 +119,30 @@ public partial class MainWindow : Window
         Loaded += (_, _) => RestoreWindowPlacement();
         Loaded += (_, _) => UpdateTaskbarMenuText();
         Loaded += (_, _) => UpdatePinMenuText();
+        Loaded += (_, _) => UpdateBiometricUi();
         KeyDown += (_, e) => { if (e.Key == Key.Escape && _expanded) Collapse(); };
     }
 
     private bool InitializeSecureStore()
     {
+        if (File.Exists(_textFilePath)
+            && EncryptedTextStore.IsEncryptedFile(_textFilePath)
+            && BiometricMasterPasswordStore.HasCachedPassword()
+            && BiometricMasterPasswordStore.IsBiometricAvailable())
+        {
+            if (TryUnlockWithFingerprintPrompt(out var cachedPassword))
+            {
+                _masterPassword = cachedPassword;
+                return true;
+            }
+
+            System.Windows.MessageBox.Show(
+                "Fingerprint unlock did not complete. Please enter your master password.",
+                "PinBubble",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+        }
+
         while (true)
         {
             var password = PromptForMasterPassword();
@@ -142,6 +162,7 @@ public partial class MainWindow : Window
                     "Label2, Your second snippet text here\n";
                 EncryptedTextStore.EncryptAndSave(_textFilePath, password, defaultContent);
                 _masterPassword = password;
+                MaybeOfferBiometricUnlock(password);
                 return true;
             }
 
@@ -150,6 +171,7 @@ public partial class MainWindow : Window
                 if (EncryptedTextStore.TryDecrypt(_textFilePath, password, out _))
                 {
                     _masterPassword = password;
+                    MaybeOfferBiometricUnlock(password);
                     return true;
                 }
 
@@ -162,6 +184,7 @@ public partial class MainWindow : Window
                 var plaintext = File.ReadAllText(_textFilePath);
                 EncryptedTextStore.EncryptAndSave(_textFilePath, password, plaintext);
                 _masterPassword = password;
+                MaybeOfferBiometricUnlock(password);
                 return true;
             }
             catch
@@ -170,6 +193,147 @@ public partial class MainWindow : Window
                 return false;
             }
         }
+    }
+
+    private void MaybeOfferBiometricUnlock(string password)
+    {
+        if (!BiometricMasterPasswordStore.IsBiometricAvailable())
+        {
+            UpdateBiometricUi();
+            return;
+        }
+
+        if (BiometricMasterPasswordStore.HasCachedPassword())
+        {
+            BiometricMasterPasswordStore.CachePassword(password);
+            UpdateBiometricUi();
+            return;
+        }
+
+        var result = System.Windows.MessageBox.Show(
+            "Enable fingerprint authentication for future unlocks?",
+            "PinBubble",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Question);
+
+        if (result != MessageBoxResult.Yes)
+        {
+            UpdateBiometricUi();
+            return;
+        }
+
+        if (!BiometricMasterPasswordStore.CachePassword(password))
+        {
+            System.Windows.MessageBox.Show(
+                "Failed to enable fingerprint unlock.",
+                "PinBubble",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+        }
+
+        UpdateBiometricUi();
+    }
+
+    private bool TryUnlockWithFingerprintPrompt(out string password)
+    {
+        password = string.Empty;
+        string unlockedPassword = string.Empty;
+        bool unlockSucceeded = false;
+
+        using var dialog = new WinForms.Form
+        {
+            Width = 420,
+            Height = 180,
+            FormBorderStyle = WinForms.FormBorderStyle.None,
+            StartPosition = WinForms.FormStartPosition.CenterScreen,
+            BackColor = System.Drawing.Color.FromArgb(30, 30, 35),
+            MaximizeBox = false,
+            MinimizeBox = false,
+            ShowInTaskbar = false,
+            TopMost = true
+        };
+
+        dialog.Paint += (s, e) =>
+        {
+            using var pen = new System.Drawing.Pen(System.Drawing.Color.FromArgb(70, 70, 75), 1);
+            e.Graphics.DrawRectangle(pen, 0, 0, dialog.Width - 1, dialog.Height - 1);
+        };
+
+        var titlePanel = new WinForms.Panel
+        {
+            Left = 0,
+            Top = 0,
+            Width = 420,
+            Height = 45,
+            BackColor = System.Drawing.Color.FromArgb(25, 25, 28)
+        };
+
+        var titleLabel = new WinForms.Label
+        {
+            Left = 20,
+            Top = 12,
+            Width = 260,
+            Height = 22,
+            Text = "FINGERPRINT UNLOCK",
+            ForeColor = System.Drawing.Color.FromArgb(200, 200, 205),
+            Font = new System.Drawing.Font("Segoe UI", 10.5f, System.Drawing.FontStyle.Bold),
+            BackColor = System.Drawing.Color.Transparent
+        };
+
+        var instructionLabel = new WinForms.Label
+        {
+            Left = 20,
+            Top = 62,
+            Width = 380,
+            Height = 40,
+            Text = "Touch your fingerprint sensor to unlock PinBubble. If you want to stop, cancel it from the Windows Security prompt.",
+            ForeColor = System.Drawing.Color.FromArgb(160, 160, 165),
+            Font = new System.Drawing.Font("Segoe UI", 9f),
+            BackColor = System.Drawing.Color.Transparent
+        };
+
+        var statusLabel = new WinForms.Label
+        {
+            Left = 20,
+            Top = 108,
+            Width = 380,
+            Height = 20,
+            Text = "Waiting for Windows Security...",
+            ForeColor = System.Drawing.Color.FromArgb(190, 190, 195),
+            Font = new System.Drawing.Font("Segoe UI", 8.5f),
+            BackColor = System.Drawing.Color.Transparent
+        };
+
+        titlePanel.Controls.Add(titleLabel);
+        dialog.Controls.Add(titlePanel);
+        dialog.Controls.Add(instructionLabel);
+        dialog.Controls.Add(statusLabel);
+
+        dialog.Shown += async (_, _) =>
+        {
+            unlockSucceeded = await BiometricMasterPasswordStore.TryUnlockCachedPasswordAsync(_textFilePath);
+
+            if (unlockSucceeded)
+            {
+                unlockSucceeded = BiometricMasterPasswordStore.TryGetCachedPassword(
+                    _textFilePath,
+                    out unlockedPassword);
+            }
+
+            if (dialog.IsDisposed)
+                return;
+
+            dialog.DialogResult = unlockSucceeded ? WinForms.DialogResult.OK : WinForms.DialogResult.Cancel;
+            dialog.Close();
+        };
+
+        if (dialog.ShowDialog() == WinForms.DialogResult.OK && unlockSucceeded)
+        {
+            password = unlockedPassword;
+            return true;
+        }
+
+        return false;
     }
 
     private static string? PromptForMasterPassword()
@@ -1862,6 +2026,81 @@ public partial class MainWindow : Window
     private void UpdatePinMenuText()
     {
         PinToggleMenuItem.Header = _isPinned ? "Unpin the Bubble" : "Pin the Bubble";
+    }
+
+    private void ToggleBiometricUnlock_Click(object sender, RoutedEventArgs e)
+    {
+        if (BiometricMasterPasswordStore.HasCachedPassword())
+        {
+            var disableResult = System.Windows.MessageBox.Show(
+                "Disable fingerprint unlock and remove the cached credential?",
+                "PinBubble",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Question);
+
+            if (disableResult != MessageBoxResult.Yes)
+                return;
+
+            BiometricMasterPasswordStore.ClearCachedPassword();
+            UpdateBiometricUi();
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(_masterPassword))
+        {
+            System.Windows.MessageBox.Show(
+                "Fingerprint unlock can only be enabled after entering your master password.",
+                "PinBubble",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+            UpdateBiometricUi();
+            return;
+        }
+
+        if (!BiometricMasterPasswordStore.IsBiometricAvailable())
+        {
+            System.Windows.MessageBox.Show(
+                "Fingerprint authentication is not available on this device.",
+                "PinBubble",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+            UpdateBiometricUi();
+            return;
+        }
+
+        if (!BiometricMasterPasswordStore.CachePassword(_masterPassword))
+        {
+            System.Windows.MessageBox.Show(
+                "Failed to enable fingerprint unlock.",
+                "PinBubble",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+        }
+
+        UpdateBiometricUi();
+    }
+
+    private void UpdateBiometricUi()
+    {
+        UpdateBiometricMenuText();
+    }
+
+    private void UpdateBiometricMenuText()
+    {
+        var enabled = BiometricMasterPasswordStore.HasCachedPassword();
+        var available = BiometricMasterPasswordStore.IsBiometricAvailable();
+
+        if (enabled)
+        {
+            BiometricToggleMenuItem.Header = "Disable Fingerprint Unlock";
+            BiometricToggleMenuItem.IsEnabled = true;
+            return;
+        }
+
+        BiometricToggleMenuItem.Header = available
+            ? "Enable Fingerprint Unlock"
+            : "Enable Fingerprint Unlock (Unavailable)";
+        BiometricToggleMenuItem.IsEnabled = available;
     }
 
     private void ToggleDarkTheme_Click(object sender, RoutedEventArgs e)
