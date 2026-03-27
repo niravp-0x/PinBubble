@@ -7,9 +7,10 @@
         AllowsTransparency="True"
         Background="Transparent"
         ResizeMode="NoResize"
-        ShowInTaskbar="False"
+        ShowInTaskbar="True"
         Topmost="True"
         Deactivated="Window_Deactivated"
+        StateChanged="Window_StateChanged"
         MouseLeftButtonDown="Root_MouseLeftButtonDown"
         MouseLeftButtonUp="Root_MouseLeftButtonUp"
         MouseMove="Root_MouseMove">
@@ -31,6 +32,15 @@
                  VerticalAlignment="Center" Cursor="Hand"/>
         </Border>
 
+        <!-- Translucent backing shown only in expanded mode -->
+        <Border x:Name="ExpandedBackdrop"
+            Visibility="Collapsed"
+            Background="#7A101216"
+            CornerRadius="16"
+            Margin="8"
+            BorderBrush="#55FFFFFF"
+            BorderThickness="1"/>
+
         <!-- Expanded bubbles -->
         <Canvas x:Name="BubblesHost" Visibility="Collapsed" IsHitTestVisible="True">
             <!-- Buttons created in code-behind -->
@@ -40,10 +50,20 @@
             <ContextMenu>
                 <MenuItem Header="Edit snippets" Click="EditSnippets_Click"/>
                 <Separator/>
-                <MenuItem Header="Open text.text in VS Code" Click="OpenInVsCode_Click"/>
-                <MenuItem Header="Open text.text in Notepad" Click="OpenInNotepad_Click"/>
-                <MenuItem Header="Find text.text" Click="OpenInExplorer_Click"/>
+                <MenuItem x:Name="TaskbarToggleMenuItem" Header="Hide from Taskbar" Click="ToggleTaskbar_Click"/>
+                <MenuItem x:Name="DarkThemeMenuItem" Header="Dark Theme" IsCheckable="True" IsChecked="True" Click="ToggleDarkTheme_Click"/>
+                <MenuItem x:Name="PinToggleMenuItem" Header="Unpin the Bubble" Click="TogglePin_Click"/>
+                <MenuItem x:Name="BiometricToggleMenuItem" Header="Enable Fingerprint Unlock" Click="ToggleBiometricUnlock_Click"/>
+                <MenuItem Header="Backdrop Opacity">
+                    <MenuItem x:Name="BackdropOpacity20MenuItem" Header="20%" Tag="0.20" IsCheckable="True" Click="BackdropOpacity_Click"/>
+                    <MenuItem x:Name="BackdropOpacity35MenuItem" Header="35%" Tag="0.35" IsCheckable="True" Click="BackdropOpacity_Click"/>
+                    <MenuItem x:Name="BackdropOpacity50MenuItem" Header="50%" Tag="0.50" IsCheckable="True" Click="BackdropOpacity_Click"/>
+                    <MenuItem x:Name="BackdropOpacity65MenuItem" Header="65%" Tag="0.65" IsCheckable="True" Click="BackdropOpacity_Click"/>
+                    <MenuItem x:Name="BackdropOpacity80MenuItem" Header="80%" Tag="0.80" IsCheckable="True" Click="BackdropOpacity_Click"/>
+                </MenuItem>
+                <MenuItem Header="Reset Preferences" Click="ResetPreferences_Click"/>
                 <Separator/>
+                <MenuItem Header="About" Click="About_Click"/>
                 <MenuItem Header="Exit" Click="Exit_Click"/>
             </ContextMenu>
         </Grid.ContextMenu>

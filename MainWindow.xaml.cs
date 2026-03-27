@@ -1,9 +1,11 @@
 ﻿using System.Diagnostics;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Text;
+using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
@@ -19,8 +21,25 @@ using WpfHorizontalAlignment = System.Windows.HorizontalAlignment;
 
 namespace PinBubble;
 
+// Row data class to track encrypted state per row
+class SnippetRow
+{
+    public string Label { get; set; } = string.Empty;
+    public string Value { get; set; } = string.Empty;
+    public string ActualValue { get; set; } = string.Empty; // Always stores the real value
+    public bool IsEncrypted { get; set;} = true;
+    public DateTime Created { get; set; } = DateTime.Now;
+    public DateTime Modified { get; set; } = DateTime.Now;
+    public DateTime ExpiryDate { get; set; } = DateTime.Now.AddDays(30);
+}
+
 public partial class MainWindow : Window
 {
+    private const double DefaultBackdropOpacity = 0.50;
+    private const bool DefaultIsPinned = true;
+    private const bool DefaultIsDarkTheme = true;
+    private const bool DefaultShowInTaskbar = true;
+
     [DllImport("user32.dll")]
     private static extern bool GetCursorPos(out POINT lpPoint);
 
@@ -28,6 +47,7 @@ public partial class MainWindow : Window
     private struct POINT { public int X; public int Y; }
 
     private readonly string _textFilePath;
+    private readonly string _settingsFilePath;
     private string? _masterPassword;
     private string[] _labels = Array.Empty<string>();
     private string[] _fullLabels = Array.Empty<string>();
@@ -38,17 +58,69 @@ public partial class MainWindow : Window
     private WinForms.ContextMenuStrip? _trayMenu;
     private bool _expanded;
     private bool _isDrag;
-    private POINT _dragStartCursor;
+    private System.Windows.Point _dragStartCursor;
     private System.Windows.Point _dragStartWindow;
+    private bool _isPinned = DefaultIsPinned;
+    private bool _isDarkTheme = DefaultIsDarkTheme;
+    private double _backdropOpacity = DefaultBackdropOpacity;
+    private double? _savedWindowLeft;
+    private double? _savedWindowTop;
+    private string? _savedMonitorDeviceName;
+    private double? _preExpandWindowLeft;
+    private double? _preExpandWindowTop;
 
-    private static readonly SolidColorBrush BubbleDefault = new SolidColorBrush(WpfColor.FromRgb(45, 45, 48));
-    private static readonly SolidColorBrush BubbleHover = new SolidColorBrush(WpfColor.FromRgb(102, 185, 51));
+    private static readonly WpfColor BubbleDefaultColorDark = WpfColor.FromRgb(45, 45, 48);
+    private static readonly WpfColor BubbleDefaultColorLight = WpfColor.FromRgb(230, 233, 237);
+    private static readonly WpfColor BubbleBorderColorDark = WpfColor.FromRgb(80, 80, 80);
+    private static readonly WpfColor BubbleBorderColorLight = WpfColor.FromRgb(176, 181, 188);
+    private static readonly WpfColor BubbleHoverColorDark = WpfColor.FromRgb(102, 185, 51);
+    private static readonly WpfColor BubbleHoverColorLight = WpfColor.FromRgb(125, 190, 90);
     private static readonly SolidColorBrush BubbleClicked = new SolidColorBrush(WpfColor.FromRgb(0, 255, 0));
+    private static readonly WpfColor BackdropBaseColorDark = WpfColor.FromRgb(16, 18, 22);
+    private static readonly WpfColor BackdropBaseColorLight = WpfColor.FromRgb(245, 247, 250);
+
+    private sealed class UiSettings
+    {
+        public double BackdropOpacity { get; set; } = DefaultBackdropOpacity;
+        public bool IsPinned { get; set; } = DefaultIsPinned;
+        public bool IsDarkTheme { get; set; } = DefaultIsDarkTheme;
+        public bool ShowInTaskbar { get; set; } = DefaultShowInTaskbar;
+        public double? WindowLeft { get; set; }
+        public double? WindowTop { get; set; }
+        public string? MonitorDeviceName { get; set; }
+    }
 
     public MainWindow()
     {
         InitializeComponent();
-        _textFilePath = Path.Combine(AppContext.BaseDirectory, "text.text");
+        _settingsFilePath = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "PinBubble",
+            "settings.json");
+
+        var appDataDir = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+            "PinBubble");
+        Directory.CreateDirectory(appDataDir);
+        _textFilePath = Path.Combine(appDataDir, "snippets.bin");
+
+        // One-time migration: move old text.text from the install directory if present
+        var legacyPath = Path.Combine(AppContext.BaseDirectory, "text.text");
+        if (!File.Exists(_textFilePath) && File.Exists(legacyPath))
+        {
+            try { File.Move(legacyPath, _textFilePath); }
+            catch { /* non-fatal; a new file will be created on first save */ }
+        }
+
+        LoadUiSettings();
+        ApplyExpandedPanelTheme();
+        UpdateBackdropOpacityMenuChecks();
+        UpdateBiometricUi();
+        DarkThemeMenuItem.IsChecked = _isDarkTheme;
+        
+        // Ensure window topmost behavior follows saved pin state.
+        Topmost = _isPinned;
+        
         if (!InitializeSecureStore())
         {
             Close();
@@ -59,12 +131,33 @@ public partial class MainWindow : Window
         BuildBubbles();
         SetupWatcher();
         SetupTrayIcon();
-        Loaded += (_, _) => SnapToNearestEdge();
+        Loaded += (_, _) => RestoreWindowPlacement();
+        Loaded += (_, _) => UpdateTaskbarMenuText();
+        Loaded += (_, _) => UpdatePinMenuText();
+        Loaded += (_, _) => UpdateBiometricUi();
         KeyDown += (_, e) => { if (e.Key == Key.Escape && _expanded) Collapse(); };
     }
 
     private bool InitializeSecureStore()
     {
+        if (File.Exists(_textFilePath)
+            && EncryptedTextStore.IsEncryptedFile(_textFilePath)
+            && BiometricMasterPasswordStore.HasCachedPassword()
+            && BiometricMasterPasswordStore.IsBiometricAvailable())
+        {
+            if (TryUnlockWithFingerprintPrompt(out var cachedPassword))
+            {
+                _masterPassword = cachedPassword;
+                return true;
+            }
+
+            System.Windows.MessageBox.Show(
+                "Fingerprint unlock did not complete. Please enter your master password.",
+                "PinBubble",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+        }
+
         while (true)
         {
             var password = PromptForMasterPassword();
@@ -84,6 +177,7 @@ public partial class MainWindow : Window
                     "Label2, Your second snippet text here\n";
                 EncryptedTextStore.EncryptAndSave(_textFilePath, password, defaultContent);
                 _masterPassword = password;
+                MaybeOfferBiometricUnlock(password);
                 return true;
             }
 
@@ -92,6 +186,7 @@ public partial class MainWindow : Window
                 if (EncryptedTextStore.TryDecrypt(_textFilePath, password, out _))
                 {
                     _masterPassword = password;
+                    MaybeOfferBiometricUnlock(password);
                     return true;
                 }
 
@@ -104,6 +199,7 @@ public partial class MainWindow : Window
                 var plaintext = File.ReadAllText(_textFilePath);
                 EncryptedTextStore.EncryptAndSave(_textFilePath, password, plaintext);
                 _masterPassword = password;
+                MaybeOfferBiometricUnlock(password);
                 return true;
             }
             catch
@@ -114,61 +210,349 @@ public partial class MainWindow : Window
         }
     }
 
-    private static string? PromptForMasterPassword()
+    private void MaybeOfferBiometricUnlock(string password)
     {
+        if (!BiometricMasterPasswordStore.IsBiometricAvailable())
+        {
+            UpdateBiometricUi();
+            return;
+        }
+
+        if (BiometricMasterPasswordStore.HasCachedPassword())
+        {
+            BiometricMasterPasswordStore.CachePassword(password);
+            UpdateBiometricUi();
+            return;
+        }
+
+        var result = System.Windows.MessageBox.Show(
+            "Enable fingerprint authentication for future unlocks?",
+            "PinBubble",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Question);
+
+        if (result != MessageBoxResult.Yes)
+        {
+            UpdateBiometricUi();
+            return;
+        }
+
+        if (!BiometricMasterPasswordStore.CachePassword(password))
+        {
+            System.Windows.MessageBox.Show(
+                "Failed to enable fingerprint unlock.",
+                "PinBubble",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+        }
+
+        UpdateBiometricUi();
+    }
+
+    private bool TryUnlockWithFingerprintPrompt(out string password)
+    {
+        password = string.Empty;
+        string unlockedPassword = string.Empty;
+        bool unlockSucceeded = false;
+
         using var dialog = new WinForms.Form
         {
-            Width = 360,
-            Height = 170,
-            FormBorderStyle = WinForms.FormBorderStyle.FixedDialog,
+            Width = 420,
+            Height = 180,
+            FormBorderStyle = WinForms.FormBorderStyle.None,
             StartPosition = WinForms.FormStartPosition.CenterScreen,
-            Text = "PinBubble - Master Password",
+            BackColor = System.Drawing.Color.FromArgb(30, 30, 35),
             MaximizeBox = false,
             MinimizeBox = false,
             ShowInTaskbar = false,
             TopMost = true
         };
 
-        var label = new WinForms.Label
+        dialog.Paint += (s, e) =>
         {
-            Left = 15,
-            Top = 15,
-            Width = 315,
-            Text = "Enter master password"
+            using var pen = new System.Drawing.Pen(System.Drawing.Color.FromArgb(70, 70, 75), 1);
+            e.Graphics.DrawRectangle(pen, 0, 0, dialog.Width - 1, dialog.Height - 1);
+        };
+
+        var titlePanel = new WinForms.Panel
+        {
+            Left = 0,
+            Top = 0,
+            Width = 420,
+            Height = 45,
+            BackColor = System.Drawing.Color.FromArgb(25, 25, 28)
+        };
+
+        var titleLabel = new WinForms.Label
+        {
+            Left = 20,
+            Top = 12,
+            Width = 260,
+            Height = 22,
+            Text = "FINGERPRINT UNLOCK",
+            ForeColor = System.Drawing.Color.FromArgb(200, 200, 205),
+            Font = new System.Drawing.Font("Segoe UI", 10.5f, System.Drawing.FontStyle.Bold),
+            BackColor = System.Drawing.Color.Transparent
+        };
+
+        var instructionLabel = new WinForms.Label
+        {
+            Left = 20,
+            Top = 62,
+            Width = 380,
+            Height = 40,
+            Text = "Touch your fingerprint sensor to unlock PinBubble. If you want to stop, cancel it from the Windows Security prompt.",
+            ForeColor = System.Drawing.Color.FromArgb(160, 160, 165),
+            Font = new System.Drawing.Font("Segoe UI", 9f),
+            BackColor = System.Drawing.Color.Transparent
+        };
+
+        var statusLabel = new WinForms.Label
+        {
+            Left = 20,
+            Top = 108,
+            Width = 380,
+            Height = 20,
+            Text = "Waiting for Windows Security...",
+            ForeColor = System.Drawing.Color.FromArgb(190, 190, 195),
+            Font = new System.Drawing.Font("Segoe UI", 8.5f),
+            BackColor = System.Drawing.Color.Transparent
+        };
+
+        titlePanel.Controls.Add(titleLabel);
+        dialog.Controls.Add(titlePanel);
+        dialog.Controls.Add(instructionLabel);
+        dialog.Controls.Add(statusLabel);
+
+        dialog.Shown += async (_, _) =>
+        {
+            unlockSucceeded = await BiometricMasterPasswordStore.TryUnlockCachedPasswordAsync(_textFilePath);
+
+            if (unlockSucceeded)
+            {
+                unlockSucceeded = BiometricMasterPasswordStore.TryGetCachedPassword(
+                    _textFilePath,
+                    out unlockedPassword);
+            }
+
+            if (dialog.IsDisposed)
+                return;
+
+            dialog.DialogResult = unlockSucceeded ? WinForms.DialogResult.OK : WinForms.DialogResult.Cancel;
+            dialog.Close();
+        };
+
+        if (dialog.ShowDialog() == WinForms.DialogResult.OK && unlockSucceeded)
+        {
+            password = unlockedPassword;
+            return true;
+        }
+
+        return false;
+    }
+
+    private static string? PromptForMasterPassword()
+    {
+        using var dialog = new WinForms.Form
+        {
+            Width = 420,
+            Height = 220,
+            FormBorderStyle = WinForms.FormBorderStyle.None,
+            StartPosition = WinForms.FormStartPosition.CenterScreen,
+            BackColor = System.Drawing.Color.FromArgb(30, 30, 35),
+            MaximizeBox = false,
+            MinimizeBox = false,
+            ShowInTaskbar = false,
+            TopMost = true
+        };
+
+        // Add a subtle border
+        dialog.Paint += (s, e) =>
+        {
+            using var pen = new System.Drawing.Pen(System.Drawing.Color.FromArgb(70, 70, 75), 1);
+            e.Graphics.DrawRectangle(pen, 0, 0, dialog.Width - 1, dialog.Height - 1);
+        };
+
+        // Title bar panel
+        var titlePanel = new WinForms.Panel
+        {
+            Left = 0,
+            Top = 0,
+            Width = 420,
+            Height = 45,
+            BackColor = System.Drawing.Color.FromArgb(25, 25, 28)
+        };
+
+        // Lock icon using PictureBox with custom drawing
+        var lockIcon = new WinForms.PictureBox
+        {
+            Left = 20,
+            Top = 10,
+            Width = 24,
+            Height = 24,
+            BackColor = System.Drawing.Color.Transparent
+        };
+        
+        // Draw a lock icon
+        var lockBitmap = new System.Drawing.Bitmap(24, 24);
+        using (var g = System.Drawing.Graphics.FromImage(lockBitmap))
+        {
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            
+            // Draw lock body (rectangle)
+            using (var brush = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(200, 200, 205)))
+            {
+                g.FillRectangle(brush, 6, 12, 12, 10);
+            }
+            
+            // Draw lock shackle (arc)
+            using (var pen = new System.Drawing.Pen(System.Drawing.Color.FromArgb(200, 200, 205), 2.5f))
+            {
+                g.DrawArc(pen, 8, 4, 8, 10, 180, 180);
+            }
+            
+            // Draw keyhole
+            using (var brush = new System.Drawing.SolidBrush(System.Drawing.Color.FromArgb(30, 30, 35)))
+            {
+                g.FillEllipse(brush, 10, 15, 4, 4);
+                g.FillRectangle(brush, 11, 18, 2, 3);
+            }
+        }
+        lockIcon.Image = lockBitmap;
+
+        var titleLabel = new WinForms.Label
+        {
+            Left = 50,
+            Top = 12,
+            Width = 300,
+            Height = 25,
+            Text = "MASTER PASSWORD",
+            ForeColor = System.Drawing.Color.FromArgb(200, 200, 205),
+            Font = new System.Drawing.Font("Segoe UI", 10.5f, System.Drawing.FontStyle.Bold),
+            BackColor = System.Drawing.Color.Transparent
+        };
+
+        var instructionLabel = new WinForms.Label
+        {
+            Left = 20,
+            Top = 58,
+            Width = 380,
+            Height = 25,
+            Text = "Enter your master password to unlock",
+            ForeColor = System.Drawing.Color.FromArgb(160, 160, 165),
+            Font = new System.Drawing.Font("Segoe UI", 9f),
+            BackColor = System.Drawing.Color.Transparent,
+            AutoSize = false
+        };
+
+        // Custom styled textbox with panel background
+        var textBoxPanel = new WinForms.Panel
+        {
+            Left = 20,
+            Top = 93,
+            Width = 380,
+            Height = 42,
+            BackColor = System.Drawing.Color.FromArgb(45, 45, 50)
         };
 
         var textBox = new WinForms.TextBox
         {
-            Left = 15,
-            Top = 40,
-            Width = 315,
-            UseSystemPasswordChar = true
+            Left = 2,
+            Top = 2,
+            Width = 376,
+            Height = 38,
+            UseSystemPasswordChar = true,
+            BorderStyle = WinForms.BorderStyle.None,
+            BackColor = System.Drawing.Color.FromArgb(45, 45, 50),
+            ForeColor = System.Drawing.Color.FromArgb(220, 220, 225),
+            Font = new System.Drawing.Font("Segoe UI", 12f)
         };
+
+        textBoxPanel.Controls.Add(textBox);
+
+        // Paint border on textbox panel
+        textBoxPanel.Paint += (s, e) =>
+        {
+            var borderColor = textBox.Focused ? 
+                System.Drawing.Color.FromArgb(0, 120, 212) : 
+                System.Drawing.Color.FromArgb(70, 70, 75);
+            using var pen = new System.Drawing.Pen(borderColor, 2);
+            e.Graphics.DrawRectangle(pen, 0, 0, textBoxPanel.Width - 1, textBoxPanel.Height - 1);
+        };
+
+        textBox.Enter += (s, e) => textBoxPanel.Invalidate();
+        textBox.Leave += (s, e) => textBoxPanel.Invalidate();
 
         var okButton = new WinForms.Button
         {
-            Text = "OK",
-            Left = 174,
-            Width = 75,
-            Top = 78,
-            DialogResult = WinForms.DialogResult.OK
+            Text = "UNLOCK",
+            Left = 205,
+            Width = 95,
+            Height = 38,
+            Top = 155,
+            DialogResult = WinForms.DialogResult.OK,
+            FlatStyle = WinForms.FlatStyle.Flat,
+            BackColor = System.Drawing.Color.FromArgb(0, 120, 212),
+            ForeColor = System.Drawing.Color.White,
+            Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold),
+            Cursor = WinForms.Cursors.Hand
         };
+        okButton.FlatAppearance.BorderSize = 0;
+        okButton.FlatAppearance.MouseOverBackColor = System.Drawing.Color.FromArgb(0, 100, 192);
+        okButton.FlatAppearance.MouseDownBackColor = System.Drawing.Color.FromArgb(0, 80, 172);
 
         var cancelButton = new WinForms.Button
         {
-            Text = "Cancel",
-            Left = 255,
-            Width = 75,
-            Top = 78,
-            DialogResult = WinForms.DialogResult.Cancel
+            Text = "CANCEL",
+            Left = 305,
+            Width = 95,
+            Height = 38,
+            Top = 155,
+            DialogResult = WinForms.DialogResult.Cancel,
+            FlatStyle = WinForms.FlatStyle.Flat,
+            BackColor = System.Drawing.Color.FromArgb(55, 55, 60),
+            ForeColor = System.Drawing.Color.FromArgb(200, 200, 205),
+            Font = new System.Drawing.Font("Segoe UI", 9f, System.Drawing.FontStyle.Bold),
+            Cursor = WinForms.Cursors.Hand
+        };
+        cancelButton.FlatAppearance.BorderSize = 0;
+        cancelButton.FlatAppearance.MouseOverBackColor = System.Drawing.Color.FromArgb(70, 70, 75);
+        cancelButton.FlatAppearance.MouseDownBackColor = System.Drawing.Color.FromArgb(85, 85, 90);
+
+        // Make dialog draggable
+        bool dragging = false;
+        System.Drawing.Point dragCursor = System.Drawing.Point.Empty;
+        System.Drawing.Point dragForm = System.Drawing.Point.Empty;
+
+        titlePanel.MouseDown += (s, e) =>
+        {
+            dragging = true;
+            dragCursor = System.Windows.Forms.Cursor.Position;
+            dragForm = dialog.Location;
         };
 
-        dialog.Controls.Add(label);
-        dialog.Controls.Add(textBox);
+        titlePanel.MouseMove += (s, e) =>
+        {
+            if (dragging)
+            {
+                var diff = System.Drawing.Point.Subtract(System.Windows.Forms.Cursor.Position, new System.Drawing.Size(dragCursor));
+                dialog.Location = System.Drawing.Point.Add(dragForm, new System.Drawing.Size(diff));
+            }
+        };
+
+        titlePanel.MouseUp += (s, e) => dragging = false;
+
+        titlePanel.Controls.Add(lockIcon);
+        titlePanel.Controls.Add(titleLabel);
+        dialog.Controls.Add(titlePanel);
+        dialog.Controls.Add(instructionLabel);
+        dialog.Controls.Add(textBoxPanel);
         dialog.Controls.Add(okButton);
         dialog.Controls.Add(cancelButton);
         dialog.AcceptButton = okButton;
         dialog.CancelButton = cancelButton;
+
+        textBox.Select();
 
         return dialog.ShowDialog() == WinForms.DialogResult.OK ? textBox.Text : null;
     }
@@ -180,8 +564,11 @@ public partial class MainWindow : Window
             _trayMenu = new WinForms.ContextMenuStrip();
             _trayMenu.Items.Add("Open", null, (_, _) =>
             {
+                ShowInTaskbar = true;
+                WindowState = WindowState.Normal;
                 Show();
                 Activate();
+                UpdateTaskbarMenuText();
             });
             _trayMenu.Items.Add("Exit", null, (_, _) => Close());
 
@@ -200,8 +587,11 @@ public partial class MainWindow : Window
 
             _trayIcon.DoubleClick += (_, _) =>
             {
+                ShowInTaskbar = true;
+                WindowState = WindowState.Normal;
                 Show();
                 Activate();
+                UpdateTaskbarMenuText();
             };
         }
         catch
@@ -213,7 +603,15 @@ public partial class MainWindow : Window
     private void Window_Deactivated(object sender, EventArgs e)
     {
         if (_expanded) Collapse();
-        Topmost = true;
+        if (_isPinned)
+        {
+            // Ensure MainWindow stays topmost when pinned
+            Dispatcher.BeginInvoke(new Action(() => 
+            {
+                if (_isPinned)
+                    Topmost = true;
+            }), System.Windows.Threading.DispatcherPriority.ApplicationIdle);
+        }
     }
 
     private void SetupWatcher()
@@ -265,9 +663,9 @@ public partial class MainWindow : Window
 
             for (int i = 0; i < lines.Length; i++)
             {
-                var commaIndex = lines[i].IndexOf(',');
-                var labelFull = lines[i][..commaIndex].Trim();
-                var value = lines[i][(commaIndex + 1)..].Trim();
+                var parts = lines[i].Split(',');
+                var labelFull = parts[0].Trim();
+                var value = parts.Length >= 2 ? parts[1].Trim() : string.Empty;
 
                 // Bubble text: uppercase A-Z and 0-9 only, max 6 chars.
                 var displayLabel = BuildBubbleLabel(labelFull);
@@ -308,6 +706,10 @@ public partial class MainWindow : Window
     private void BuildBubbles()
     {
         BubblesHost.Children.Clear();
+        var bubbleDefault = new SolidColorBrush(_isDarkTheme ? BubbleDefaultColorDark : BubbleDefaultColorLight);
+        var bubbleHover = new SolidColorBrush(_isDarkTheme ? BubbleHoverColorDark : BubbleHoverColorLight);
+        var bubbleBorder = new SolidColorBrush(_isDarkTheme ? BubbleBorderColorDark : BubbleBorderColorLight);
+        var bubbleForeground = _isDarkTheme ? WpfBrushes.White : WpfBrushes.Black;
 
         // Dynamic width based on count - 5 per row
         int count = _labels.Length;
@@ -329,10 +731,10 @@ public partial class MainWindow : Window
                 Content = _labels[i],
                 FontSize = _labels[i].Length <= 3 ? 12 : 9,
                 FontWeight = FontWeights.Bold,
-                Foreground = WpfBrushes.White,
-                Background = BubbleDefault,
+                Foreground = bubbleForeground,
+                Background = bubbleDefault,
                 BorderThickness = new Thickness(1),
-                BorderBrush = new SolidColorBrush(WpfColor.FromRgb(80, 80, 80)),
+                BorderBrush = bubbleBorder,
                 Tag = i,
                 ToolTip = i < _fullLabels.Length ? _fullLabels[i] : _labels[i],
                 Cursor = WpfCursors.Hand,
@@ -340,8 +742,8 @@ public partial class MainWindow : Window
             };
 
             btn.Click += Bubble_Click;
-            btn.MouseEnter += (s, _) => { if (s is WpfButton b) b.Background = BubbleHover; };
-            btn.MouseLeave += (s, _) => { if (s is WpfButton b) b.Background = BubbleDefault; };
+            btn.MouseEnter += (s, _) => { if (s is WpfButton b) b.Background = bubbleHover; };
+            btn.MouseLeave += (s, _) => { if (s is WpfButton b) b.Background = bubbleDefault; };
             btn.Template = CreateRoundButtonTemplate();
             BubblesHost.Children.Add(btn);
         }
@@ -376,7 +778,7 @@ public partial class MainWindow : Window
                 System.Windows.Clipboard.SetText(_snippets[idx]);
                 b.Background = BubbleClicked;
                 await Task.Delay(150);
-                b.Background = BubbleDefault;
+                b.Background = new SolidColorBrush(_isDarkTheme ? BubbleDefaultColorDark : BubbleDefaultColorLight);
             }
             catch { }
             Collapse();
@@ -393,10 +795,19 @@ public partial class MainWindow : Window
     {
         LoadSnippets();
         BuildBubbles();
+        _preExpandWindowLeft = Left;
+        _preExpandWindowTop = Top;
         _expanded = true;
         Width = _expandWidth;
         Height = _expandHeight;
+
+        // Keep expanded UI on the monitor where the user is currently interacting.
+        var activeWorkArea = GetWorkAreaForActiveScreen();
+        Left = Math.Max(activeWorkArea.Left, Math.Min(Left, activeWorkArea.Right - Width));
+        Top = Math.Max(activeWorkArea.Top, Math.Min(Top, activeWorkArea.Bottom - Height));
+
         Pin.Opacity = 0.3;
+        ExpandedBackdrop.Visibility = Visibility.Visible;
         BubblesHost.Visibility = Visibility.Visible;
         PositionBubbles();
     }
@@ -406,14 +817,27 @@ public partial class MainWindow : Window
         _expanded = false;
         Width = 64;
         Height = 64;
+
+        if (_preExpandWindowLeft is double originalLeft)
+            Left = originalLeft;
+
+        if (_preExpandWindowTop is double originalTop)
+            Top = originalTop;
+
+        if (_preExpandWindowLeft is not double || _preExpandWindowTop is not double)
+            SnapToNearestEdge();
+
+        _preExpandWindowLeft = null;
+        _preExpandWindowTop = null;
         Pin.Opacity = 1.0;
         Pin.Background = new SolidColorBrush(WpfColor.FromRgb(102, 185, 51));
+        ExpandedBackdrop.Visibility = Visibility.Collapsed;
         BubblesHost.Visibility = Visibility.Collapsed;
     }
 
     private void Root_MouseLeftButtonDown(object sender, MouseButtonEventArgs e)
     {
-        GetCursorPos(out _dragStartCursor);
+        _dragStartCursor = GetCursorPositionInWpfUnits();
         _dragStartWindow = new System.Windows.Point(Left, Top);
         _isDrag = false;
         CaptureMouse();
@@ -422,26 +846,124 @@ public partial class MainWindow : Window
     private void Root_MouseMove(object sender, System.Windows.Input.MouseEventArgs e)
     {
         if (e.LeftButton != MouseButtonState.Pressed) return;
-        GetCursorPos(out POINT cur);
-        int dx = cur.X - _dragStartCursor.X;
-        int dy = cur.Y - _dragStartCursor.Y;
+        var cur = GetCursorPositionInWpfUnits();
+        double dx = cur.X - _dragStartCursor.X;
+        double dy = cur.Y - _dragStartCursor.Y;
         if (!_isDrag && Math.Abs(dx) < 4 && Math.Abs(dy) < 4) return;
         _isDrag = true;
         Left = _dragStartWindow.X + dx;
         Top = _dragStartWindow.Y + dy;
     }
 
+    private System.Windows.Point GetCursorPositionInWpfUnits()
+    {
+        if (!GetCursorPos(out POINT cursorPoint))
+            return new System.Windows.Point(Left, Top);
+
+        var source = PresentationSource.FromVisual(this);
+        if (source?.CompositionTarget is null)
+            return new System.Windows.Point(cursorPoint.X, cursorPoint.Y);
+
+        var fromDevice = source.CompositionTarget.TransformFromDevice;
+        return fromDevice.Transform(new System.Windows.Point(cursorPoint.X, cursorPoint.Y));
+    }
+
     private void Root_MouseLeftButtonUp(object sender, MouseButtonEventArgs e)
     {
         ReleaseMouseCapture();
-        if (_isDrag) SnapToNearestEdge();
+        if (_isDrag)
+        {
+            SnapToNearestEdge();
+            SaveUiSettings();
+        }
         else ToggleExpand();
         _isDrag = false;
     }
 
+    private Rect GetWorkAreaForActiveScreen()
+    {
+        if (!GetCursorPos(out POINT cursorPoint))
+            return SystemParameters.WorkArea;
+
+        var activeScreen = WinForms.Screen.FromPoint(new Drawing.Point(cursorPoint.X, cursorPoint.Y));
+        return ConvertDeviceRectToWpfRect(activeScreen.WorkingArea);
+    }
+
+    private Rect GetWorkAreaForCurrentWindowScreen()
+    {
+        var windowRect = ConvertWpfRectToDeviceRect(new Rect(
+            Left,
+            Top,
+            Math.Max(1, Width),
+            Math.Max(1, Height)));
+
+        var screen = WinForms.Screen.FromRectangle(windowRect);
+        return ConvertDeviceRectToWpfRect(screen.WorkingArea);
+    }
+
+    private bool IsWindowOffAllScreens()
+    {
+        var windowRect = new Rect(Left, Top, Width, Height);
+        foreach (var screen in WinForms.Screen.AllScreens)
+        {
+            var screenRect = ConvertDeviceRectToWpfRect(screen.WorkingArea);
+            if (windowRect.IntersectsWith(screenRect))
+                return false;
+        }
+
+        return true;
+    }
+
+    private Rect ConvertDeviceRectToWpfRect(Drawing.Rectangle deviceRect)
+    {
+        var source = PresentationSource.FromVisual(this);
+        if (source?.CompositionTarget is null)
+            return new Rect(deviceRect.Left, deviceRect.Top, deviceRect.Width, deviceRect.Height);
+
+        var fromDevice = source.CompositionTarget.TransformFromDevice;
+        var topLeft = fromDevice.Transform(new System.Windows.Point(deviceRect.Left, deviceRect.Top));
+        var bottomRight = fromDevice.Transform(new System.Windows.Point(deviceRect.Right, deviceRect.Bottom));
+        return new Rect(topLeft, bottomRight);
+    }
+
+    private Drawing.Rectangle ConvertWpfRectToDeviceRect(Rect wpfRect)
+    {
+        var source = PresentationSource.FromVisual(this);
+        if (source?.CompositionTarget is null)
+        {
+            return new Drawing.Rectangle(
+                (int)Math.Round(wpfRect.Left),
+                (int)Math.Round(wpfRect.Top),
+                (int)Math.Round(wpfRect.Width),
+                (int)Math.Round(wpfRect.Height));
+        }
+
+        var toDevice = source.CompositionTarget.TransformToDevice;
+        var topLeft = toDevice.Transform(new System.Windows.Point(wpfRect.Left, wpfRect.Top));
+        var bottomRight = toDevice.Transform(new System.Windows.Point(wpfRect.Right, wpfRect.Bottom));
+
+        return Drawing.Rectangle.FromLTRB(
+            (int)Math.Round(topLeft.X),
+            (int)Math.Round(topLeft.Y),
+            (int)Math.Round(bottomRight.X),
+            (int)Math.Round(bottomRight.Y));
+    }
+
+    private void MoveToActiveScreenIfOffscreen()
+    {
+        if (!IsWindowOffAllScreens())
+            return;
+
+        var activeWorkArea = GetWorkAreaForActiveScreen();
+        Left = Math.Max(activeWorkArea.Left, Math.Min(Left, activeWorkArea.Right - Width));
+        Top = Math.Max(activeWorkArea.Top, Math.Min(Top, activeWorkArea.Bottom - Height));
+    }
+
     private void SnapToNearestEdge()
     {
-        var wa = SystemParameters.WorkArea;
+        MoveToActiveScreenIfOffscreen();
+
+        var wa = GetWorkAreaForCurrentWindowScreen();
         double leftDist = Math.Abs(Left - wa.Left);
         double rightDist = Math.Abs(Left + Width - wa.Right);
         double topDist = Math.Abs(Top - wa.Top);
@@ -457,9 +979,39 @@ public partial class MainWindow : Window
         Top = Math.Max(wa.Top, Math.Min(Top, wa.Bottom - Height));
     }
 
+    private void RestoreWindowPlacement()
+    {
+        if (_savedWindowLeft is null || _savedWindowTop is null)
+        {
+            SnapToNearestEdge();
+            return;
+        }
+
+        Left = _savedWindowLeft.Value;
+        Top = _savedWindowTop.Value;
+
+        if (!string.IsNullOrWhiteSpace(_savedMonitorDeviceName))
+        {
+            var savedScreen = WinForms.Screen.AllScreens.FirstOrDefault(s =>
+                string.Equals(s.DeviceName, _savedMonitorDeviceName, StringComparison.OrdinalIgnoreCase));
+
+            if (savedScreen is not null)
+            {
+                var wa = ConvertDeviceRectToWpfRect(savedScreen.WorkingArea);
+                Left = Math.Max(wa.Left, Math.Min(Left, wa.Right - Width));
+                Top = Math.Max(wa.Top, Math.Min(Top, wa.Bottom - Height));
+            }
+        }
+
+        if (IsWindowOffAllScreens())
+            MoveToActiveScreenIfOffscreen();
+
+        SnapToNearestEdge();
+    }
+
     private void PositionBubbles()
     {
-        var wa = SystemParameters.WorkArea;
+        var wa = GetWorkAreaForCurrentWindowScreen();
         double startX = 25;
         double startY = 25;
         double spacingX = 56;
@@ -493,70 +1045,976 @@ public partial class MainWindow : Window
 
         using var dialog = new WinForms.Form
         {
-            Width = 720,
-            Height = 520,
+            Width = 800,
+            Height = 600,
             FormBorderStyle = WinForms.FormBorderStyle.Sizable,
             StartPosition = WinForms.FormStartPosition.CenterScreen,
             Text = "PinBubble - Edit Snippets",
             MinimizeBox = false,
-            TopMost = true
+            MaximizeBox = false,
+            TopMost = true,
+            KeyPreview = true,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White,
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black
         };
 
-        var infoLabel = new WinForms.Label
+        var isDecrypted = false;
+        var originalLines = plaintext.Split('\n');
+        var hasChanges = false;
+        var isUpdatingProgrammatically = false;
+        
+        // Toolbar panel
+        var toolbar = new WinForms.Panel
         {
-            Left = 12,
-            Top = 10,
-            Width = 680,
-            Text = "One snippet per line: Label, Your snippet text"
+            Dock = WinForms.DockStyle.Top,
+            Height = 70,
+            BorderStyle = WinForms.BorderStyle.FixedSingle,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 48) : Drawing.Color.FromArgb(240, 240, 240)
         };
 
-        var editor = new WinForms.TextBox
+        // Status indicator - LED Light
+        var statusLED = new WinForms.PictureBox
         {
-            Left = 12,
-            Top = 32,
-            Width = 680,
-            Height = 410,
-            Multiline = true,
-            ScrollBars = WinForms.ScrollBars.Vertical,
-            AcceptsReturn = true,
-            AcceptsTab = true,
-            WordWrap = true,
-            Font = new Drawing.Font("Consolas", 10),
-            Text = NormalizeForEditor(plaintext)
+            Left = 30,
+            Top = 20,
+            Width = 30,
+            Height = 30,
+            BackColor = Drawing.Color.Transparent
         };
+        
+        // Function to draw LED with given color
+        void DrawLED(Drawing.Color color)
+        {
+            var ledBitmap = new System.Drawing.Bitmap(30, 30);
+            using (var g = System.Drawing.Graphics.FromImage(ledBitmap))
+            {
+                g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                
+                // Outer dark ring
+                using (var brush = new System.Drawing.SolidBrush(Drawing.Color.FromArgb(40, 40, 45)))
+                {
+                    g.FillEllipse(brush, 0, 0, 30, 30);
+                }
+                
+                // Main LED body
+                using (var brush = new System.Drawing.SolidBrush(color))
+                {
+                    g.FillEllipse(brush, 3, 3, 24, 24);
+                }
+                
+                // Inner glow effect
+                using (var path = new System.Drawing.Drawing2D.GraphicsPath())
+                {
+                    path.AddEllipse(6, 6, 18, 18);
+                    using (var pgb = new System.Drawing.Drawing2D.PathGradientBrush(path))
+                    {
+                        pgb.CenterPoint = new System.Drawing.PointF(15, 15);
+                        pgb.CenterColor = Drawing.Color.FromArgb(180, 255, 255, 255);
+                        pgb.SurroundColors = new[] { Drawing.Color.FromArgb(0, 255, 255, 255) };
+                        g.FillEllipse(pgb, 6, 6, 18, 18);
+                    }
+                }
+                
+                // Highlight (glossy effect)
+                using (var brush = new System.Drawing.Drawing2D.LinearGradientBrush(
+                    new System.Drawing.Rectangle(8, 8, 10, 8),
+                    Drawing.Color.FromArgb(200, 255, 255, 255),
+                    Drawing.Color.FromArgb(0, 255, 255, 255),
+                    45f))
+                {
+                    g.FillEllipse(brush, 8, 8, 10, 8);
+                }
+            }
+            statusLED.Image = ledBitmap;
+        }
+        
+        // Initialize with green LED
+        DrawLED(Drawing.Color.FromArgb(0, 220, 0));
+        toolbar.Controls.Add(statusLED);
 
-        var saveButton = new WinForms.Button
+        // Button: Decrypt All (toggle) - only visible when Control key is held
+        var btnDecryptAll = new WinForms.Button
+        {
+            Text = "Show All",
+            Left = 80,
+            Top = 12,
+            Width = 110,
+            Height = 46,
+            FlatStyle = WinForms.FlatStyle.Flat,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(55, 55, 60) : Drawing.Color.White,
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
+            Font = new Drawing.Font("Segoe UI", 9, Drawing.FontStyle.Bold),
+            Cursor = WinForms.Cursors.Hand,
+            Visible = false,
+            Enabled = false
+        };
+        btnDecryptAll.FlatAppearance.BorderColor = _isDarkTheme ? Drawing.Color.FromArgb(80, 80, 85) : Drawing.Color.Gray;
+
+        // Button: Save - only visible when changes are made
+        var btnSave = new WinForms.Button
         {
             Text = "Save",
-            Left = 536,
-            Width = 75,
-            Top = 450,
-            DialogResult = WinForms.DialogResult.OK
+            Left = 580,
+            Top = 12,
+            Width = 90,
+            Height = 46,
+            FlatStyle = WinForms.FlatStyle.Flat,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(0, 100, 70) : Drawing.Color.LightGreen,
+            ForeColor = _isDarkTheme ? Drawing.Color.White : Drawing.Color.Black,
+            Font = new Drawing.Font("Segoe UI", 9, Drawing.FontStyle.Bold),
+            Cursor = WinForms.Cursors.Hand,
+            DialogResult = WinForms.DialogResult.OK,
+            Visible = false
         };
+        btnSave.FlatAppearance.BorderColor = _isDarkTheme ? Drawing.Color.FromArgb(0, 120, 80) : Drawing.Color.DarkGreen;
 
-        var cancelButton = new WinForms.Button
+        // Button: Cancel
+        var btnCancel = new WinForms.Button
         {
             Text = "Cancel",
-            Left = 617,
-            Width = 75,
-            Top = 450,
-            DialogResult = WinForms.DialogResult.Cancel
+            Left = 680,
+            Top = 12,
+            Width = 90,
+            Height = 46,
+            FlatStyle = WinForms.FlatStyle.Flat,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(80, 40, 40) : Drawing.Color.LightCoral,
+            ForeColor = _isDarkTheme ? Drawing.Color.White : Drawing.Color.Black,
+            Font = new Drawing.Font("Segoe UI", 9, Drawing.FontStyle.Bold),
+            Cursor = WinForms.Cursors.Hand
+        };
+        btnCancel.FlatAppearance.BorderColor = _isDarkTheme ? Drawing.Color.FromArgb(100, 50, 50) : Drawing.Color.DarkRed;
+
+        toolbar.Controls.Add(btnDecryptAll);
+        toolbar.Controls.Add(btnSave);
+        toolbar.Controls.Add(btnCancel);
+
+        // Parse snippets into rows
+        var snippetRows = new List<SnippetRow>();
+        foreach (var line in originalLines)
+        {
+            var trimmed = line.Trim();
+            if (string.IsNullOrWhiteSpace(trimmed) || trimmed.StartsWith("#"))
+                continue;
+                
+            var parts = trimmed.Split(',');
+            if (parts.Length >= 2)
+            {
+                var label = parts[0].Trim();
+                var value = parts[1].Trim();
+                DateTime created = DateTime.Now;
+                DateTime modified = DateTime.Now;
+                DateTime expiry = DateTime.Now.AddDays(30);
+                
+                // Try to parse timestamps if they exist (backward compatible)
+                if (parts.Length >= 4)
+                {
+                    DateTime.TryParse(parts[2].Trim(), out created);
+                    DateTime.TryParse(parts[3].Trim(), out modified);
+                }
+                if (parts.Length >= 5)
+                {
+                    DateTime.TryParse(parts[4].Trim(), out expiry);
+                }
+                
+                snippetRows.Add(new SnippetRow
+                {
+                    Label = label,
+                    Value = "••••••••",
+                    ActualValue = value,
+                    IsEncrypted = true,
+                    Created = created,
+                    Modified = modified,
+                    ExpiryDate = expiry
+                });
+            }
+        }
+
+        // Create DataGridView
+        var grid = new WinForms.DataGridView
+        {
+            Dock = WinForms.DockStyle.Fill,
+            BackgroundColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White,
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
+            GridColor = _isDarkTheme ? Drawing.Color.FromArgb(60, 60, 65) : Drawing.Color.Gray,
+            BorderStyle = WinForms.BorderStyle.None,
+            AllowUserToResizeRows = false,
+            AllowUserToAddRows = true,
+            AllowUserToDeleteRows = true,
+            ColumnHeadersHeightSizeMode = WinForms.DataGridViewColumnHeadersHeightSizeMode.AutoSize,
+            AutoSizeColumnsMode = WinForms.DataGridViewAutoSizeColumnsMode.Fill,
+            SelectionMode = WinForms.DataGridViewSelectionMode.FullRowSelect,
+            MultiSelect = false,
+            RowHeadersVisible = false,
+            RowHeadersWidth = 25,
+            Font = new Drawing.Font("Consolas", 10)
         };
 
-        dialog.Controls.Add(infoLabel);
-        dialog.Controls.Add(editor);
-        dialog.Controls.Add(saveButton);
-        dialog.Controls.Add(cancelButton);
-        dialog.AcceptButton = saveButton;
-        dialog.CancelButton = cancelButton;
+        // Style the grid
+        grid.ColumnHeadersDefaultCellStyle.BackColor = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 48) : Drawing.Color.FromArgb(240, 240, 240);
+        grid.ColumnHeadersDefaultCellStyle.ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black;
+        grid.EnableHeadersVisualStyles = false;
+        grid.DefaultCellStyle.BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White;
+        grid.DefaultCellStyle.ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black;
+        grid.DefaultCellStyle.SelectionBackColor = _isDarkTheme ? Drawing.Color.FromArgb(0, 100, 150) : Drawing.Color.LightBlue;
+        grid.DefaultCellStyle.SelectionForeColor = Drawing.Color.White;
+        grid.RowHeadersDefaultCellStyle.BackColor = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 48) : Drawing.Color.FromArgb(240, 240, 240);
+
+        // Add columns
+        var colAge = new WinForms.DataGridViewTextBoxColumn
+        {
+            HeaderText = "",
+            Name = "Age",
+            FillWeight = 5,
+            Width = 50,
+            ReadOnly = true,
+            SortMode = WinForms.DataGridViewColumnSortMode.NotSortable
+        };
+        
+        var colLabel = new WinForms.DataGridViewTextBoxColumn
+        {
+            HeaderText = "Label",
+            Name = "Label",
+            FillWeight = 30,
+            SortMode = WinForms.DataGridViewColumnSortMode.NotSortable
+        };
+        
+        var colValue = new WinForms.DataGridViewTextBoxColumn
+        {
+            HeaderText = "Value",
+            Name = "Value",
+            FillWeight = 60,
+            SortMode = WinForms.DataGridViewColumnSortMode.NotSortable
+        };
+        
+        var colToggle = new WinForms.DataGridViewTextBoxColumn
+        {
+            HeaderText = "",
+            Name = "Toggle",
+            FillWeight = 10,
+            Width = 50,
+            ReadOnly = true,
+            SortMode = WinForms.DataGridViewColumnSortMode.NotSortable
+        };
+
+        grid.Columns.Add(colAge);
+        grid.Columns.Add(colLabel);
+        grid.Columns.Add(colValue);
+        grid.Columns.Add(colToggle);
+        
+        // Increase header height for cleaner look
+        grid.ColumnHeadersHeight = 35;
+
+        // Populate grid - Age column will be empty, clock icon shown via painting
+        foreach (var row in snippetRows)
+        {
+            grid.Rows.Add("", row.Label, row.Value);
+            grid.Rows[grid.Rows.Count - 2].Tag = row; // Store the SnippetRow in Tag
+        }
+
+        // Function to update status circle color
+        void UpdateStatusColor()
+        {
+            bool hasDecrypted = false;
+            int totalRows = 0;
+            int encryptedRows = 0;
+            
+            foreach (WinForms.DataGridViewRow gridRow in grid.Rows)
+            {
+                if (gridRow.IsNewRow) continue;
+                if (gridRow.Tag is SnippetRow snippetRow)
+                {
+                    totalRows++;
+                    if (!snippetRow.IsEncrypted)
+                    {
+                        hasDecrypted = true;
+                    }
+                    else
+                    {
+                        encryptedRows++;
+                    }
+                }
+            }
+            
+            // Update LED color
+            DrawLED(hasDecrypted ? Drawing.Color.FromArgb(220, 0, 0) : Drawing.Color.FromArgb(0, 220, 0));
+            
+            // Auto-hide "Hide All" button if all entries are manually encrypted
+            bool allEncrypted = (totalRows > 0 && encryptedRows == totalRows);
+            if (allEncrypted && btnDecryptAll.Text == "Hide All")
+            {
+                isDecrypted = false;
+                btnDecryptAll.Text = "Show All";
+                btnDecryptAll.Visible = false;
+                btnDecryptAll.Enabled = false;
+            }
+        }
+
+        // Track hovered cell for eye icon display
+        int hoveredRowIndex = -1;
+        int hoveredColumnIndex = -1;
+        
+        // Enable tooltips on the grid
+        grid.ShowCellToolTips = true;
+        
+        // Custom paint for age column (clock icon) and eye icon column
+        grid.CellPainting += (s, ev) =>
+        {
+            // Age column (column 0) - show clock icon with color based on days until expiry
+            if (ev.ColumnIndex == 0 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count - 1)
+            {
+                ev.Paint(ev.CellBounds, WinForms.DataGridViewPaintParts.All);
+                
+                var row = grid.Rows[ev.RowIndex];
+                if (row.Tag is SnippetRow snippetRow && ev.Graphics != null)
+                {
+                    var daysUntilExpiry = (int)(snippetRow.ExpiryDate - DateTime.Now).TotalDays;
+                    bool shouldShowClock = false;
+                    Drawing.Color clockColor = Drawing.Color.FromArgb(100, 150, 200); // Default blue
+                    
+                    if (daysUntilExpiry < 7)
+                    {
+                        // Less than 7 days - Red and always visible
+                        shouldShowClock = true;
+                        clockColor = Drawing.Color.FromArgb(220, 0, 0);
+                    }
+                    else if (daysUntilExpiry < 14)
+                    {
+                        // Less than 14 days - Yellow and always visible
+                        shouldShowClock = true;
+                        clockColor = Drawing.Color.FromArgb(220, 180, 0);
+                    }
+                    else if (daysUntilExpiry >= 15)
+                    {
+                        // 15 days or more - Blue and only on hover
+                        shouldShowClock = (hoveredRowIndex == ev.RowIndex && hoveredColumnIndex == ev.ColumnIndex);
+                        clockColor = Drawing.Color.FromArgb(100, 150, 200);
+                    }
+                    
+                    if (shouldShowClock)
+                    {
+                        var clockFont = new Drawing.Font("Segoe UI Emoji", 14f);
+                        var clockBrush = new System.Drawing.SolidBrush(clockColor);
+                        var sf = new System.Drawing.StringFormat
+                        {
+                            Alignment = System.Drawing.StringAlignment.Center,
+                            LineAlignment = System.Drawing.StringAlignment.Center
+                        };
+                        ev.Graphics.DrawString("⏰", clockFont, clockBrush, ev.CellBounds, sf);
+                        clockBrush.Dispose();
+                        clockFont.Dispose();
+                    }
+                }
+                
+                ev.Handled = true;
+            }
+            // Toggle column (column 3) - eye icon
+            else if (ev.ColumnIndex == 3 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count - 1)
+            {
+                ev.Paint(ev.CellBounds, WinForms.DataGridViewPaintParts.Background | WinForms.DataGridViewPaintParts.Border);
+                
+                var row = grid.Rows[ev.RowIndex];
+                if (row.Tag is SnippetRow snippetRow)
+                {
+                    bool shouldShowEye = false;
+                    var eyeColor = Drawing.Color.Gray;
+                    
+                    if (!snippetRow.IsEncrypted)
+                    {
+                        // Decrypted: show persistent red eye
+                        shouldShowEye = true;
+                        eyeColor = Drawing.Color.FromArgb(220, 0, 0);
+                    }
+                    else if (hoveredRowIndex == ev.RowIndex && hoveredColumnIndex == ev.ColumnIndex)
+                    {
+                        // Encrypted but hovering: show gray eye
+                        shouldShowEye = true;
+                        eyeColor = Drawing.Color.FromArgb(120, 120, 125);
+                    }
+                    
+                    if (shouldShowEye && ev.Graphics != null)
+                    {
+                        var eyeFont = new Drawing.Font("Segoe UI Emoji", 12f);
+                        var eyeBrush = new System.Drawing.SolidBrush(eyeColor);
+                        var sf = new System.Drawing.StringFormat
+                        {
+                            Alignment = System.Drawing.StringAlignment.Center,
+                            LineAlignment = System.Drawing.StringAlignment.Center
+                        };
+                        ev.Graphics.DrawString("👁", eyeFont, eyeBrush, ev.CellBounds, sf);
+                        eyeBrush.Dispose();
+                        eyeFont.Dispose();
+                    }
+                }
+                
+                ev.Handled = true;
+            }
+        };
+        
+        // Track mouse movement for hover effect and tooltip
+        grid.CellMouseEnter += (s, ev) =>
+        {
+            // Set tooltip directly on cells for age column (0) only
+            if (ev.ColumnIndex == 0 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count)
+            {
+                var row = grid.Rows[ev.RowIndex];
+                if (!row.IsNewRow && row.Tag is SnippetRow snippetRow)
+                {
+                    var daysUntilExpiry = (int)(snippetRow.ExpiryDate - DateTime.Now).TotalDays;
+                    var expiryText = daysUntilExpiry >= 0 ? $"Expires in {daysUntilExpiry} days" : $"Expired {Math.Abs(daysUntilExpiry)} days ago";
+                    var tooltipText = $"Entry: {snippetRow.Label}\n\nFirst Added: {snippetRow.Created:yyyy-MM-dd HH:mm}\nLast Modified: {snippetRow.Modified:yyyy-MM-dd HH:mm}\nExpiry: {snippetRow.ExpiryDate:yyyy-MM-dd}\n\n{expiryText}";
+                    
+                    // Set tooltip text directly on the cell
+                    row.Cells[ev.ColumnIndex].ToolTipText = tooltipText;
+                }
+            }
+            
+            if ((ev.ColumnIndex == 0 || ev.ColumnIndex == 3) && ev.RowIndex >= 0)
+            {
+                hoveredRowIndex = ev.RowIndex;
+                hoveredColumnIndex = ev.ColumnIndex;
+                grid.InvalidateCell(ev.ColumnIndex, ev.RowIndex);
+            }
+        };
+        
+        grid.CellMouseLeave += (s, ev) =>
+        {
+            if ((ev.ColumnIndex == 0 || ev.ColumnIndex == 3) && ev.RowIndex >= 0)
+            {
+                hoveredRowIndex = -1;
+                hoveredColumnIndex = -1;
+                grid.InvalidateCell(ev.ColumnIndex, ev.RowIndex);
+            }
+        };
+
+        // Handle cell value changes
+        grid.CellValueChanged += (s, ev) =>
+        {
+            if (isUpdatingProgrammatically || ev.RowIndex < 0 || ev.RowIndex >= grid.Rows.Count)
+                return;
+
+            var row = grid.Rows[ev.RowIndex];
+            if (row.Tag is not SnippetRow snippetRow)
+            {
+                // New row - create SnippetRow with 30 days default expiry
+                snippetRow = new SnippetRow { IsEncrypted = true, Created = DateTime.Now, Modified = DateTime.Now, ExpiryDate = DateTime.Now.AddDays(30) };
+                row.Tag = snippetRow;
+            }
+
+            hasChanges = true;
+            btnSave.Visible = true;
+            snippetRow.Modified = DateTime.Now; // Update modified timestamp
+
+            // Update the SnippetRow based on which column changed
+            if (ev.ColumnIndex == 1) // Label column (shifted from 0 to 1)
+            {
+                snippetRow.Label = row.Cells[1].Value?.ToString() ?? string.Empty;
+            }
+            else if (ev.ColumnIndex == 2) // Value column (shifted from 1 to 2)
+            {
+                var newValue = row.Cells[2].Value?.ToString() ?? string.Empty;
+                
+                // If encrypted and user types non-dots, store actual value and re-encrypt display
+                if (snippetRow.IsEncrypted && newValue != "••••••••" && !newValue.All(c => c == '•'))
+                {
+                    snippetRow.ActualValue = newValue;
+                    
+                    // Re-encrypt display after a brief delay
+                    var timer = new System.Windows.Forms.Timer { Interval = 150 };
+                    timer.Tick += (ts, te) =>
+                    {
+                        timer.Stop();
+                        timer.Dispose();
+                        if (!isUpdatingProgrammatically && row.Index < grid.Rows.Count)
+                        {
+                            isUpdatingProgrammatically = true;
+                            row.Cells[2].Value = "••••••••";
+                            isUpdatingProgrammatically = false;
+                        }
+                    };
+                    timer.Start();
+                }
+                else if (!snippetRow.IsEncrypted)
+                {
+                    // Decrypted - just update actual value
+                    snippetRow.ActualValue = newValue;
+                }
+            }
+        };
+
+        // Handle end edit to commit changes
+        grid.CellEndEdit += (s, ev) =>
+        {
+            if (ev.RowIndex < 0 || ev.RowIndex >= grid.Rows.Count)
+                return;
+                
+            hasChanges = true;
+            btnSave.Visible = true;
+        };
+
+        // Handle clicks on clock icon column and eye icon column
+        grid.CellClick += (s, ev) =>
+        {
+            // Clock icon column - set expiry date
+            if (ev.ColumnIndex == 0 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count - 1)
+            {
+                var row = grid.Rows[ev.RowIndex];
+                if (row.Tag is SnippetRow snippetRow)
+                {
+                    var daysUntilExpiry = (int)(snippetRow.ExpiryDate - DateTime.Now).TotalDays;
+                    var expiryText = daysUntilExpiry >= 0 ? $"Expires in {daysUntilExpiry} days" : $"Expired {Math.Abs(daysUntilExpiry)} days ago";
+                    
+                    // Show a dialog with summary and date picker
+                    using var inputForm = new WinForms.Form
+                    {
+                        Width = 450,
+                        Height = 420,
+                        FormBorderStyle = WinForms.FormBorderStyle.FixedDialog,
+                        Text = "Expiry Date",
+                        StartPosition = WinForms.FormStartPosition.CenterParent,
+                        MaximizeBox = false,
+                        MinimizeBox = false,
+                        TopMost = true,
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White,
+                        Padding = new WinForms.Padding(25)
+                    };
+                    
+                    // Entry label
+                    var entryLabel = new WinForms.Label
+                    {
+                        Left = 30,
+                        Top = 30,
+                        Width = 380,
+                        Height = 35,
+                        Text = $"Entry: {snippetRow.Label}",
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
+                        Font = new Drawing.Font("Segoe UI", 11f, Drawing.FontStyle.Bold),
+                        AutoSize = false
+                    };
+                    
+                    var label1 = new WinForms.Label
+                    {
+                        Left = 30,
+                        Top = 75,
+                        Width = 380,
+                        Height = 30,
+                        Text = $"First Added: {snippetRow.Created:yyyy-MM-dd HH:mm}",
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
+                        Font = new Drawing.Font("Segoe UI", 10f),
+                        AutoSize = false
+                    };
+                    
+                    var label2 = new WinForms.Label
+                    {
+                        Left = 30,
+                        Top = 110,
+                        Width = 380,
+                        Height = 30,
+                        Text = $"Last Modified: {snippetRow.Modified:yyyy-MM-dd HH:mm}",
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
+                        Font = new Drawing.Font("Segoe UI", 10f),
+                        AutoSize = false
+                    };
+                    
+                    var label3 = new WinForms.Label
+                    {
+                        Left = 30,
+                        Top = 145,
+                        Width = 380,
+                        Height = 30,
+                        Text = expiryText,
+                        ForeColor = daysUntilExpiry < 7 ? Drawing.Color.FromArgb(255, 100, 100) : 
+                                   (daysUntilExpiry < 14 ? Drawing.Color.FromArgb(255, 200, 100) : 
+                                   Drawing.Color.FromArgb(100, 200, 100)),
+                        Font = new Drawing.Font("Segoe UI", 10f, Drawing.FontStyle.Bold),
+                        AutoSize = false
+                    };
+                    
+                    var separatorLabel = new WinForms.Label
+                    {
+                        Left = 30,
+                        Top = 195,
+                        Width = 380,
+                        Height = 30,
+                        Text = "Set new expiry date:",
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(160, 160, 165) : Drawing.Color.DarkGray,
+                        Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold)
+                    };
+                    
+                    var datePicker = new WinForms.DateTimePicker
+                    {
+                        Left = 30,
+                        Top = 235,
+                        Width = 380,
+                        Height = 35,
+                        Font = new Drawing.Font("Segoe UI", 11f),
+                        Format = WinForms.DateTimePickerFormat.Short,
+                        Value = snippetRow.ExpiryDate < DateTime.Now ? DateTime.Now.AddDays(30) : snippetRow.ExpiryDate,
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 50) : Drawing.Color.White,
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
+                        CalendarForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
+                        CalendarMonthBackground = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 50) : Drawing.Color.White
+                    };
+                    
+                    var btnOk = new WinForms.Button
+                    {
+                        Text = "Update",
+                        Left = 220,
+                        Top = 300,
+                        Width = 90,
+                        Height = 45,
+                        DialogResult = WinForms.DialogResult.OK,
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(0, 120, 80) : Drawing.Color.LightGreen,
+                        ForeColor = Drawing.Color.White,
+                        FlatStyle = WinForms.FlatStyle.Flat,
+                        Font = new Drawing.Font("Segoe UI", 10f, Drawing.FontStyle.Bold),
+                        Cursor = WinForms.Cursors.Hand
+                    };
+                    btnOk.FlatAppearance.BorderSize = 0;
+                    
+                    var btnCancel = new WinForms.Button
+                    {
+                        Text = "Cancel",
+                        Left = 320,
+                        Top = 300,
+                        Width = 90,
+                        Height = 45,
+                        DialogResult = WinForms.DialogResult.Cancel,
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(80, 40, 40) : Drawing.Color.LightCoral,
+                        ForeColor = Drawing.Color.White,
+                        FlatStyle = WinForms.FlatStyle.Flat,
+                        Font = new Drawing.Font("Segoe UI", 10f, Drawing.FontStyle.Bold),
+                        Cursor = WinForms.Cursors.Hand
+                    };
+                    btnCancel.FlatAppearance.BorderSize = 0;
+                    
+                    inputForm.Controls.Add(entryLabel);
+                    inputForm.Controls.Add(label1);
+                    inputForm.Controls.Add(label2);
+                    inputForm.Controls.Add(label3);
+                    inputForm.Controls.Add(separatorLabel);
+                    inputForm.Controls.Add(datePicker);
+                    inputForm.Controls.Add(btnOk);
+                    inputForm.Controls.Add(btnCancel);
+                    inputForm.AcceptButton = btnOk;
+                    inputForm.CancelButton = btnCancel;
+                    
+                    if (inputForm.ShowDialog() == WinForms.DialogResult.OK)
+                    {
+                        snippetRow.ExpiryDate = datePicker.Value.Date.AddHours(23).AddMinutes(59).AddSeconds(59); // Set to end of day
+                        hasChanges = true;
+                        btnSave.Visible = true;
+                        
+                        // Refresh the clock icon to update color if needed
+                        grid.InvalidateCell(0, ev.RowIndex);
+                    }
+                }
+            }
+            // Eye icon column - toggle encryption
+            else if (ev.ColumnIndex == 3 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count - 1) // Toggle column (now column 3), not new row
+            {
+                var row = grid.Rows[ev.RowIndex];
+                if (row.Tag is SnippetRow snippetRow)
+                {
+                    isUpdatingProgrammatically = true;
+                    snippetRow.IsEncrypted = !snippetRow.IsEncrypted;
+                    
+                    if (snippetRow.IsEncrypted)
+                    {
+                        // Switching to encrypted - show dots
+                        row.Cells[2].Value = "••••••••";
+                    }
+                    else
+                    {
+                        // Switching to decrypted - show actual value
+                        row.Cells[2].Value = snippetRow.ActualValue;
+                    }
+                    
+                    isUpdatingProgrammatically = false;
+                    UpdateStatusColor();
+                    // Refresh the eye icon display
+                    grid.InvalidateCell(3, ev.RowIndex);
+                }
+            }
+        };
+
+        // Decrypt All button click handler
+        btnDecryptAll.Click += (s, ev) =>
+        {
+            // Check if there are unsaved changes
+            if (hasChanges)
+            {
+                var result = WinForms.MessageBox.Show(
+                    "You have unsaved changes. Save before showing all?",
+                    "PinBubble - Unsaved Changes",
+                    WinForms.MessageBoxButtons.YesNoCancel,
+                    WinForms.MessageBoxIcon.Question);
+                
+                if (result == WinForms.DialogResult.Cancel)
+                    return;
+                
+                if (result == WinForms.DialogResult.Yes)
+                {
+                    // Save the changes first
+                    try
+                    {
+                        var textToSave = new StringBuilder();
+                        foreach (WinForms.DataGridViewRow gridRow in grid.Rows)
+                        {
+                            if (gridRow.IsNewRow) continue;
+                            if (gridRow.Tag is SnippetRow snippetRow && !string.IsNullOrWhiteSpace(snippetRow.Label))
+                            {
+                                textToSave.AppendLine($"{snippetRow.Label}, {snippetRow.ActualValue}, {snippetRow.Created:o}, {snippetRow.Modified:o}, {snippetRow.ExpiryDate:o}");
+                            }
+                        }
+                        
+                        EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, textToSave.ToString().Trim());
+                        hasChanges = false;
+                        btnSave.Visible = false;
+                    }
+                    catch
+                    {
+                        WinForms.MessageBox.Show("Failed to save changes.", "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Error);
+                        return;
+                    }
+                }
+                else if (result == WinForms.DialogResult.No)
+                {
+                    // User chose not to save, reset the change flag
+                    hasChanges = false;
+                    btnSave.Visible = false;
+                }
+            }
+            
+            isDecrypted = !isDecrypted;
+            isUpdatingProgrammatically = true;
+            
+            if (isDecrypted)
+            {
+                // Show all decrypted
+                btnDecryptAll.Text = "Hide All";
+                btnDecryptAll.Visible = true;
+                btnDecryptAll.Enabled = true;
+                
+                foreach (WinForms.DataGridViewRow gridRow in grid.Rows)
+                {
+                    if (gridRow.IsNewRow) continue;
+                    if (gridRow.Tag is SnippetRow snippetRow)
+                    {
+                        snippetRow.IsEncrypted = false;
+                        gridRow.Cells[2].Value = snippetRow.ActualValue;
+                        grid.InvalidateCell(3, gridRow.Index); // Refresh eye icon
+                    }
+                }
+            }
+            else
+            {
+                // Show all encrypted
+                btnDecryptAll.Text = "Show All";
+                btnDecryptAll.Visible = false;
+                btnDecryptAll.Enabled = false;
+                
+                foreach (WinForms.DataGridViewRow gridRow in grid.Rows)
+                {
+                    if (gridRow.IsNewRow) continue;
+                    if (gridRow.Tag is SnippetRow snippetRow)
+                    {
+                        snippetRow.IsEncrypted = true;
+                        gridRow.Cells[2].Value = "••••••••";
+                        grid.InvalidateCell(3, gridRow.Index); // Refresh eye icon
+                    }
+                }
+            }
+            
+            isUpdatingProgrammatically = false;
+            UpdateStatusColor();
+        };
+
+        // Cancel button click handler
+        btnCancel.Click += (s, ev) =>
+        {
+            if (hasChanges)
+            {
+                var result = WinForms.MessageBox.Show(
+                    "You have unsaved changes. Do you want to save before closing?",
+                    "PinBubble - Unsaved Changes",
+                    WinForms.MessageBoxButtons.YesNoCancel,
+                    WinForms.MessageBoxIcon.Question);
+                
+                if (result == WinForms.DialogResult.Cancel)
+                    return;
+                
+                if (result == WinForms.DialogResult.Yes)
+                {
+                    // Save before closing
+                    try
+                    {
+                        var textToSave = new StringBuilder();
+                        foreach (WinForms.DataGridViewRow gridRow in grid.Rows)
+                        {
+                            if (gridRow.IsNewRow) continue;
+                            if (gridRow.Tag is SnippetRow snippetRow && !string.IsNullOrWhiteSpace(snippetRow.Label))
+                            {
+                                textToSave.AppendLine($"{snippetRow.Label}, {snippetRow.ActualValue}, {snippetRow.Created:o}, {snippetRow.Modified:o}, {snippetRow.ExpiryDate:o}");
+                            }
+                        }
+                        
+                        EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, textToSave.ToString().Trim());
+                        hasChanges = false;
+                        dialog.DialogResult = WinForms.DialogResult.Cancel;
+                        dialog.Close();
+                    }
+                    catch
+                    {
+                        WinForms.MessageBox.Show("Failed to save changes.", "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Error);
+                        return;
+                    }
+                }
+                else
+                {
+                    // User chose No, close without saving
+                    hasChanges = false;
+                    dialog.DialogResult = WinForms.DialogResult.Cancel;
+                    dialog.Close();
+                }
+            }
+            else
+            {
+                // No changes, just close
+                dialog.DialogResult = WinForms.DialogResult.Cancel;
+                dialog.Close();
+            }
+        };
+
+        // Control key handling for Show All button visibility and Ctrl+S save
+        dialog.KeyDown += (s, ev) =>
+        {
+            // Handle Ctrl+S to save first (before showing the button)
+            if (ev.Control && ev.KeyCode == WinForms.Keys.S)
+            {
+                ev.SuppressKeyPress = true; // Prevent beep sound
+                
+                // Hide Show All button to prevent glitch during save dialog
+                btnDecryptAll.Visible = false;
+                btnDecryptAll.Enabled = false;
+                
+                if (hasChanges)
+                {
+                    // Trigger save
+                    try
+                    {
+                        var textToSave = new StringBuilder();
+                        foreach (WinForms.DataGridViewRow gridRow in grid.Rows)
+                        {
+                            if (gridRow.IsNewRow) continue;
+                            if (gridRow.Tag is SnippetRow snippetRow && !string.IsNullOrWhiteSpace(snippetRow.Label))
+                            {
+                                textToSave.AppendLine($"{snippetRow.Label}, {snippetRow.ActualValue}, {snippetRow.Created:o}, {snippetRow.Modified:o}, {snippetRow.ExpiryDate:o}");
+                            }
+                        }
+                        
+                        EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, textToSave.ToString().Trim());
+                        hasChanges = false;
+                        btnSave.Visible = false;
+                        
+                        WinForms.MessageBox.Show("Saved successfully.", "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Information);
+                    }
+                    catch
+                    {
+                        WinForms.MessageBox.Show("Failed to save changes.", "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Error);
+                    }
+                }
+                return;
+            }
+            
+            // Handle Escape key to cancel/close
+            if (ev.KeyCode == WinForms.Keys.Escape)
+            {
+                ev.SuppressKeyPress = true;
+                btnCancel.PerformClick();
+                return;
+            }
+            
+            // Only show the button when Control is pressed AND it's in "Show All" mode
+            if (ev.Control && !ev.Alt && !ev.Shift && btnDecryptAll.Text == "Show All")
+            {
+                btnDecryptAll.Visible = true;
+                btnDecryptAll.Enabled = true;
+            }
+        };
+
+        dialog.KeyUp += (s, ev) =>
+        {
+            // Hide Show All button when Control is released (but keep Hide All visible)
+            if (ev.KeyCode == WinForms.Keys.ControlKey && btnDecryptAll.Text == "Show All")
+            {
+                btnDecryptAll.Visible = false;
+                btnDecryptAll.Enabled = false;
+            }
+        };
+
+        // Handle form closing to prompt for unsaved changes
+        dialog.FormClosing += (s, ev) =>
+        {
+            if (hasChanges && ((WinForms.FormClosingEventArgs)ev).CloseReason == WinForms.CloseReason.UserClosing)
+            {
+                var result = WinForms.MessageBox.Show(
+                    "You have unsaved changes. Do you want to save before closing?",
+                    "PinBubble - Unsaved Changes",
+                    WinForms.MessageBoxButtons.YesNoCancel,
+                    WinForms.MessageBoxIcon.Question);
+                
+                if (result == WinForms.DialogResult.Cancel)
+                {
+                    ((WinForms.FormClosingEventArgs)ev).Cancel = true;
+                    return;
+                }
+                
+                if (result == WinForms.DialogResult.Yes)
+                {
+                    // Save before closing
+                    try
+                    {
+                        var textToSave = new StringBuilder();
+                        foreach (WinForms.DataGridViewRow gridRow in grid.Rows)
+                        {
+                            if (gridRow.IsNewRow) continue;
+                            if (gridRow.Tag is SnippetRow snippetRow && !string.IsNullOrWhiteSpace(snippetRow.Label))
+                            {
+                                textToSave.AppendLine($"{snippetRow.Label}, {snippetRow.ActualValue}, {snippetRow.Created:o}, {snippetRow.Modified:o}, {snippetRow.ExpiryDate:o}");
+                            }
+                        }
+                        
+                        EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, textToSave.ToString().Trim());
+                    }
+                    catch
+                    {
+                        WinForms.MessageBox.Show("Failed to save changes.", "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Error);
+                        ((WinForms.FormClosingEventArgs)ev).Cancel = true;
+                    }
+                }
+            }
+        };
+
+        dialog.Controls.Add(grid);
+        dialog.Controls.Add(toolbar);
+        dialog.AcceptButton = btnSave;
 
         if (dialog.ShowDialog() != WinForms.DialogResult.OK)
             return;
 
         try
         {
-            var normalized = NormalizeForStorage(editor.Text);
-            EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, normalized);
+            var textToSave = new StringBuilder();
+            foreach (WinForms.DataGridViewRow gridRow in grid.Rows)
+            {
+                if (gridRow.IsNewRow) continue;
+                if (gridRow.Tag is SnippetRow snippetRow && !string.IsNullOrWhiteSpace(snippetRow.Label))
+                {
+                    textToSave.AppendLine($"{snippetRow.Label}, {snippetRow.ActualValue}, {snippetRow.Created:o}, {snippetRow.Modified:o}, {snippetRow.ExpiryDate:o}");
+                }
+            }
+            
+            EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword, textToSave.ToString().Trim());
             LoadSnippets();
             BuildBubbles();
         }
@@ -566,40 +2024,529 @@ public partial class MainWindow : Window
         }
     }
 
-    private static string NormalizeForEditor(string value)
+    private void ToggleTaskbar_Click(object sender, RoutedEventArgs e)
     {
-        // WinForms multiline text boxes reliably display CRLF line endings.
-        return value.Replace("\r\n", "\n").Replace("\n", Environment.NewLine);
+        ShowInTaskbar = !ShowInTaskbar;
+        UpdateTaskbarMenuText();
+        SaveUiSettings();
+        
+        if (!ShowInTaskbar && _trayIcon != null)
+        {
+            _trayIcon.BalloonTipTitle = "PinBubble";
+            _trayIcon.BalloonTipText = "Taskbar icon hidden. App is still running and pinned on screen.";
+            _trayIcon.ShowBalloonTip(2000);
+        }
     }
 
-    private static string NormalizeForStorage(string value)
+    private void UpdateTaskbarMenuText()
     {
-        return value.Replace("\r\n", "\n");
+        TaskbarToggleMenuItem.Header = ShowInTaskbar ? "Hide from Taskbar" : "Show in Taskbar";
     }
 
-    private void OpenInVsCode_Click(object sender, RoutedEventArgs e)
+    private void TogglePin_Click(object sender, RoutedEventArgs e)
     {
-        try { Process.Start(new ProcessStartInfo("code", $"\"{_textFilePath}\"") { UseShellExecute = true }); }
-        catch { Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{_textFilePath}\"") { UseShellExecute = true }); }
+        _isPinned = !_isPinned;
+        Topmost = _isPinned;
+        UpdatePinMenuText();
+        SaveUiSettings();
     }
 
-    private void OpenInNotepad_Click(object sender, RoutedEventArgs e)
+    private void UpdatePinMenuText()
     {
-        Process.Start(new ProcessStartInfo("notepad.exe", $"\"{_textFilePath}\"") { UseShellExecute = true });
+        PinToggleMenuItem.Header = _isPinned ? "Unpin the Bubble" : "Pin the Bubble";
     }
 
-    private void OpenInExplorer_Click(object sender, RoutedEventArgs e)
+    private void ToggleBiometricUnlock_Click(object sender, RoutedEventArgs e)
     {
-        Process.Start(new ProcessStartInfo("explorer.exe", $"/select,\"{_textFilePath}\"") { UseShellExecute = true });
+        if (BiometricMasterPasswordStore.HasCachedPassword())
+        {
+            var disableResult = System.Windows.MessageBox.Show(
+                "Disable fingerprint unlock and remove the cached credential?",
+                "PinBubble",
+                MessageBoxButton.YesNo,
+                MessageBoxImage.Question);
+
+            if (disableResult != MessageBoxResult.Yes)
+                return;
+
+            BiometricMasterPasswordStore.ClearCachedPassword();
+            UpdateBiometricUi();
+            return;
+        }
+
+        if (string.IsNullOrWhiteSpace(_masterPassword))
+        {
+            System.Windows.MessageBox.Show(
+                "Fingerprint unlock can only be enabled after entering your master password.",
+                "PinBubble",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+            UpdateBiometricUi();
+            return;
+        }
+
+        if (!BiometricMasterPasswordStore.IsBiometricAvailable())
+        {
+            System.Windows.MessageBox.Show(
+                "Fingerprint authentication is not available on this device.",
+                "PinBubble",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+            UpdateBiometricUi();
+            return;
+        }
+
+        if (!BiometricMasterPasswordStore.CachePassword(_masterPassword))
+        {
+            System.Windows.MessageBox.Show(
+                "Failed to enable fingerprint unlock.",
+                "PinBubble",
+                MessageBoxButton.OK,
+                MessageBoxImage.Warning);
+        }
+
+        UpdateBiometricUi();
+    }
+
+    private void UpdateBiometricUi()
+    {
+        UpdateBiometricMenuText();
+    }
+
+    private void UpdateBiometricMenuText()
+    {
+        var enabled = BiometricMasterPasswordStore.HasCachedPassword();
+        var available = BiometricMasterPasswordStore.IsBiometricAvailable();
+
+        if (enabled)
+        {
+            BiometricToggleMenuItem.Header = "Disable Fingerprint Unlock";
+            BiometricToggleMenuItem.IsEnabled = true;
+            return;
+        }
+
+        BiometricToggleMenuItem.Header = available
+            ? "Enable Fingerprint Unlock"
+            : "Enable Fingerprint Unlock (Unavailable)";
+        BiometricToggleMenuItem.IsEnabled = available;
+    }
+
+    private void ToggleDarkTheme_Click(object sender, RoutedEventArgs e)
+    {
+        _isDarkTheme = !_isDarkTheme;
+        DarkThemeMenuItem.IsChecked = _isDarkTheme;
+        ApplyExpandedPanelTheme();
+        BuildBubbles();
+        SaveUiSettings();
+    }
+
+    private void ResetPreferences_Click(object sender, RoutedEventArgs e)
+    {
+        var result = System.Windows.MessageBox.Show(
+            "Reset UI preferences to defaults? This does not affect snippets.",
+            "PinBubble",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Question);
+
+        if (result != MessageBoxResult.Yes)
+            return;
+
+        _backdropOpacity = DefaultBackdropOpacity;
+        _isPinned = DefaultIsPinned;
+        _isDarkTheme = DefaultIsDarkTheme;
+        ShowInTaskbar = DefaultShowInTaskbar;
+
+        Topmost = _isPinned;
+        DarkThemeMenuItem.IsChecked = _isDarkTheme;
+        ApplyExpandedPanelTheme();
+        BuildBubbles();
+        UpdateBackdropOpacityMenuChecks();
+        UpdatePinMenuText();
+        UpdateTaskbarMenuText();
+        SaveUiSettings();
+    }
+
+    private void BackdropOpacity_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not MenuItem menuItem || menuItem.Tag is not string tagValue)
+            return;
+
+        if (!double.TryParse(tagValue, NumberStyles.Float, CultureInfo.InvariantCulture, out var opacity))
+            return;
+
+        _backdropOpacity = Math.Clamp(opacity, 0.0, 1.0);
+        ApplyBackdropOpacity();
+        UpdateBackdropOpacityMenuChecks();
+        SaveUiSettings();
+    }
+
+    private void ApplyBackdropOpacity()
+    {
+        var baseColor = _isDarkTheme ? BackdropBaseColorDark : BackdropBaseColorLight;
+        var alpha = (byte)Math.Round(Math.Clamp(_backdropOpacity, 0.0, 1.0) * 255);
+        ExpandedBackdrop.Background = new SolidColorBrush(
+            WpfColor.FromArgb(alpha, baseColor.R, baseColor.G, baseColor.B));
+    }
+
+    private void ApplyExpandedPanelTheme()
+    {
+        ApplyBackdropOpacity();
+        ExpandedBackdrop.BorderBrush = new SolidColorBrush(_isDarkTheme
+            ? WpfColor.FromArgb(85, 255, 255, 255)
+            : WpfColor.FromArgb(120, 45, 55, 70));
+    }
+
+    private void UpdateBackdropOpacityMenuChecks()
+    {
+        BackdropOpacity20MenuItem.IsChecked = Math.Abs(_backdropOpacity - 0.20) < 0.01;
+        BackdropOpacity35MenuItem.IsChecked = Math.Abs(_backdropOpacity - 0.35) < 0.01;
+        BackdropOpacity50MenuItem.IsChecked = Math.Abs(_backdropOpacity - 0.50) < 0.01;
+        BackdropOpacity65MenuItem.IsChecked = Math.Abs(_backdropOpacity - 0.65) < 0.01;
+        BackdropOpacity80MenuItem.IsChecked = Math.Abs(_backdropOpacity - 0.80) < 0.01;
+    }
+
+    private void LoadUiSettings()
+    {
+        try
+        {
+            if (!File.Exists(_settingsFilePath))
+                return;
+
+            var json = File.ReadAllText(_settingsFilePath);
+            var settings = JsonSerializer.Deserialize<UiSettings>(json);
+            if (settings is not null)
+            {
+                _backdropOpacity = Math.Clamp(settings.BackdropOpacity, 0.0, 1.0);
+                _isPinned = settings.IsPinned;
+                _isDarkTheme = settings.IsDarkTheme;
+                ShowInTaskbar = settings.ShowInTaskbar;
+                _savedWindowLeft = settings.WindowLeft;
+                _savedWindowTop = settings.WindowTop;
+                _savedMonitorDeviceName = settings.MonitorDeviceName;
+            }
+        }
+        catch
+        {
+            // Invalid or inaccessible settings should not block app startup.
+        }
+    }
+
+    private void SaveUiSettings()
+    {
+        try
+        {
+            var settingsDir = Path.GetDirectoryName(_settingsFilePath);
+            if (!string.IsNullOrWhiteSpace(settingsDir))
+                Directory.CreateDirectory(settingsDir);
+
+            var windowRect = ConvertWpfRectToDeviceRect(new Rect(
+                Left,
+                Top,
+                Math.Max(1, Width),
+                Math.Max(1, Height)));
+            var currentScreen = WinForms.Screen.FromRectangle(windowRect);
+
+            var settings = new UiSettings
+            {
+                BackdropOpacity = _backdropOpacity,
+                IsPinned = _isPinned,
+                IsDarkTheme = _isDarkTheme,
+                ShowInTaskbar = ShowInTaskbar,
+                WindowLeft = Left,
+                WindowTop = Top,
+                MonitorDeviceName = currentScreen.DeviceName
+            };
+            var json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
+            File.WriteAllText(_settingsFilePath, json);
+        }
+        catch
+        {
+            // Failing to save UI preferences should be non-fatal.
+        }
+    }
+
+    private void Window_StateChanged(object? sender, EventArgs e)
+    {
+        // Allow normal minimize/restore behavior when clicking taskbar icon
+        // Window will minimize when clicked, and restore when clicked again
     }
 
     protected override void OnClosed(EventArgs e)
     {
+        SaveUiSettings();
         _trayIcon?.Dispose();
         _trayMenu?.Dispose();
         _watcher?.Dispose();
         _reloadDebounce?.Stop();
         base.OnClosed(e);
+    }
+
+    private void About_Click(object sender, RoutedEventArgs e)
+    {
+        using var aboutDialog = new WinForms.Form
+        {
+            Width = 500,
+            Height = 520,
+            FormBorderStyle = WinForms.FormBorderStyle.FixedDialog,
+            StartPosition = WinForms.FormStartPosition.CenterScreen,
+            Text = "About PinBubble",
+            MaximizeBox = false,
+            MinimizeBox = false,
+            ShowInTaskbar = false,
+            TopMost = true,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White,
+            KeyPreview = true
+        };
+
+        aboutDialog.KeyDown += (s, e) =>
+        {
+            if (e.KeyCode == WinForms.Keys.Escape)
+                aboutDialog.Close();
+        };
+
+        // Pin icon using custom drawing
+        var pinIcon = new WinForms.PictureBox
+        {
+            Left = 210,
+            Top = 15,
+            Width = 60,
+            Height = 60,
+            BackColor = Drawing.Color.Transparent
+        };
+        
+        var pinBitmap = new System.Drawing.Bitmap(60, 60);
+        using (var g = System.Drawing.Graphics.FromImage(pinBitmap))
+        {
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            var pinColor = _isDarkTheme ? Drawing.Color.FromArgb(102, 185, 51) : Drawing.Color.FromArgb(80, 150, 40);
+            
+            // Draw pin head (circle)
+            using (var brush = new System.Drawing.SolidBrush(pinColor))
+            {
+                g.FillEllipse(brush, 15, 5, 30, 30);
+            }
+            
+            // Draw pin point (triangle)
+            using (var brush = new System.Drawing.SolidBrush(pinColor))
+            {
+                var points = new System.Drawing.Point[] 
+                {
+                    new System.Drawing.Point(26, 35),
+                    new System.Drawing.Point(34, 35),
+                    new System.Drawing.Point(30, 52)
+                };
+                g.FillPolygon(brush, points);
+            }
+        }
+        pinIcon.Image = pinBitmap;
+
+        // Title
+        var titleLabel = new WinForms.Label
+        {
+            Left = 20,
+            Top = 80,
+            Width = 460,
+            Height = 35,
+            Text = "PinBubble",
+            Font = new Drawing.Font("Segoe UI", 24f, Drawing.FontStyle.Bold),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.MiddleCenter
+        };
+
+        // Version
+        var versionLabel = new WinForms.Label
+        {
+            Left = 20,
+            Top = 118,
+            Width = 460,
+            Height = 20,
+            Text = "Version 1.0.0",
+            Font = new Drawing.Font("Segoe UI", 9f),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(160, 160, 165) : Drawing.Color.FromArgb(100, 100, 100),
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.MiddleCenter
+        };
+
+        // Separator line
+        var separator1 = new WinForms.Panel
+        {
+            Left = 20,
+            Top = 148,
+            Width = 440,
+            Height = 1,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(70, 70, 75) : Drawing.Color.FromArgb(200, 200, 200)
+        };
+
+        // Description
+        var descriptionLabel = new WinForms.Label
+        {
+            Left = 30,
+            Top = 158,
+            Width = 440,
+            Height = 45,
+            Text = "A lightweight, always-on-screen snippet manager\nthat keeps your frequently used text snippets\nat your fingertips.",
+            Font = new Drawing.Font("Segoe UI", 9f),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.TopCenter
+        };
+
+        // Features header - more spacing above
+        var featuresLabel = new WinForms.Label
+        {
+            Left = 40,
+            Top = 225,
+            Width = 420,
+            Height = 20,
+            Text = "KEY FEATURES",
+            Font = new Drawing.Font("Segoe UI", 8.5f, Drawing.FontStyle.Bold),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(102, 185, 51) : Drawing.Color.FromArgb(80, 150, 40),
+            BackColor = Drawing.Color.Transparent
+        };
+
+        // Features list with better spacing - increased height to 22px each
+        var feature1 = new WinForms.Label
+        {
+            Left = 60,
+            Top = 253,
+            Width = 420,
+            Height = 22,
+            Text = "> Encrypted snippet storage with master password",
+            Font = new Drawing.Font("Segoe UI", 8.5f),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
+            BackColor = Drawing.Color.Transparent
+        };
+
+        var feature2 = new WinForms.Label
+        {
+            Left = 60,
+            Top = 280,
+            Width = 420,
+            Height = 22,
+            Text = "> Pin/unpin to stay on top of other windows",
+            Font = new Drawing.Font("Segoe UI", 8.5f),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
+            BackColor = Drawing.Color.Transparent
+        };
+
+        var feature3 = new WinForms.Label
+        {
+            Left = 60,
+            Top = 307,
+            Width = 420,
+            Height = 22,
+            Text = "> Dark theme support for comfortable viewing",
+            Font = new Drawing.Font("Segoe UI", 8.5f),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
+            BackColor = Drawing.Color.Transparent
+        };
+
+        var feature4 = new WinForms.Label
+        {
+            Left = 60,
+            Top = 334,
+            Width = 420,
+            Height = 22,
+            Text = "> Quick copy snippets with a single click",
+            Font = new Drawing.Font("Segoe UI", 8.5f),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
+            BackColor = Drawing.Color.Transparent
+        };
+
+        var feature5 = new WinForms.Label
+        {
+            Left = 60,
+            Top = 361,
+            Width = 420,
+            Height = 22,
+            Text = "> Line-by-line encryption controls",
+            Font = new Drawing.Font("Segoe UI", 8.5f),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
+            BackColor = Drawing.Color.Transparent
+        };
+
+        // Separator line 2
+        var separator2 = new WinForms.Panel
+        {
+            Left = 20,
+            Top = 400,
+            Width = 440,
+            Height = 1,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(70, 70, 75) : Drawing.Color.FromArgb(200, 200, 200)
+        };
+
+        // Robot icon for copilot
+        var robotIcon = new WinForms.PictureBox
+        {
+            Left = 75,
+            Top = 425,
+            Width = 18,
+            Height = 18,
+            BackColor = Drawing.Color.Transparent
+        };
+        
+        var robotBitmap = new System.Drawing.Bitmap(18, 18);
+        using (var g = System.Drawing.Graphics.FromImage(robotBitmap))
+        {
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            var robotColor = _isDarkTheme ? Drawing.Color.FromArgb(140, 140, 145) : Drawing.Color.FromArgb(120, 120, 120);
+            
+            // Draw robot head (rectangle)
+            using (var brush = new System.Drawing.SolidBrush(robotColor))
+            {
+                g.FillRectangle(brush, 3, 5, 12, 10);
+            }
+            
+            // Draw robot eyes (two small circles)
+            using (var brush = new System.Drawing.SolidBrush(_isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White))
+            {
+                g.FillEllipse(brush, 6, 8, 3, 3);
+                g.FillEllipse(brush, 11, 8, 3, 3);
+            }
+            
+            // Draw antenna
+            using (var pen = new System.Drawing.Pen(robotColor, 1.5f))
+            {
+                g.DrawLine(pen, 9, 2, 9, 5);
+            }
+            using (var brush = new System.Drawing.SolidBrush(robotColor))
+            {
+                g.FillEllipse(brush, 7, 0, 4, 4);
+            }
+        }
+        robotIcon.Image = robotBitmap;
+
+        // Copilot credit
+        var copilotLabel = new WinForms.Label
+        {
+            Left = 98,
+            Top = 425,
+            Width = 330,
+            Height = 22,
+            Text = "Proudly vibecoded with GitHub Copilot",
+            Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Italic),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(140, 140, 145) : Drawing.Color.FromArgb(120, 120, 120),
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.MiddleLeft
+        };
+
+        aboutDialog.Controls.Add(pinIcon);
+        aboutDialog.Controls.Add(titleLabel);
+        aboutDialog.Controls.Add(versionLabel);
+        aboutDialog.Controls.Add(separator1);
+        aboutDialog.Controls.Add(descriptionLabel);
+        aboutDialog.Controls.Add(featuresLabel);
+        aboutDialog.Controls.Add(feature1);
+        aboutDialog.Controls.Add(feature2);
+        aboutDialog.Controls.Add(feature3);
+        aboutDialog.Controls.Add(feature4);
+        aboutDialog.Controls.Add(feature5);
+        aboutDialog.Controls.Add(separator2);
+        aboutDialog.Controls.Add(robotIcon);
+        aboutDialog.Controls.Add(copilotLabel);
+
+        aboutDialog.ShowDialog();
     }
 
     private void Exit_Click(object sender, RoutedEventArgs e) => Close();

@@ -1,0 +1,57 @@
+# This workflow will build, test, and publish a .NET Core WPF desktop application
+
+name: .NET Core Desktop
+
+on:
+  push:
+    branches: [ "main", "master", "snippet-enhancement" ]
+  pull_request:
+    branches: [ "main", "master", "snippet-enhancement" ]
+  workflow_dispatch:  # Allows manual triggering from GitHub Actions tab
+
+jobs:
+
+  build:
+
+    strategy:
+      matrix:
+        configuration: [Debug, Release]
+
+    runs-on: windows-latest
+
+    env:
+      Solution_Name: PinBubble.sln
+      Project_Path: PinBubble.csproj
+
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    # Install the .NET Core workload
+    - name: Install .NET Core
+      uses: actions/setup-dotnet@v4
+      with:
+        dotnet-version: 8.0.x
+
+    # Restore dependencies
+    - name: Restore dependencies
+      run: dotnet restore $env:Solution_Name
+
+    # Build the application
+    - name: Build
+      run: dotnet build $env:Solution_Name --configuration ${{ matrix.configuration }} --no-restore
+
+    # Publish the application for Windows
+    - name: Publish Windows Application
+      if: matrix.configuration == 'Release'
+      run: dotnet publish $env:Project_Path --configuration Release --runtime win-x64 --self-contained false --output ./publish/win-x64
+
+    # Upload the published application as artifact
+    - name: Upload build artifacts
+      if: matrix.configuration == 'Release'
+      uses: actions/upload-artifact@v4
+      with:
+        name: PinBubble-Release-win-x64
+        path: ./publish/win-x64/
