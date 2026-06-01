@@ -49,6 +49,7 @@
         <Grid.ContextMenu>
             <ContextMenu>
                 <MenuItem Header="Edit snippets" Click="EditSnippets_Click"/>
+                <MenuItem Header="Manage Shortcuts" Click="EditShortcuts_Click"/>
                 <Separator/>
                 <MenuItem x:Name="TaskbarToggleMenuItem" Header="Hide from Taskbar" Click="ToggleTaskbar_Click"/>
                 <MenuItem x:Name="DarkThemeMenuItem" Header="Dark Theme" IsCheckable="True" IsChecked="True" Click="ToggleDarkTheme_Click"/>
