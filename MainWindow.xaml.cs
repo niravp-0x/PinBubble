@@ -3061,10 +3061,14 @@ public partial class MainWindow : Window
 
     private void About_Click(object sender, RoutedEventArgs e)
     {
+        var dimColor = _isDarkTheme ? Drawing.Color.FromArgb(140, 140, 145) : Drawing.Color.FromArgb(120, 120, 120);
+        var accentColor = _isDarkTheme ? Drawing.Color.FromArgb(102, 185, 51) : Drawing.Color.FromArgb(80, 150, 40);
+        var textColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black;
+
         using var aboutDialog = new WinForms.Form
         {
             Width = 500,
-            Height = 520,
+            Height = 560,
             FormBorderStyle = WinForms.FormBorderStyle.FixedDialog,
             StartPosition = WinForms.FormStartPosition.CenterScreen,
             Text = "About PinBubble",
@@ -3082,49 +3086,25 @@ public partial class MainWindow : Window
                 aboutDialog.Close();
         };
 
-        // Pin icon using custom drawing
-        var pinIcon = new WinForms.PictureBox
-        {
-            Left = 210,
-            Top = 15,
-            Width = 60,
-            Height = 60,
-            BackColor = Drawing.Color.Transparent
-        };
-        
+        // ── Pin icon ────────────────────────────────────────────────────────
+        var pinIcon = new WinForms.PictureBox { Left = 220, Top = 15, Width = 60, Height = 60, BackColor = Drawing.Color.Transparent };
         var pinBitmap = new System.Drawing.Bitmap(60, 60);
         using (var g = System.Drawing.Graphics.FromImage(pinBitmap))
         {
             g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            var pinColor = _isDarkTheme ? Drawing.Color.FromArgb(102, 185, 51) : Drawing.Color.FromArgb(80, 150, 40);
-            
-            // Draw pin head (circle)
-            using (var brush = new System.Drawing.SolidBrush(pinColor))
+            using (var brush = new System.Drawing.SolidBrush(accentColor))
             {
                 g.FillEllipse(brush, 15, 5, 30, 30);
-            }
-            
-            // Draw pin point (triangle)
-            using (var brush = new System.Drawing.SolidBrush(pinColor))
-            {
-                var points = new System.Drawing.Point[] 
-                {
-                    new System.Drawing.Point(26, 35),
-                    new System.Drawing.Point(34, 35),
-                    new System.Drawing.Point(30, 52)
-                };
-                g.FillPolygon(brush, points);
+                g.FillPolygon(brush, new System.Drawing.Point[] {
+                    new(26, 35), new(34, 35), new(30, 52) });
             }
         }
         pinIcon.Image = pinBitmap;
 
-        // Title
+        // ── Title ───────────────────────────────────────────────────────────
         var titleLabel = new WinForms.Label
         {
-            Left = 20,
-            Top = 80,
-            Width = 460,
-            Height = 35,
+            Left = 20, Top = 80, Width = 460, Height = 35,
             Text = "PinBubble",
             Font = new Drawing.Font("Segoe UI", 24f, Drawing.FontStyle.Bold),
             ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
@@ -3132,197 +3112,182 @@ public partial class MainWindow : Window
             TextAlign = Drawing.ContentAlignment.MiddleCenter
         };
 
-        // Version
+        // ── Version (right of centre) + GitHub link (left of centre) ───────
         var versionLabel = new WinForms.Label
         {
-            Left = 20,
-            Top = 118,
-            Width = 460,
-            Height = 20,
-            Text = "Version 1.0.0",
+            Left = 20, Top = 120, Width = 200, Height = 22,
+            Text = "Version 2.0.0",
             Font = new Drawing.Font("Segoe UI", 9f),
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(160, 160, 165) : Drawing.Color.FromArgb(100, 100, 100),
+            ForeColor = dimColor,
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.MiddleRight
+        };
+
+        var pipeLbl = new WinForms.Label
+        {
+            Left = 223, Top = 120, Width = 12, Height = 22,
+            Text = "│",
+            Font = new Drawing.Font("Segoe UI", 9f),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(70, 70, 75) : Drawing.Color.FromArgb(200, 200, 200),
             BackColor = Drawing.Color.Transparent,
             TextAlign = Drawing.ContentAlignment.MiddleCenter
         };
 
-        // Separator line
+        var githubLink = new WinForms.LinkLabel
+        {
+            Left = 238, Top = 120, Width = 200, Height = 22,
+            Text = "⭐ View on GitHub",
+            Font = new Drawing.Font("Segoe UI", 9f),
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.MiddleLeft,
+            LinkColor = accentColor,
+            ActiveLinkColor = _isDarkTheme ? Drawing.Color.FromArgb(150, 220, 80) : Drawing.Color.FromArgb(0, 80, 40),
+            VisitedLinkColor = accentColor
+        };
+        githubLink.LinkClicked += (_, _) =>
+        {
+            try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                "https://github.com/niravp-0x/PinBubble") { UseShellExecute = true }); }
+            catch { }
+        };
+
+        // ── Separator 1 ─────────────────────────────────────────────────────
         var separator1 = new WinForms.Panel
         {
-            Left = 20,
-            Top = 148,
-            Width = 440,
-            Height = 1,
+            Left = 20, Top = 152, Width = 440, Height = 1,
             BackColor = _isDarkTheme ? Drawing.Color.FromArgb(70, 70, 75) : Drawing.Color.FromArgb(200, 200, 200)
         };
 
-        // Description
+        // ── Description ─────────────────────────────────────────────────────
         var descriptionLabel = new WinForms.Label
         {
-            Left = 30,
-            Top = 158,
-            Width = 440,
-            Height = 45,
+            Left = 30, Top = 162, Width = 440, Height = 45,
             Text = "A lightweight, always-on-screen snippet manager\nthat keeps your frequently used text snippets\nat your fingertips.",
             Font = new Drawing.Font("Segoe UI", 9f),
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
+            ForeColor = textColor,
             BackColor = Drawing.Color.Transparent,
             TextAlign = Drawing.ContentAlignment.TopCenter
         };
 
-        // Features header - more spacing above
+        // ── Features ────────────────────────────────────────────────────────
         var featuresLabel = new WinForms.Label
         {
-            Left = 40,
-            Top = 225,
-            Width = 420,
-            Height = 20,
+            Left = 40, Top = 218, Width = 420, Height = 20,
             Text = "KEY FEATURES",
             Font = new Drawing.Font("Segoe UI", 8.5f, Drawing.FontStyle.Bold),
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(102, 185, 51) : Drawing.Color.FromArgb(80, 150, 40),
+            ForeColor = accentColor,
             BackColor = Drawing.Color.Transparent
         };
 
-        // Features list with better spacing - increased height to 22px each
-        var feature1 = new WinForms.Label
+        WinForms.Label MakeFeat(string text, int top) => new WinForms.Label
         {
-            Left = 60,
-            Top = 253,
-            Width = 420,
-            Height = 22,
-            Text = "> Encrypted snippet storage with master password",
+            Left = 60, Top = top, Width = 390, Height = 22,
+            Text = text,
             Font = new Drawing.Font("Segoe UI", 8.5f),
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
+            ForeColor = textColor,
             BackColor = Drawing.Color.Transparent
         };
+        var feature1 = MakeFeat("> Encrypted snippet storage with master password", 244);
+        var feature2 = MakeFeat("> Global hotkeys & QWERTY picker for instant copy",  266);
+        var feature3 = MakeFeat("> Pin/unpin to stay on top of other windows",         288);
+        var feature4 = MakeFeat("> Dark theme support for comfortable viewing",         310);
+        var feature5 = MakeFeat("> Auto-clear clipboard after copy (configurable)",     332);
 
-        var feature2 = new WinForms.Label
-        {
-            Left = 60,
-            Top = 280,
-            Width = 420,
-            Height = 22,
-            Text = "> Pin/unpin to stay on top of other windows",
-            Font = new Drawing.Font("Segoe UI", 8.5f),
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
-            BackColor = Drawing.Color.Transparent
-        };
-
-        var feature3 = new WinForms.Label
-        {
-            Left = 60,
-            Top = 307,
-            Width = 420,
-            Height = 22,
-            Text = "> Dark theme support for comfortable viewing",
-            Font = new Drawing.Font("Segoe UI", 8.5f),
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
-            BackColor = Drawing.Color.Transparent
-        };
-
-        var feature4 = new WinForms.Label
-        {
-            Left = 60,
-            Top = 334,
-            Width = 420,
-            Height = 22,
-            Text = "> Quick copy snippets with a single click",
-            Font = new Drawing.Font("Segoe UI", 8.5f),
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
-            BackColor = Drawing.Color.Transparent
-        };
-
-        var feature5 = new WinForms.Label
-        {
-            Left = 60,
-            Top = 361,
-            Width = 420,
-            Height = 22,
-            Text = "> Line-by-line encryption controls",
-            Font = new Drawing.Font("Segoe UI", 8.5f),
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
-            BackColor = Drawing.Color.Transparent
-        };
-
-        // Separator line 2
+        // ── Separator 2 ─────────────────────────────────────────────────────
         var separator2 = new WinForms.Panel
         {
-            Left = 20,
-            Top = 400,
-            Width = 440,
-            Height = 1,
+            Left = 20, Top = 366, Width = 440, Height = 1,
             BackColor = _isDarkTheme ? Drawing.Color.FromArgb(70, 70, 75) : Drawing.Color.FromArgb(200, 200, 200)
         };
 
-        // Robot icon for copilot
-        var robotIcon = new WinForms.PictureBox
+        // ── Authors ─────────────────────────────────────────────────────────
+        var authorsHeaderLbl = new WinForms.Label
         {
-            Left = 75,
-            Top = 425,
-            Width = 18,
-            Height = 18,
-            BackColor = Drawing.Color.Transparent
+            Left = 20, Top = 378, Width = 460, Height = 18,
+            Text = "AUTHORS",
+            Font = new Drawing.Font("Segoe UI", 8.5f, Drawing.FontStyle.Bold),
+            ForeColor = accentColor,
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.MiddleCenter
         };
-        
+
+        var authorNamesLbl = new WinForms.Label
+        {
+            Left = 20, Top = 398, Width = 460, Height = 20,
+            Text = "niravp-0x  ·  biggrocer",
+            Font = new Drawing.Font("Segoe UI", 9f),
+            ForeColor = dimColor,
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.MiddleCenter
+        };
+
+        var licenseLink = new WinForms.LinkLabel
+        {
+            Left = 20, Top = 420, Width = 460, Height = 18,
+            Text = "Released under the MIT License",
+            Font = new Drawing.Font("Segoe UI", 8f),
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.MiddleCenter,
+            LinkColor = dimColor,
+            ActiveLinkColor = accentColor,
+            VisitedLinkColor = dimColor
+        };
+        licenseLink.LinkClicked += (_, _) =>
+        {
+            try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                "https://github.com/niravp-0x/PinBubble/blob/main/LICENSE") { UseShellExecute = true }); }
+            catch { }
+        };
+
+        // ── Separator 3 ─────────────────────────────────────────────────────
+        var separator3 = new WinForms.Panel
+        {
+            Left = 20, Top = 448, Width = 440, Height = 1,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(70, 70, 75) : Drawing.Color.FromArgb(200, 200, 200)
+        };
+
+        // ── Copilot credit (centered) ────────────────────────────────────────
+        // "Proudly vibecoded with GitHub Copilot" ≈ 258px at 9f italic
+        // icon 18px + 5px gap + text 258px = 281px → left = 20 + (460-281)/2 = 110
+        var robotIcon = new WinForms.PictureBox { Left = 110, Top = 463, Width = 18, Height = 18, BackColor = Drawing.Color.Transparent };
         var robotBitmap = new System.Drawing.Bitmap(18, 18);
         using (var g = System.Drawing.Graphics.FromImage(robotBitmap))
         {
             g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            var robotColor = _isDarkTheme ? Drawing.Color.FromArgb(140, 140, 145) : Drawing.Color.FromArgb(120, 120, 120);
-            
-            // Draw robot head (rectangle)
-            using (var brush = new System.Drawing.SolidBrush(robotColor))
-            {
+            using (var brush = new System.Drawing.SolidBrush(dimColor))
                 g.FillRectangle(brush, 3, 5, 12, 10);
-            }
-            
-            // Draw robot eyes (two small circles)
             using (var brush = new System.Drawing.SolidBrush(_isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White))
             {
                 g.FillEllipse(brush, 6, 8, 3, 3);
                 g.FillEllipse(brush, 11, 8, 3, 3);
             }
-            
-            // Draw antenna
-            using (var pen = new System.Drawing.Pen(robotColor, 1.5f))
-            {
+            using (var pen = new System.Drawing.Pen(dimColor, 1.5f))
                 g.DrawLine(pen, 9, 2, 9, 5);
-            }
-            using (var brush = new System.Drawing.SolidBrush(robotColor))
-            {
+            using (var brush = new System.Drawing.SolidBrush(dimColor))
                 g.FillEllipse(brush, 7, 0, 4, 4);
-            }
         }
         robotIcon.Image = robotBitmap;
 
-        // Copilot credit
         var copilotLabel = new WinForms.Label
         {
-            Left = 98,
-            Top = 425,
-            Width = 330,
-            Height = 22,
+            Left = 133, Top = 463, Width = 260, Height = 22,
             Text = "Proudly vibecoded with GitHub Copilot",
             Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Italic),
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(140, 140, 145) : Drawing.Color.FromArgb(120, 120, 120),
+            ForeColor = dimColor,
             BackColor = Drawing.Color.Transparent,
             TextAlign = Drawing.ContentAlignment.MiddleLeft
         };
 
-        aboutDialog.Controls.Add(pinIcon);
-        aboutDialog.Controls.Add(titleLabel);
-        aboutDialog.Controls.Add(versionLabel);
-        aboutDialog.Controls.Add(separator1);
-        aboutDialog.Controls.Add(descriptionLabel);
-        aboutDialog.Controls.Add(featuresLabel);
-        aboutDialog.Controls.Add(feature1);
-        aboutDialog.Controls.Add(feature2);
-        aboutDialog.Controls.Add(feature3);
-        aboutDialog.Controls.Add(feature4);
-        aboutDialog.Controls.Add(feature5);
-        aboutDialog.Controls.Add(separator2);
-        aboutDialog.Controls.Add(robotIcon);
-        aboutDialog.Controls.Add(copilotLabel);
+        aboutDialog.Controls.AddRange(new WinForms.Control[]
+        {
+            pinIcon, titleLabel, versionLabel, pipeLbl, githubLink,
+            separator1, descriptionLabel,
+            featuresLabel, feature1, feature2, feature3, feature4, feature5,
+            separator2,
+            authorsHeaderLbl, authorNamesLbl, licenseLink,
+            separator3,
+            robotIcon, copilotLabel
+        });
 
         aboutDialog.ShowDialog();
     }
