@@ -50,6 +50,12 @@
             <ContextMenu>
                 <MenuItem Header="Edit snippets" Click="EditSnippets_Click"/>
                 <MenuItem Header="Manage Shortcuts" Click="EditShortcuts_Click"/>
+                <MenuItem Header="Clear Clipboard After Copy">
+                    <MenuItem x:Name="ClearClipDisabledMenuItem" Header="Disabled" IsCheckable="True" IsChecked="True" Tag="0" Click="ClearClip_Click"/>
+                    <MenuItem x:Name="ClearClip30MenuItem" Header="30 seconds" IsCheckable="True" Tag="30" Click="ClearClip_Click"/>
+                    <MenuItem x:Name="ClearClip60MenuItem" Header="60 seconds" IsCheckable="True" Tag="60" Click="ClearClip_Click"/>
+                    <MenuItem x:Name="ClearClip120MenuItem" Header="2 minutes" IsCheckable="True" Tag="120" Click="ClearClip_Click"/>
+                </MenuItem>
                 <Separator/>
                 <MenuItem x:Name="TaskbarToggleMenuItem" Header="Hide from Taskbar" Click="ToggleTaskbar_Click"/>
                 <MenuItem x:Name="DarkThemeMenuItem" Header="Dark Theme" IsCheckable="True" IsChecked="True" Click="ToggleDarkTheme_Click"/>

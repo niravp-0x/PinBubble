@@ -215,6 +215,9 @@ public partial class MainWindow : Window
     private double? _preExpandWindowLeft;
     private double? _preExpandWindowTop;
 
+    // Clipboard clear setting (0 = disabled)
+    private int _clipboardClearSeconds = 0;
+
     // Shortcut hotkey state
     private string _shortcutsFilePath = string.Empty;
     private List<ShortcutEntry> _shortcuts = new();
@@ -240,6 +243,8 @@ public partial class MainWindow : Window
         public double? WindowLeft { get; set; }
         public double? WindowTop { get; set; }
         public string? MonitorDeviceName { get; set; }
+        // 0 = disabled; 30 / 60 / 120 = clear after N seconds
+        public int ClipboardClearSeconds { get; set; } = 0;
     }
 
     public MainWindow()
@@ -268,6 +273,7 @@ public partial class MainWindow : Window
         LoadUiSettings();
         ApplyExpandedPanelTheme();
         UpdateBackdropOpacityMenuChecks();
+        UpdateClearClipMenuChecks();
         UpdateBiometricUi();
         DarkThemeMenuItem.IsChecked = _isDarkTheme;
         
@@ -935,6 +941,7 @@ public partial class MainWindow : Window
             try
             {
                 System.Windows.Clipboard.SetText(_snippets[idx]);
+                ScheduleClipboardClear(_snippets[idx]);
                 b.Background = BubbleClicked;
                 await Task.Delay(150);
                 b.Background = new SolidColorBrush(_isDarkTheme ? BubbleDefaultColorDark : BubbleDefaultColorLight);
@@ -1261,7 +1268,11 @@ public partial class MainWindow : Window
 
         if (snippetIdx < 0 || snippetIdx >= _snippets.Length) return;
 
-        try { System.Windows.Clipboard.SetText(_snippets[snippetIdx]); }
+        try
+        {
+            System.Windows.Clipboard.SetText(_snippets[snippetIdx]);
+            ScheduleClipboardClear(_snippets[snippetIdx]);
+        }
         catch { }
 
         if (prevHwnd != IntPtr.Zero)
@@ -1621,19 +1632,19 @@ public partial class MainWindow : Window
     {
         LoadSnippets();
 
-        const int keySize = 54;
-        const int keyGap = 4;
+        const int keySize = 65;
+        const int keyGap = 5;
         const int stride = keySize + keyGap;
 
         // Row offsets (x pixel) to simulate QWERTY stagger
-        int[] rowXOffsets = { 16, 43, 82 };
+        int[] rowXOffsets = { 19, 52, 98 };
         int[][] rowKeyIndices =
         {
             new[] { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 },      // Q–P
             new[] { 10, 11, 12, 13, 14, 15, 16, 17, 18 }, // A–L
             new[] { 19, 20, 21, 22, 23, 24, 25 }           // Z–M
         };
-        int[] rowYOffsets = { 46, 108, 170 };
+        int[] rowYOffsets = { 55, 130, 204 };
 
         int maxRowWidth = rowXOffsets[0] + 10 * stride + 16;
         int totalHeight = rowYOffsets[2] + keySize + 20;
@@ -1660,16 +1671,39 @@ public partial class MainWindow : Window
         // Title / hint
         var hint = new WinForms.Label
         {
-            Left = 0, Top = 8, Width = picker.Width, Height = 26,
+            Left = 0, Top = 10, Width = picker.Width, Height = 32,
             Text = "⌨  Ctrl+Alt+P  –  press a key to copy  |  Esc to close",
             ForeColor = Drawing.Color.FromArgb(120, 120, 135),
-            Font = new Drawing.Font("Segoe UI", 8.5f),
+            Font = new Drawing.Font("Segoe UI", 10f),
             BackColor = Drawing.Color.Transparent,
             TextAlign = Drawing.ContentAlignment.MiddleCenter
         };
         picker.Controls.Add(hint);
 
         string? copiedSnippet = null;
+
+        // Tooltip component for key buttons
+        var keyTooltip = new WinForms.ToolTip
+        {
+            InitialDelay = 600,
+            ReshowDelay = 200,
+            AutoPopDelay = 5000,
+            ShowAlways = false,
+            BackColor = Drawing.Color.FromArgb(22, 22, 28),
+            ForeColor = Drawing.Color.FromArgb(210, 255, 210),
+            IsBalloon = false
+        };
+
+        // Shared resources for custom key button painting (scoped to picker lifetime)
+        using var activeLetterFont   = new Drawing.Font("Segoe UI", 14f, Drawing.FontStyle.Bold);
+        using var inactiveLetterFont = new Drawing.Font("Segoe UI", 14f, Drawing.FontStyle.Regular);
+        using var snippetLabelFont   = new Drawing.Font("Segoe UI", 9f);
+        using var keyPaintSf = new Drawing.StringFormat
+        {
+            Alignment     = Drawing.StringAlignment.Center,
+            LineAlignment = Drawing.StringAlignment.Center,
+            Trimming      = Drawing.StringTrimming.Character
+        };
 
         // Build keys
         for (int rowIdx = 0; rowIdx < 3; rowIdx++)
@@ -1688,6 +1722,10 @@ public partial class MainWindow : Window
                 var keyFg   = hasSnippet ? Drawing.Color.FromArgb(210, 255, 210) : Drawing.Color.FromArgb(60, 60, 72);
                 var borderC = hasSnippet ? Drawing.Color.FromArgb(70, 145, 80)   : Drawing.Color.FromArgb(48, 48, 56);
 
+                var capturedChar  = keyChar;
+                var capturedLabel = BuildBubbleLabel(snippetLabel);
+                var capturedHas   = hasSnippet;
+
                 var btn = new WinForms.Button
                 {
                     Left = xPos, Top = yPos,
@@ -1695,17 +1733,46 @@ public partial class MainWindow : Window
                     FlatStyle = WinForms.FlatStyle.Flat,
                     BackColor = keyBg,
                     ForeColor = keyFg,
-                    Font = new Drawing.Font("Segoe UI", 8f),
                     Cursor = hasSnippet ? WinForms.Cursors.Hand : WinForms.Cursors.Default,
                     Enabled = hasSnippet,
-                    Text = hasSnippet
-                        ? $"{keyChar}\n{TruncateLabel(snippetLabel, 6)}"
-                        : keyChar.ToString(),
+                    Text = string.Empty,
                     Tag = snippetValue
                 };
                 btn.FlatAppearance.BorderColor = borderC;
                 btn.FlatAppearance.BorderSize = 1;
                 btn.FlatAppearance.MouseOverBackColor = Drawing.Color.FromArgb(58, 140, 66);
+
+                if (hasSnippet)
+                    keyTooltip.SetToolTip(btn, $"\n\n{snippetLabel}");
+
+                // Custom paint: bold key letter / thin divider / small snippet label
+                btn.Paint += (_, pe) =>
+                {
+                    pe.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                    pe.Graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+                    if (capturedHas)
+                    {
+                        // Key letter – upper portion, bold
+                        using var lb = new Drawing.SolidBrush(Drawing.Color.FromArgb(230, 255, 230));
+                        pe.Graphics.DrawString(capturedChar.ToString(), activeLetterFont, lb,
+                            new Drawing.RectangleF(0, 1, keySize, keySize * 0.46f), keyPaintSf);
+                        // Divider line
+                        int ly = (int)(keySize * 0.51f);
+                        using var lp = new Drawing.Pen(Drawing.Color.FromArgb(70, 145, 80), 1f);
+                        pe.Graphics.DrawLine(lp, 6, ly, keySize - 6, ly);
+                        // Snippet label – lower portion
+                        using var slb = new Drawing.SolidBrush(Drawing.Color.FromArgb(150, 215, 155));
+                        pe.Graphics.DrawString(capturedLabel, snippetLabelFont, slb,
+                            new Drawing.RectangleF(2, ly + 2, keySize - 4, keySize - ly - 4), keyPaintSf);
+                    }
+                    else
+                    {
+                        // Inactive key: letter centered, dimmed
+                        using var lb = new Drawing.SolidBrush(Drawing.Color.FromArgb(55, 55, 68));
+                        pe.Graphics.DrawString(capturedChar.ToString(), inactiveLetterFont, lb,
+                            new Drawing.RectangleF(0, 0, keySize, keySize), keyPaintSf);
+                    }
+                };
 
                 if (hasSnippet)
                 {
@@ -1772,7 +1839,11 @@ public partial class MainWindow : Window
 
         if (!string.IsNullOrEmpty(copiedSnippet))
         {
-            try { System.Windows.Clipboard.SetText(copiedSnippet); }
+            try
+            {
+                System.Windows.Clipboard.SetText(copiedSnippet);
+                ScheduleClipboardClear(copiedSnippet);
+            }
             catch { }
         }
 
@@ -2887,6 +2958,7 @@ public partial class MainWindow : Window
                 _savedWindowLeft = settings.WindowLeft;
                 _savedWindowTop = settings.WindowTop;
                 _savedMonitorDeviceName = settings.MonitorDeviceName;
+                _clipboardClearSeconds = settings.ClipboardClearSeconds;
             }
         }
         catch
@@ -2918,7 +2990,8 @@ public partial class MainWindow : Window
                 ShowInTaskbar = ShowInTaskbar,
                 WindowLeft = Left,
                 WindowTop = Top,
-                MonitorDeviceName = currentScreen.DeviceName
+                MonitorDeviceName = currentScreen.DeviceName,
+                ClipboardClearSeconds = _clipboardClearSeconds
             };
             var json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(_settingsFilePath, json);
@@ -2927,6 +3000,45 @@ public partial class MainWindow : Window
         {
             // Failing to save UI preferences should be non-fatal.
         }
+    }
+
+    // ── Clipboard auto-clear ────────────────────────────────────────────────
+
+    private void ScheduleClipboardClear(string copiedText)
+    {
+        if (_clipboardClearSeconds <= 0) return;
+        var timer = new System.Windows.Threading.DispatcherTimer
+        {
+            Interval = TimeSpan.FromSeconds(_clipboardClearSeconds)
+        };
+        timer.Tick += (_, _) =>
+        {
+            timer.Stop();
+            try
+            {
+                if (System.Windows.Clipboard.ContainsText() &&
+                    System.Windows.Clipboard.GetText() == copiedText)
+                    System.Windows.Clipboard.Clear();
+            }
+            catch { }
+        };
+        timer.Start();
+    }
+
+    private void ClearClip_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not MenuItem clicked) return;
+        _clipboardClearSeconds = int.TryParse(clicked.Tag?.ToString(), out var sec) ? sec : 0;
+        UpdateClearClipMenuChecks();
+        SaveUiSettings();
+    }
+
+    private void UpdateClearClipMenuChecks()
+    {
+        ClearClipDisabledMenuItem.IsChecked = _clipboardClearSeconds == 0;
+        ClearClip30MenuItem.IsChecked       = _clipboardClearSeconds == 30;
+        ClearClip60MenuItem.IsChecked       = _clipboardClearSeconds == 60;
+        ClearClip120MenuItem.IsChecked      = _clipboardClearSeconds == 120;
     }
 
     private void Window_StateChanged(object? sender, EventArgs e)
