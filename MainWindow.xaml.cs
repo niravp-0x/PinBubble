@@ -1,4 +1,5 @@
 ﻿using System.Diagnostics;
+using System.Windows.Interop;
 using System.Globalization;
 using System.IO;
 using System.Linq;
@@ -41,6 +42,15 @@ class SnippetEntry
     public DateTime Created { get; set; } = DateTime.Now;
     public DateTime Modified { get; set; } = DateTime.Now;
     public DateTime ExpiryDate { get; set; } = DateTime.Now.AddDays(30);
+}
+
+// Maps a global hotkey to a pinned snippet
+class ShortcutEntry
+{
+    public string SnippetLabel { get; set; } = string.Empty;
+    public int Modifiers { get; set; }
+    public int VirtualKey { get; set; }
+    public string DisplayShortcut { get; set; } = string.Empty;
 }
 
 public partial class MainWindow : Window
@@ -146,8 +156,38 @@ public partial class MainWindow : Window
     private const bool DefaultIsDarkTheme = true;
     private const bool DefaultShowInTaskbar = true;
 
+    // Hotkey constants
+    private const int WmHotkey = 0x0312;
+    private const int HotkeyIdQwertyPicker = 1;
+    private const int HotkeyIdUserBase = 100;
+    private const int ModAlt = 0x0001;
+    private const int ModControl = 0x0002;
+    private const int ModShift = 0x0004;
+    private const int ModNoRepeat = 0x4000;
+
+    // QWERTY keyboard order for the quick-paste picker
+    private static readonly char[] QwertyOrder =
+    {
+        'Q', 'W', 'E', 'R', 'T', 'Y', 'U', 'I', 'O', 'P',
+        'A', 'S', 'D', 'F', 'G', 'H', 'J', 'K', 'L',
+        'Z', 'X', 'C', 'V', 'B', 'N', 'M'
+    };
+
     [DllImport("user32.dll")]
     private static extern bool GetCursorPos(out POINT lpPoint);
+
+    [DllImport("user32.dll")]
+    private static extern bool RegisterHotKey(IntPtr hWnd, int id, int fsModifiers, int vk);
+
+    [DllImport("user32.dll")]
+    private static extern bool UnregisterHotKey(IntPtr hWnd, int id);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool SetForegroundWindow(IntPtr hWnd);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct POINT { public int X; public int Y; }
@@ -175,6 +215,15 @@ public partial class MainWindow : Window
     private double? _preExpandWindowLeft;
     private double? _preExpandWindowTop;
 
+    // Clipboard clear setting (0 = disabled)
+    private int _clipboardClearSeconds = 0;
+
+    // Shortcut hotkey state
+    private string _shortcutsFilePath = string.Empty;
+    private List<ShortcutEntry> _shortcuts = new();
+    private readonly List<int> _registeredHotkeyIds = new();
+    private HwndSource? _hwndSource;
+
     private static readonly WpfColor BubbleDefaultColorDark = WpfColor.FromRgb(45, 45, 48);
     private static readonly WpfColor BubbleDefaultColorLight = WpfColor.FromRgb(230, 233, 237);
     private static readonly WpfColor BubbleBorderColorDark = WpfColor.FromRgb(80, 80, 80);
@@ -194,6 +243,8 @@ public partial class MainWindow : Window
         public double? WindowLeft { get; set; }
         public double? WindowTop { get; set; }
         public string? MonitorDeviceName { get; set; }
+        // 0 = disabled; 30 / 60 / 120 = clear after N seconds
+        public int ClipboardClearSeconds { get; set; } = 0;
     }
 
     public MainWindow()
@@ -209,6 +260,7 @@ public partial class MainWindow : Window
             "PinBubble");
         Directory.CreateDirectory(appDataDir);
         _textFilePath = Path.Combine(appDataDir, "snippets.bin");
+        _shortcutsFilePath = Path.Combine(appDataDir, "shortcuts.json");
 
         // One-time migration: move old text.text from the install directory if present
         var legacyPath = Path.Combine(AppContext.BaseDirectory, "text.text");
@@ -221,6 +273,7 @@ public partial class MainWindow : Window
         LoadUiSettings();
         ApplyExpandedPanelTheme();
         UpdateBackdropOpacityMenuChecks();
+        UpdateClearClipMenuChecks();
         UpdateBiometricUi();
         DarkThemeMenuItem.IsChecked = _isDarkTheme;
         
@@ -234,9 +287,11 @@ public partial class MainWindow : Window
         }
 
         LoadSnippets();
+        LoadShortcuts();
         BuildBubbles();
         SetupWatcher();
         SetupTrayIcon();
+        SourceInitialized += (_, _) => SetupGlobalHotkeys();
         Loaded += (_, _) => RestoreWindowPlacement();
         Loaded += (_, _) => UpdateTaskbarMenuText();
         Loaded += (_, _) => UpdatePinMenuText();
@@ -822,8 +877,18 @@ public partial class MainWindow : Window
         _expandWidth = Math.Max(wNeeded, 100);
         _expandHeight = Math.Max(hNeeded, 100);
 
+        // Build shortcut lookup: label -> display string (e.g. "Ctrl+Alt+A")
+        var shortcutLookup = _shortcuts
+            .GroupBy(s => s.SnippetLabel, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(g => g.Key, g => g.First().DisplayShortcut, StringComparer.OrdinalIgnoreCase);
+
         for (int i = 0; i < count; i++)
         {
+            var fullLbl = i < _fullLabels.Length ? _fullLabels[i] : _labels[i];
+            var tipText = shortcutLookup.TryGetValue(fullLbl, out var sc)
+                ? $"{fullLbl}\n\nShortcut: {sc}"
+                : fullLbl;
+
             var btn = new WpfButton
             {
                 Width = 44,
@@ -836,7 +901,7 @@ public partial class MainWindow : Window
                 BorderThickness = new Thickness(1),
                 BorderBrush = bubbleBorder,
                 Tag = i,
-                ToolTip = i < _fullLabels.Length ? _fullLabels[i] : _labels[i],
+                ToolTip = tipText,
                 Cursor = WpfCursors.Hand,
                 Margin = new Thickness(4)
             };
@@ -876,6 +941,7 @@ public partial class MainWindow : Window
             try
             {
                 System.Windows.Clipboard.SetText(_snippets[idx]);
+                ScheduleClipboardClear(_snippets[idx]);
                 b.Background = BubbleClicked;
                 await Task.Delay(150);
                 b.Background = new SolidColorBrush(_isDarkTheme ? BubbleDefaultColorDark : BubbleDefaultColorLight);
@@ -1128,6 +1194,664 @@ public partial class MainWindow : Window
             Canvas.SetTop((UIElement)BubblesHost.Children[i], startY + row * spacingY);
         }
     }
+
+    // ── Global hotkey infrastructure ───────────────────────────────────────────
+
+    private void SetupGlobalHotkeys()
+    {
+        var helper = new WindowInteropHelper(this);
+        _hwndSource = HwndSource.FromHwnd(helper.Handle);
+        _hwndSource?.AddHook(WndProc);
+
+        // Ctrl+Alt+P → QWERTY quick-paste picker (VK 'P' = 0x50)
+        if (RegisterHotKey(helper.Handle, HotkeyIdQwertyPicker, ModControl | ModAlt | ModNoRepeat, 0x50))
+            _registeredHotkeyIds.Add(HotkeyIdQwertyPicker);
+
+        RegisterShortcutHotkeys();
+    }
+
+    private void RegisterShortcutHotkeys()
+    {
+        var hwnd = new WindowInteropHelper(this).Handle;
+
+        // Unregister only user-defined hotkeys (keep QWERTY picker)
+        foreach (var id in _registeredHotkeyIds.Where(id => id >= HotkeyIdUserBase).ToList())
+        {
+            UnregisterHotKey(hwnd, id);
+            _registeredHotkeyIds.Remove(id);
+        }
+
+        for (int i = 0; i < _shortcuts.Count; i++)
+        {
+            var s = _shortcuts[i];
+            int hotkeyId = HotkeyIdUserBase + i;
+            if (s.VirtualKey > 0 && RegisterHotKey(hwnd, hotkeyId, s.Modifiers | ModNoRepeat, s.VirtualKey))
+                _registeredHotkeyIds.Add(hotkeyId);
+        }
+    }
+
+    private void UnregisterAllHotkeys()
+    {
+        var hwnd = new WindowInteropHelper(this).Handle;
+        foreach (var id in _registeredHotkeyIds)
+            UnregisterHotKey(hwnd, id);
+        _registeredHotkeyIds.Clear();
+    }
+
+    private IntPtr WndProc(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+    {
+        if (msg == WmHotkey)
+        {
+            int id = (int)wParam;
+            // Capture foreground window before any UI appears
+            IntPtr prevHwnd = GetForegroundWindow();
+            Dispatcher.BeginInvoke(new Action(() => HandleHotkey(id, prevHwnd)));
+            handled = true;
+        }
+        return IntPtr.Zero;
+    }
+
+    private void HandleHotkey(int id, IntPtr prevHwnd)
+    {
+        if (id == HotkeyIdQwertyPicker)
+        {
+            ShowQwertyPicker(prevHwnd);
+            return;
+        }
+
+        int idx = id - HotkeyIdUserBase;
+        if (idx < 0 || idx >= _shortcuts.Count) return;
+
+        var shortcut = _shortcuts[idx];
+        int snippetIdx = Array.FindIndex(_fullLabels, l =>
+            string.Equals(l, shortcut.SnippetLabel, StringComparison.OrdinalIgnoreCase));
+
+        if (snippetIdx < 0 || snippetIdx >= _snippets.Length) return;
+
+        try
+        {
+            System.Windows.Clipboard.SetText(_snippets[snippetIdx]);
+            ScheduleClipboardClear(_snippets[snippetIdx]);
+        }
+        catch { }
+
+        if (prevHwnd != IntPtr.Zero)
+            SetForegroundWindow(prevHwnd);
+    }
+
+    // ── Shortcut persistence ────────────────────────────────────────────────
+
+    private void LoadShortcuts()
+    {
+        try
+        {
+            if (!File.Exists(_shortcutsFilePath)) return;
+            var json = File.ReadAllText(_shortcutsFilePath);
+            _shortcuts = JsonSerializer.Deserialize<List<ShortcutEntry>>(json, s_jsonOptions) ?? new();
+        }
+        catch { _shortcuts = new(); }
+    }
+
+    private void SaveShortcuts()
+    {
+        try
+        {
+            var json = JsonSerializer.Serialize(_shortcuts, new JsonSerializerOptions
+            {
+                WriteIndented = true,
+                PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+            });
+            File.WriteAllText(_shortcutsFilePath, json);
+        }
+        catch { }
+    }
+
+    private static string BuildShortcutDisplay(int mods, int vk)
+    {
+        var parts = new List<string>();
+        if ((mods & ModControl) != 0) parts.Add("Ctrl");
+        if ((mods & ModAlt) != 0) parts.Add("Alt");
+        if ((mods & ModShift) != 0) parts.Add("Shift");
+        parts.Add(((WinForms.Keys)vk).ToString());
+        return string.Join("+", parts);
+    }
+
+    private static string TruncateLabel(string s, int maxLen) =>
+        s.Length <= maxLen ? s : s[..maxLen] + "…";
+
+    // ── Shortcut editor dialog ───────────────────────────────────────────────
+
+    private void EditShortcuts_Click(object sender, RoutedEventArgs e)
+    {
+        // Work on a copy so Cancel is a true cancel
+        var working = _shortcuts.Select(s => new ShortcutEntry
+        {
+            SnippetLabel = s.SnippetLabel,
+            Modifiers = s.Modifiers,
+            VirtualKey = s.VirtualKey,
+            DisplayShortcut = s.DisplayShortcut
+        }).ToList();
+
+        using var dlg = new WinForms.Form
+        {
+            Width = 680,
+            Height = 480,
+            MinimumSize = new Drawing.Size(580, 380),
+            FormBorderStyle = WinForms.FormBorderStyle.Sizable,
+            StartPosition = WinForms.FormStartPosition.CenterScreen,
+            Text = "PinBubble – Manage Shortcuts",
+            MinimizeBox = false,
+            MaximizeBox = false,
+            TopMost = true,
+            KeyPreview = true,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White,
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black
+        };
+
+        // ── Toolbar ──────────────────────────────────────────────────────────
+        var toolbar = new WinForms.Panel
+        {
+            Dock = WinForms.DockStyle.Top,
+            Height = 64,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(40, 40, 44) : Drawing.Color.FromArgb(240, 240, 240)
+        };
+
+        var infoLbl = new WinForms.Label
+        {
+            Left = 14, Top = 10, Width = 254, Height = 44,
+            Text = "Shortcuts copy a snippet instantly.\nCtrl+Alt+P always opens the QWERTY picker.",
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(130, 130, 140) : Drawing.Color.Gray,
+            Font = new Drawing.Font("Segoe UI", 8.5f),
+            BackColor = Drawing.Color.Transparent
+        };
+
+        WinForms.Button MakeToolBtn(string text, Drawing.Color bg, int left) => new WinForms.Button
+        {
+            Text = text, Left = left, Top = 12, Width = 85, Height = 40,
+            FlatStyle = WinForms.FlatStyle.Flat,
+            BackColor = bg,
+            ForeColor = Drawing.Color.White,
+            Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
+            Cursor = WinForms.Cursors.Hand
+        };
+
+        var btnAdd    = MakeToolBtn("＋ Add",    Drawing.Color.FromArgb(0, 110, 70),  272);
+        var btnRemove = MakeToolBtn("✕ Remove",  Drawing.Color.FromArgb(130, 40, 40), 364);
+        var btnSave   = MakeToolBtn("Save",      Drawing.Color.FromArgb(0, 100, 180), 456);
+        var btnClose  = MakeToolBtn("Close",     Drawing.Color.FromArgb(60, 60, 68),  548);
+
+        foreach (var b in new[] { btnAdd, btnRemove, btnSave, btnClose })
+        {
+            b.FlatAppearance.BorderSize = 0;
+            toolbar.Controls.Add(b);
+        }
+        toolbar.Controls.Add(infoLbl);
+
+        // ── ListView ─────────────────────────────────────────────────────────
+        var list = new WinForms.ListView
+        {
+            Dock = WinForms.DockStyle.Fill,
+            View = WinForms.View.Details,
+            FullRowSelect = true,
+            GridLines = false,
+            MultiSelect = false,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White,
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
+            Font = new Drawing.Font("Segoe UI", 10f),
+            BorderStyle = WinForms.BorderStyle.None
+        };
+        list.Columns.Add("Shortcut", 200);
+        list.Columns.Add("Linked Snippet", -2);
+
+        void RefreshList()
+        {
+            list.Items.Clear();
+            foreach (var s in working)
+            {
+                var item = new WinForms.ListViewItem(s.DisplayShortcut);
+                item.SubItems.Add(s.SnippetLabel);
+                item.Tag = s;
+                list.Items.Add(item);
+            }
+        }
+        RefreshList();
+
+        // ── Add shortcut ─────────────────────────────────────────────────────
+        btnAdd.Click += (_, _) =>
+        {
+            // Step 1: Record key combo
+            (int mods, int vk, string display)? recorded = null;
+
+            using var recorder = new WinForms.Form
+            {
+                Width = 420, Height = 180,
+                FormBorderStyle = WinForms.FormBorderStyle.FixedDialog,
+                StartPosition = WinForms.FormStartPosition.CenterParent,
+                Text = "Record Shortcut",
+                MaximizeBox = false, MinimizeBox = false, TopMost = true,
+                KeyPreview = true,
+                BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White
+            };
+
+            var recLabel = new WinForms.Label
+            {
+                Left = 20, Top = 20, Width = 380, Height = 30,
+                Text = "Press your desired key combination…",
+                Font = new Drawing.Font("Segoe UI", 10f),
+                ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
+                BackColor = Drawing.Color.Transparent
+            };
+            var recDisplay = new WinForms.Label
+            {
+                Left = 20, Top = 56, Width = 380, Height = 36,
+                Text = "",
+                Font = new Drawing.Font("Segoe UI", 14f, Drawing.FontStyle.Bold),
+                ForeColor = Drawing.Color.FromArgb(0, 180, 120),
+                BackColor = Drawing.Color.Transparent,
+                TextAlign = Drawing.ContentAlignment.MiddleCenter
+            };
+            var recUse = new WinForms.Button
+            {
+                Text = "Use This", Left = 220, Top = 100, Width = 85, Height = 38,
+                DialogResult = WinForms.DialogResult.OK,
+                FlatStyle = WinForms.FlatStyle.Flat,
+                BackColor = Drawing.Color.FromArgb(0, 110, 70),
+                ForeColor = Drawing.Color.White,
+                Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
+                Enabled = false, Cursor = WinForms.Cursors.Hand
+            };
+            recUse.FlatAppearance.BorderSize = 0;
+            var recCancel = new WinForms.Button
+            {
+                Text = "Cancel", Left = 314, Top = 100, Width = 85, Height = 38,
+                DialogResult = WinForms.DialogResult.Cancel,
+                FlatStyle = WinForms.FlatStyle.Flat,
+                BackColor = Drawing.Color.FromArgb(60, 60, 68),
+                ForeColor = Drawing.Color.White,
+                Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
+                Cursor = WinForms.Cursors.Hand
+            };
+            recCancel.FlatAppearance.BorderSize = 0;
+            recorder.Controls.AddRange(new WinForms.Control[] { recLabel, recDisplay, recUse, recCancel });
+            recorder.AcceptButton = recUse;
+            recorder.CancelButton = recCancel;
+
+            recorder.KeyDown += (_, ke) =>
+            {
+                ke.SuppressKeyPress = true;
+                var modifiers = 0;
+                if (ke.Control) modifiers |= ModControl;
+                if (ke.Alt)     modifiers |= ModAlt;
+                if (ke.Shift)   modifiers |= ModShift;
+
+                // Ignore standalone modifier keys
+                var ignoreKeys = new[]
+                {
+                    WinForms.Keys.ControlKey, WinForms.Keys.Menu,
+                    WinForms.Keys.ShiftKey, WinForms.Keys.LWin, WinForms.Keys.RWin
+                };
+                if (Array.IndexOf(ignoreKeys, ke.KeyCode) >= 0) return;
+                if (modifiers == 0) return; // require at least one modifier
+
+                int vkCode = (int)ke.KeyCode;
+                string display = BuildShortcutDisplay(modifiers, vkCode);
+                recDisplay.Text = display;
+                recorded = (modifiers, vkCode, display);
+                recUse.Enabled = true;
+            };
+
+            if (recorder.ShowDialog(dlg) != WinForms.DialogResult.OK || recorded is null)
+                return;
+
+            // Step 2: Pick a snippet
+            if (_fullLabels.Length == 0)
+            {
+                WinForms.MessageBox.Show("No snippets found. Add snippets first via Edit Snippets.",
+                    "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Information);
+                return;
+            }
+
+            using var snippetPicker = new WinForms.Form
+            {
+                Width = 400, Height = 170,
+                FormBorderStyle = WinForms.FormBorderStyle.FixedDialog,
+                StartPosition = WinForms.FormStartPosition.CenterParent,
+                Text = "Link to Snippet",
+                MaximizeBox = false, MinimizeBox = false, TopMost = true,
+                BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White
+            };
+
+            var pickLabel = new WinForms.Label
+            {
+                Left = 20, Top = 20, Width = 360, Height = 22,
+                Text = $"Link  {recorded.Value.display}  to:",
+                Font = new Drawing.Font("Segoe UI", 10f),
+                ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
+                BackColor = Drawing.Color.Transparent
+            };
+            var combo = new WinForms.ComboBox
+            {
+                Left = 20, Top = 50, Width = 360, Height = 30,
+                DropDownStyle = WinForms.ComboBoxStyle.DropDownList,
+                Font = new Drawing.Font("Segoe UI", 10f),
+                BackColor = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 50) : Drawing.Color.White,
+                ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black
+            };
+            combo.Items.AddRange(_fullLabels.Cast<object>().ToArray());
+            if (combo.Items.Count > 0) combo.SelectedIndex = 0;
+
+            var pickOk = new WinForms.Button
+            {
+                Text = "Link", Left = 200, Top = 95, Width = 85, Height = 38,
+                DialogResult = WinForms.DialogResult.OK,
+                FlatStyle = WinForms.FlatStyle.Flat,
+                BackColor = Drawing.Color.FromArgb(0, 110, 70),
+                ForeColor = Drawing.Color.White,
+                Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
+                Cursor = WinForms.Cursors.Hand
+            };
+            pickOk.FlatAppearance.BorderSize = 0;
+            var pickCancel = new WinForms.Button
+            {
+                Text = "Cancel", Left = 295, Top = 95, Width = 85, Height = 38,
+                DialogResult = WinForms.DialogResult.Cancel,
+                FlatStyle = WinForms.FlatStyle.Flat,
+                BackColor = Drawing.Color.FromArgb(60, 60, 68),
+                ForeColor = Drawing.Color.White,
+                Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
+                Cursor = WinForms.Cursors.Hand
+            };
+            pickCancel.FlatAppearance.BorderSize = 0;
+            snippetPicker.Controls.AddRange(new WinForms.Control[] { pickLabel, combo, pickOk, pickCancel });
+            snippetPicker.AcceptButton = pickOk;
+            snippetPicker.CancelButton = pickCancel;
+
+            if (snippetPicker.ShowDialog(dlg) != WinForms.DialogResult.OK) return;
+
+            var selectedSnippet = combo.SelectedItem?.ToString() ?? string.Empty;
+            if (string.IsNullOrWhiteSpace(selectedSnippet)) return;
+
+            // Check for duplicate hotkey
+            if (working.Any(s => s.VirtualKey == recorded.Value.vk && s.Modifiers == recorded.Value.mods))
+            {
+                WinForms.MessageBox.Show("That key combination is already assigned.",
+                    "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Warning);
+                return;
+            }
+
+            working.Add(new ShortcutEntry
+            {
+                SnippetLabel = selectedSnippet,
+                Modifiers = recorded.Value.mods,
+                VirtualKey = recorded.Value.vk,
+                DisplayShortcut = recorded.Value.display
+            });
+            RefreshList();
+        };
+
+        // ── Remove shortcut ───────────────────────────────────────────────────
+        btnRemove.Click += (_, _) =>
+        {
+            if (list.SelectedItems.Count == 0) return;
+            int idx = list.SelectedItems[0].Index;
+            if (idx >= 0 && idx < working.Count)
+            {
+                working.RemoveAt(idx);
+                RefreshList();
+            }
+        };
+
+        // ── Save ──────────────────────────────────────────────────────────────
+        btnSave.Click += (_, _) =>
+        {
+            _shortcuts = working.Select(s => new ShortcutEntry
+            {
+                SnippetLabel = s.SnippetLabel,
+                Modifiers = s.Modifiers,
+                VirtualKey = s.VirtualKey,
+                DisplayShortcut = s.DisplayShortcut
+            }).ToList();
+            SaveShortcuts();
+            RegisterShortcutHotkeys();
+            dlg.DialogResult = WinForms.DialogResult.OK;
+            dlg.Close();
+        };
+
+        // ── Close ─────────────────────────────────────────────────────────────
+        btnClose.Click += (_, _) => { dlg.DialogResult = WinForms.DialogResult.Cancel; dlg.Close(); };
+        dlg.KeyDown += (_, ke) => { if (ke.KeyCode == WinForms.Keys.Escape) btnClose.PerformClick(); };
+
+        dlg.Controls.Add(list);
+        dlg.Controls.Add(toolbar);
+        dlg.ShowDialog();
+    }
+
+    // ── QWERTY quick-paste picker ────────────────────────────────────────────
+
+    private void ShowQwertyPicker(IntPtr prevHwnd)
+    {
+        LoadSnippets();
+
+        const int keySize = 65;
+        const int keyGap = 5;
+        const int stride = keySize + keyGap;
+
+        // Row offsets (x pixel) to simulate QWERTY stagger
+        int[] rowXOffsets = { 19, 52, 98 };
+        int[][] rowKeyIndices =
+        {
+            new[] { 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 },      // Q–P
+            new[] { 10, 11, 12, 13, 14, 15, 16, 17, 18 }, // A–L
+            new[] { 19, 20, 21, 22, 23, 24, 25 }           // Z–M
+        };
+        int[] rowYOffsets = { 55, 130, 204 };
+
+        int maxRowWidth = rowXOffsets[0] + 10 * stride + 16;
+        int totalHeight = rowYOffsets[2] + keySize + 20;
+
+        using var picker = new WinForms.Form
+        {
+            FormBorderStyle = WinForms.FormBorderStyle.None,
+            StartPosition = WinForms.FormStartPosition.CenterScreen,
+            Width = maxRowWidth,
+            Height = totalHeight,
+            TopMost = true,
+            ShowInTaskbar = false,
+            BackColor = Drawing.Color.FromArgb(22, 22, 28),
+            KeyPreview = true
+        };
+
+        // Rounded border via Paint
+        picker.Paint += (s, pe) =>
+        {
+            using var pen = new Drawing.Pen(Drawing.Color.FromArgb(80, 80, 90), 1.5f);
+            pe.Graphics.DrawRectangle(pen, 0, 0, picker.Width - 1, picker.Height - 1);
+        };
+
+        // Title / hint
+        var hint = new WinForms.Label
+        {
+            Left = 0, Top = 10, Width = picker.Width, Height = 32,
+            Text = "⌨  Ctrl+Alt+P  –  press a key to copy  |  Esc to close",
+            ForeColor = Drawing.Color.FromArgb(120, 120, 135),
+            Font = new Drawing.Font("Segoe UI", 10f),
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.MiddleCenter
+        };
+        picker.Controls.Add(hint);
+
+        string? copiedSnippet = null;
+
+        // Tooltip component for key buttons
+        var keyTooltip = new WinForms.ToolTip
+        {
+            InitialDelay = 600,
+            ReshowDelay = 200,
+            AutoPopDelay = 5000,
+            ShowAlways = false,
+            BackColor = Drawing.Color.FromArgb(22, 22, 28),
+            ForeColor = Drawing.Color.FromArgb(210, 255, 210),
+            IsBalloon = false
+        };
+
+        // Shared resources for custom key button painting (scoped to picker lifetime)
+        using var activeLetterFont   = new Drawing.Font("Segoe UI", 14f, Drawing.FontStyle.Bold);
+        using var inactiveLetterFont = new Drawing.Font("Segoe UI", 14f, Drawing.FontStyle.Regular);
+        using var snippetLabelFont   = new Drawing.Font("Segoe UI", 9f);
+        using var keyPaintSf = new Drawing.StringFormat
+        {
+            Alignment     = Drawing.StringAlignment.Center,
+            LineAlignment = Drawing.StringAlignment.Center,
+            Trimming      = Drawing.StringTrimming.Character
+        };
+
+        // Build keys
+        for (int rowIdx = 0; rowIdx < 3; rowIdx++)
+        {
+            int xPos = rowXOffsets[rowIdx];
+            int yPos = rowYOffsets[rowIdx];
+
+            foreach (int charIdx in rowKeyIndices[rowIdx])
+            {
+                bool hasSnippet = charIdx < _snippets.Length && !string.IsNullOrEmpty(_snippets[charIdx]);
+                string snippetLabel = hasSnippet && charIdx < _fullLabels.Length ? _fullLabels[charIdx] : "";
+                string snippetValue = hasSnippet ? _snippets[charIdx] : "";
+                char keyChar = QwertyOrder[charIdx];
+
+                var keyBg   = hasSnippet ? Drawing.Color.FromArgb(42, 100, 48)  : Drawing.Color.FromArgb(32, 32, 38);
+                var keyFg   = hasSnippet ? Drawing.Color.FromArgb(210, 255, 210) : Drawing.Color.FromArgb(60, 60, 72);
+                var borderC = hasSnippet ? Drawing.Color.FromArgb(70, 145, 80)   : Drawing.Color.FromArgb(48, 48, 56);
+
+                var capturedChar  = keyChar;
+                var capturedLabel = BuildBubbleLabel(snippetLabel);
+                var capturedHas   = hasSnippet;
+
+                var btn = new WinForms.Button
+                {
+                    Left = xPos, Top = yPos,
+                    Width = keySize, Height = keySize,
+                    FlatStyle = WinForms.FlatStyle.Flat,
+                    BackColor = keyBg,
+                    ForeColor = keyFg,
+                    Cursor = hasSnippet ? WinForms.Cursors.Hand : WinForms.Cursors.Default,
+                    Enabled = hasSnippet,
+                    Text = string.Empty,
+                    Tag = snippetValue
+                };
+                btn.FlatAppearance.BorderColor = borderC;
+                btn.FlatAppearance.BorderSize = 1;
+                btn.FlatAppearance.MouseOverBackColor = Drawing.Color.FromArgb(58, 140, 66);
+
+                if (hasSnippet)
+                    keyTooltip.SetToolTip(btn, $"\n\n{snippetLabel}");
+
+                // Custom paint: bold key letter / thin divider / small snippet label
+                btn.Paint += (_, pe) =>
+                {
+                    pe.Graphics.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                    pe.Graphics.TextRenderingHint = System.Drawing.Text.TextRenderingHint.ClearTypeGridFit;
+                    if (capturedHas)
+                    {
+                        // Key letter – upper portion, bold
+                        using var lb = new Drawing.SolidBrush(Drawing.Color.FromArgb(230, 255, 230));
+                        pe.Graphics.DrawString(capturedChar.ToString(), activeLetterFont, lb,
+                            new Drawing.RectangleF(0, 1, keySize, keySize * 0.46f), keyPaintSf);
+                        // Divider line
+                        int ly = (int)(keySize * 0.51f);
+                        using var lp = new Drawing.Pen(Drawing.Color.FromArgb(70, 145, 80), 1f);
+                        pe.Graphics.DrawLine(lp, 6, ly, keySize - 6, ly);
+                        // Snippet label – lower portion
+                        using var slb = new Drawing.SolidBrush(Drawing.Color.FromArgb(150, 215, 155));
+                        pe.Graphics.DrawString(capturedLabel, snippetLabelFont, slb,
+                            new Drawing.RectangleF(2, ly + 2, keySize - 4, keySize - ly - 4), keyPaintSf);
+                    }
+                    else
+                    {
+                        // Inactive key: letter centered, dimmed
+                        using var lb = new Drawing.SolidBrush(Drawing.Color.FromArgb(55, 55, 68));
+                        pe.Graphics.DrawString(capturedChar.ToString(), inactiveLetterFont, lb,
+                            new Drawing.RectangleF(0, 0, keySize, keySize), keyPaintSf);
+                    }
+                };
+
+                if (hasSnippet)
+                {
+                    var capturedValue = snippetValue;
+                    btn.Click += (_, _) =>
+                    {
+                        copiedSnippet = capturedValue;
+                        picker.DialogResult = WinForms.DialogResult.OK;
+                        picker.Close();
+                    };
+                }
+
+                picker.Controls.Add(btn);
+                xPos += stride;
+            }
+        }
+
+        // Key press handler
+        picker.KeyDown += (_, ke) =>
+        {
+            ke.SuppressKeyPress = true;
+            if (ke.KeyCode == WinForms.Keys.Escape)
+            {
+                picker.DialogResult = WinForms.DialogResult.Cancel;
+                picker.Close();
+                return;
+            }
+
+            string keyName = ke.KeyCode.ToString();
+            if (keyName.Length == 1)
+            {
+                char c = char.ToUpper(keyName[0]);
+                int idx = Array.IndexOf(QwertyOrder, c);
+                if (idx >= 0 && idx < _snippets.Length && !string.IsNullOrEmpty(_snippets[idx]))
+                {
+                    copiedSnippet = _snippets[idx];
+                    picker.DialogResult = WinForms.DialogResult.OK;
+                    picker.Close();
+                }
+            }
+        };
+
+        // Ensure picker grabs focus once fully shown, preventing spurious Deactivate
+        bool pickerReady = false;
+        picker.Shown += (_, _) =>
+        {
+            pickerReady = true;
+            SetForegroundWindow(picker.Handle);
+            picker.Activate();
+        };
+
+        // Auto-close if focus leaves (only after picker is fully shown)
+        picker.Deactivate += (_, _) =>
+        {
+            if (!pickerReady) return;
+            if (picker.DialogResult == WinForms.DialogResult.None)
+            {
+                picker.DialogResult = WinForms.DialogResult.Cancel;
+                picker.Close();
+            }
+        };
+
+        picker.ShowDialog();
+
+        if (!string.IsNullOrEmpty(copiedSnippet))
+        {
+            try
+            {
+                System.Windows.Clipboard.SetText(copiedSnippet);
+                ScheduleClipboardClear(copiedSnippet);
+            }
+            catch { }
+        }
+
+        if (prevHwnd != IntPtr.Zero)
+            SetForegroundWindow(prevHwnd);
+    }
+
+    // ── Edit Snippets (existing) ────────────────────────────────────────────
 
     private void EditSnippets_Click(object sender, RoutedEventArgs e)
     {
@@ -2234,6 +2958,7 @@ public partial class MainWindow : Window
                 _savedWindowLeft = settings.WindowLeft;
                 _savedWindowTop = settings.WindowTop;
                 _savedMonitorDeviceName = settings.MonitorDeviceName;
+                _clipboardClearSeconds = settings.ClipboardClearSeconds;
             }
         }
         catch
@@ -2265,7 +2990,8 @@ public partial class MainWindow : Window
                 ShowInTaskbar = ShowInTaskbar,
                 WindowLeft = Left,
                 WindowTop = Top,
-                MonitorDeviceName = currentScreen.DeviceName
+                MonitorDeviceName = currentScreen.DeviceName,
+                ClipboardClearSeconds = _clipboardClearSeconds
             };
             var json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(_settingsFilePath, json);
@@ -2276,6 +3002,45 @@ public partial class MainWindow : Window
         }
     }
 
+    // ── Clipboard auto-clear ────────────────────────────────────────────────
+
+    private void ScheduleClipboardClear(string copiedText)
+    {
+        if (_clipboardClearSeconds <= 0) return;
+        var timer = new System.Windows.Threading.DispatcherTimer
+        {
+            Interval = TimeSpan.FromSeconds(_clipboardClearSeconds)
+        };
+        timer.Tick += (_, _) =>
+        {
+            timer.Stop();
+            try
+            {
+                if (System.Windows.Clipboard.ContainsText() &&
+                    System.Windows.Clipboard.GetText() == copiedText)
+                    System.Windows.Clipboard.Clear();
+            }
+            catch { }
+        };
+        timer.Start();
+    }
+
+    private void ClearClip_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is not MenuItem clicked) return;
+        _clipboardClearSeconds = int.TryParse(clicked.Tag?.ToString(), out var sec) ? sec : 0;
+        UpdateClearClipMenuChecks();
+        SaveUiSettings();
+    }
+
+    private void UpdateClearClipMenuChecks()
+    {
+        ClearClipDisabledMenuItem.IsChecked = _clipboardClearSeconds == 0;
+        ClearClip30MenuItem.IsChecked       = _clipboardClearSeconds == 30;
+        ClearClip60MenuItem.IsChecked       = _clipboardClearSeconds == 60;
+        ClearClip120MenuItem.IsChecked      = _clipboardClearSeconds == 120;
+    }
+
     private void Window_StateChanged(object? sender, EventArgs e)
     {
         // Allow normal minimize/restore behavior when clicking taskbar icon
@@ -2284,6 +3049,8 @@ public partial class MainWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
+        UnregisterAllHotkeys();
+        _hwndSource?.RemoveHook(WndProc);
         SaveUiSettings();
         _trayIcon?.Dispose();
         _trayMenu?.Dispose();
@@ -2294,10 +3061,14 @@ public partial class MainWindow : Window
 
     private void About_Click(object sender, RoutedEventArgs e)
     {
+        var dimColor = _isDarkTheme ? Drawing.Color.FromArgb(140, 140, 145) : Drawing.Color.FromArgb(120, 120, 120);
+        var accentColor = _isDarkTheme ? Drawing.Color.FromArgb(102, 185, 51) : Drawing.Color.FromArgb(80, 150, 40);
+        var textColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black;
+
         using var aboutDialog = new WinForms.Form
         {
             Width = 500,
-            Height = 520,
+            Height = 560,
             FormBorderStyle = WinForms.FormBorderStyle.FixedDialog,
             StartPosition = WinForms.FormStartPosition.CenterScreen,
             Text = "About PinBubble",
@@ -2315,49 +3086,25 @@ public partial class MainWindow : Window
                 aboutDialog.Close();
         };
 
-        // Pin icon using custom drawing
-        var pinIcon = new WinForms.PictureBox
-        {
-            Left = 210,
-            Top = 15,
-            Width = 60,
-            Height = 60,
-            BackColor = Drawing.Color.Transparent
-        };
-        
+        // ── Pin icon ────────────────────────────────────────────────────────
+        var pinIcon = new WinForms.PictureBox { Left = 220, Top = 15, Width = 60, Height = 60, BackColor = Drawing.Color.Transparent };
         var pinBitmap = new System.Drawing.Bitmap(60, 60);
         using (var g = System.Drawing.Graphics.FromImage(pinBitmap))
         {
             g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            var pinColor = _isDarkTheme ? Drawing.Color.FromArgb(102, 185, 51) : Drawing.Color.FromArgb(80, 150, 40);
-            
-            // Draw pin head (circle)
-            using (var brush = new System.Drawing.SolidBrush(pinColor))
+            using (var brush = new System.Drawing.SolidBrush(accentColor))
             {
                 g.FillEllipse(brush, 15, 5, 30, 30);
-            }
-            
-            // Draw pin point (triangle)
-            using (var brush = new System.Drawing.SolidBrush(pinColor))
-            {
-                var points = new System.Drawing.Point[] 
-                {
-                    new System.Drawing.Point(26, 35),
-                    new System.Drawing.Point(34, 35),
-                    new System.Drawing.Point(30, 52)
-                };
-                g.FillPolygon(brush, points);
+                g.FillPolygon(brush, new System.Drawing.Point[] {
+                    new(26, 35), new(34, 35), new(30, 52) });
             }
         }
         pinIcon.Image = pinBitmap;
 
-        // Title
+        // ── Title ───────────────────────────────────────────────────────────
         var titleLabel = new WinForms.Label
         {
-            Left = 20,
-            Top = 80,
-            Width = 460,
-            Height = 35,
+            Left = 20, Top = 80, Width = 460, Height = 35,
             Text = "PinBubble",
             Font = new Drawing.Font("Segoe UI", 24f, Drawing.FontStyle.Bold),
             ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
@@ -2365,197 +3112,182 @@ public partial class MainWindow : Window
             TextAlign = Drawing.ContentAlignment.MiddleCenter
         };
 
-        // Version
+        // ── Version (right of centre) + GitHub link (left of centre) ───────
         var versionLabel = new WinForms.Label
         {
-            Left = 20,
-            Top = 118,
-            Width = 460,
-            Height = 20,
-            Text = "Version 1.0.0",
+            Left = 20, Top = 120, Width = 200, Height = 22,
+            Text = "Version 2.0.0",
             Font = new Drawing.Font("Segoe UI", 9f),
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(160, 160, 165) : Drawing.Color.FromArgb(100, 100, 100),
+            ForeColor = dimColor,
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.MiddleRight
+        };
+
+        var pipeLbl = new WinForms.Label
+        {
+            Left = 223, Top = 120, Width = 12, Height = 22,
+            Text = "│",
+            Font = new Drawing.Font("Segoe UI", 9f),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(70, 70, 75) : Drawing.Color.FromArgb(200, 200, 200),
             BackColor = Drawing.Color.Transparent,
             TextAlign = Drawing.ContentAlignment.MiddleCenter
         };
 
-        // Separator line
+        var githubLink = new WinForms.LinkLabel
+        {
+            Left = 238, Top = 120, Width = 200, Height = 22,
+            Text = "⭐ View on GitHub",
+            Font = new Drawing.Font("Segoe UI", 9f),
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.MiddleLeft,
+            LinkColor = accentColor,
+            ActiveLinkColor = _isDarkTheme ? Drawing.Color.FromArgb(150, 220, 80) : Drawing.Color.FromArgb(0, 80, 40),
+            VisitedLinkColor = accentColor
+        };
+        githubLink.LinkClicked += (_, _) =>
+        {
+            try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                "https://github.com/niravp-0x/PinBubble") { UseShellExecute = true }); }
+            catch { }
+        };
+
+        // ── Separator 1 ─────────────────────────────────────────────────────
         var separator1 = new WinForms.Panel
         {
-            Left = 20,
-            Top = 148,
-            Width = 440,
-            Height = 1,
+            Left = 20, Top = 152, Width = 440, Height = 1,
             BackColor = _isDarkTheme ? Drawing.Color.FromArgb(70, 70, 75) : Drawing.Color.FromArgb(200, 200, 200)
         };
 
-        // Description
+        // ── Description ─────────────────────────────────────────────────────
         var descriptionLabel = new WinForms.Label
         {
-            Left = 30,
-            Top = 158,
-            Width = 440,
-            Height = 45,
+            Left = 30, Top = 162, Width = 440, Height = 45,
             Text = "A lightweight, always-on-screen snippet manager\nthat keeps your frequently used text snippets\nat your fingertips.",
             Font = new Drawing.Font("Segoe UI", 9f),
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
+            ForeColor = textColor,
             BackColor = Drawing.Color.Transparent,
             TextAlign = Drawing.ContentAlignment.TopCenter
         };
 
-        // Features header - more spacing above
+        // ── Features ────────────────────────────────────────────────────────
         var featuresLabel = new WinForms.Label
         {
-            Left = 40,
-            Top = 225,
-            Width = 420,
-            Height = 20,
+            Left = 40, Top = 218, Width = 420, Height = 20,
             Text = "KEY FEATURES",
             Font = new Drawing.Font("Segoe UI", 8.5f, Drawing.FontStyle.Bold),
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(102, 185, 51) : Drawing.Color.FromArgb(80, 150, 40),
+            ForeColor = accentColor,
             BackColor = Drawing.Color.Transparent
         };
 
-        // Features list with better spacing - increased height to 22px each
-        var feature1 = new WinForms.Label
+        WinForms.Label MakeFeat(string text, int top) => new WinForms.Label
         {
-            Left = 60,
-            Top = 253,
-            Width = 420,
-            Height = 22,
-            Text = "> Encrypted snippet storage with master password",
+            Left = 60, Top = top, Width = 390, Height = 22,
+            Text = text,
             Font = new Drawing.Font("Segoe UI", 8.5f),
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
+            ForeColor = textColor,
             BackColor = Drawing.Color.Transparent
         };
+        var feature1 = MakeFeat("> Encrypted snippet storage with master password", 244);
+        var feature2 = MakeFeat("> Global hotkeys & QWERTY picker for instant copy",  266);
+        var feature3 = MakeFeat("> Pin/unpin to stay on top of other windows",         288);
+        var feature4 = MakeFeat("> Dark theme support for comfortable viewing",         310);
+        var feature5 = MakeFeat("> Auto-clear clipboard after copy (configurable)",     332);
 
-        var feature2 = new WinForms.Label
-        {
-            Left = 60,
-            Top = 280,
-            Width = 420,
-            Height = 22,
-            Text = "> Pin/unpin to stay on top of other windows",
-            Font = new Drawing.Font("Segoe UI", 8.5f),
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
-            BackColor = Drawing.Color.Transparent
-        };
-
-        var feature3 = new WinForms.Label
-        {
-            Left = 60,
-            Top = 307,
-            Width = 420,
-            Height = 22,
-            Text = "> Dark theme support for comfortable viewing",
-            Font = new Drawing.Font("Segoe UI", 8.5f),
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
-            BackColor = Drawing.Color.Transparent
-        };
-
-        var feature4 = new WinForms.Label
-        {
-            Left = 60,
-            Top = 334,
-            Width = 420,
-            Height = 22,
-            Text = "> Quick copy snippets with a single click",
-            Font = new Drawing.Font("Segoe UI", 8.5f),
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
-            BackColor = Drawing.Color.Transparent
-        };
-
-        var feature5 = new WinForms.Label
-        {
-            Left = 60,
-            Top = 361,
-            Width = 420,
-            Height = 22,
-            Text = "> Line-by-line encryption controls",
-            Font = new Drawing.Font("Segoe UI", 8.5f),
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
-            BackColor = Drawing.Color.Transparent
-        };
-
-        // Separator line 2
+        // ── Separator 2 ─────────────────────────────────────────────────────
         var separator2 = new WinForms.Panel
         {
-            Left = 20,
-            Top = 400,
-            Width = 440,
-            Height = 1,
+            Left = 20, Top = 366, Width = 440, Height = 1,
             BackColor = _isDarkTheme ? Drawing.Color.FromArgb(70, 70, 75) : Drawing.Color.FromArgb(200, 200, 200)
         };
 
-        // Robot icon for copilot
-        var robotIcon = new WinForms.PictureBox
+        // ── Authors ─────────────────────────────────────────────────────────
+        var authorsHeaderLbl = new WinForms.Label
         {
-            Left = 75,
-            Top = 425,
-            Width = 18,
-            Height = 18,
-            BackColor = Drawing.Color.Transparent
+            Left = 20, Top = 378, Width = 460, Height = 18,
+            Text = "AUTHORS",
+            Font = new Drawing.Font("Segoe UI", 8.5f, Drawing.FontStyle.Bold),
+            ForeColor = accentColor,
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.MiddleCenter
         };
-        
+
+        var authorNamesLbl = new WinForms.Label
+        {
+            Left = 20, Top = 398, Width = 460, Height = 20,
+            Text = "niravp-0x  ·  biggrocer",
+            Font = new Drawing.Font("Segoe UI", 9f),
+            ForeColor = dimColor,
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.MiddleCenter
+        };
+
+        var licenseLink = new WinForms.LinkLabel
+        {
+            Left = 20, Top = 420, Width = 460, Height = 18,
+            Text = "Released under the MIT License",
+            Font = new Drawing.Font("Segoe UI", 8f),
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.MiddleCenter,
+            LinkColor = dimColor,
+            ActiveLinkColor = accentColor,
+            VisitedLinkColor = dimColor
+        };
+        licenseLink.LinkClicked += (_, _) =>
+        {
+            try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                "https://github.com/niravp-0x/PinBubble/blob/main/LICENSE") { UseShellExecute = true }); }
+            catch { }
+        };
+
+        // ── Separator 3 ─────────────────────────────────────────────────────
+        var separator3 = new WinForms.Panel
+        {
+            Left = 20, Top = 448, Width = 440, Height = 1,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(70, 70, 75) : Drawing.Color.FromArgb(200, 200, 200)
+        };
+
+        // ── Copilot credit (centered) ────────────────────────────────────────
+        // "Proudly vibecoded with GitHub Copilot" ≈ 258px at 9f italic
+        // icon 18px + 5px gap + text 258px = 281px → left = 20 + (460-281)/2 = 110
+        var robotIcon = new WinForms.PictureBox { Left = 110, Top = 463, Width = 18, Height = 18, BackColor = Drawing.Color.Transparent };
         var robotBitmap = new System.Drawing.Bitmap(18, 18);
         using (var g = System.Drawing.Graphics.FromImage(robotBitmap))
         {
             g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            var robotColor = _isDarkTheme ? Drawing.Color.FromArgb(140, 140, 145) : Drawing.Color.FromArgb(120, 120, 120);
-            
-            // Draw robot head (rectangle)
-            using (var brush = new System.Drawing.SolidBrush(robotColor))
-            {
+            using (var brush = new System.Drawing.SolidBrush(dimColor))
                 g.FillRectangle(brush, 3, 5, 12, 10);
-            }
-            
-            // Draw robot eyes (two small circles)
             using (var brush = new System.Drawing.SolidBrush(_isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White))
             {
                 g.FillEllipse(brush, 6, 8, 3, 3);
                 g.FillEllipse(brush, 11, 8, 3, 3);
             }
-            
-            // Draw antenna
-            using (var pen = new System.Drawing.Pen(robotColor, 1.5f))
-            {
+            using (var pen = new System.Drawing.Pen(dimColor, 1.5f))
                 g.DrawLine(pen, 9, 2, 9, 5);
-            }
-            using (var brush = new System.Drawing.SolidBrush(robotColor))
-            {
+            using (var brush = new System.Drawing.SolidBrush(dimColor))
                 g.FillEllipse(brush, 7, 0, 4, 4);
-            }
         }
         robotIcon.Image = robotBitmap;
 
-        // Copilot credit
         var copilotLabel = new WinForms.Label
         {
-            Left = 98,
-            Top = 425,
-            Width = 330,
-            Height = 22,
+            Left = 133, Top = 463, Width = 260, Height = 22,
             Text = "Proudly vibecoded with GitHub Copilot",
             Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Italic),
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(140, 140, 145) : Drawing.Color.FromArgb(120, 120, 120),
+            ForeColor = dimColor,
             BackColor = Drawing.Color.Transparent,
             TextAlign = Drawing.ContentAlignment.MiddleLeft
         };
 
-        aboutDialog.Controls.Add(pinIcon);
-        aboutDialog.Controls.Add(titleLabel);
-        aboutDialog.Controls.Add(versionLabel);
-        aboutDialog.Controls.Add(separator1);
-        aboutDialog.Controls.Add(descriptionLabel);
-        aboutDialog.Controls.Add(featuresLabel);
-        aboutDialog.Controls.Add(feature1);
-        aboutDialog.Controls.Add(feature2);
-        aboutDialog.Controls.Add(feature3);
-        aboutDialog.Controls.Add(feature4);
-        aboutDialog.Controls.Add(feature5);
-        aboutDialog.Controls.Add(separator2);
-        aboutDialog.Controls.Add(robotIcon);
-        aboutDialog.Controls.Add(copilotLabel);
+        aboutDialog.Controls.AddRange(new WinForms.Control[]
+        {
+            pinIcon, titleLabel, versionLabel, pipeLbl, githubLink,
+            separator1, descriptionLabel,
+            featuresLabel, feature1, feature2, feature3, feature4, feature5,
+            separator2,
+            authorsHeaderLbl, authorNamesLbl, licenseLink,
+            separator3,
+            robotIcon, copilotLabel
+        });
 
         aboutDialog.ShowDialog();
     }
