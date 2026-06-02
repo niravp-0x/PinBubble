@@ -14,6 +14,9 @@ using System.Windows.Media;
 using System.Windows.Media.Effects;
 using Drawing = System.Drawing;
 using WinForms = System.Windows.Forms;
+using WinClipboard = Windows.ApplicationModel.DataTransfer.Clipboard;
+using WinDataPackage = Windows.ApplicationModel.DataTransfer.DataPackage;
+using WinClipboardContentOptions = Windows.ApplicationModel.DataTransfer.ClipboardContentOptions;
 using WpfBrushes = System.Windows.Media.Brushes;
 using WpfButton = System.Windows.Controls.Button;
 using WpfColor = System.Windows.Media.Color;
@@ -940,8 +943,7 @@ public partial class MainWindow : Window
         {
             try
             {
-                System.Windows.Clipboard.SetText(_snippets[idx]);
-                ScheduleClipboardClear(_snippets[idx]);
+                CopySnippetToClipboard(_snippets[idx]);
                 b.Background = BubbleClicked;
                 await Task.Delay(150);
                 b.Background = new SolidColorBrush(_isDarkTheme ? BubbleDefaultColorDark : BubbleDefaultColorLight);
@@ -1270,8 +1272,7 @@ public partial class MainWindow : Window
 
         try
         {
-            System.Windows.Clipboard.SetText(_snippets[snippetIdx]);
-            ScheduleClipboardClear(_snippets[snippetIdx]);
+            CopySnippetToClipboard(_snippets[snippetIdx]);
         }
         catch { }
 
@@ -1841,8 +1842,7 @@ public partial class MainWindow : Window
         {
             try
             {
-                System.Windows.Clipboard.SetText(copiedSnippet);
-                ScheduleClipboardClear(copiedSnippet);
+                CopySnippetToClipboard(copiedSnippet);
             }
             catch { }
         }
@@ -3003,6 +3003,50 @@ public partial class MainWindow : Window
     }
 
     // ── Clipboard auto-clear ────────────────────────────────────────────────
+
+    private void CopySnippetToClipboard(string text)
+    {
+        if (!TrySetClipboardWithoutHistory(text))
+            System.Windows.Clipboard.SetText(text);
+
+        ScheduleClipboardClear(text);
+    }
+
+    private static bool TrySetClipboardWithoutHistory(string text)
+    {
+        try
+        {
+            var dataPackage = new WinDataPackage();
+            dataPackage.SetText(text);
+
+            var options = new WinClipboardContentOptions
+            {
+                IsAllowedInHistory = false,
+                IsRoamable = false
+            };
+
+            WinClipboard.SetContentWithOptions(dataPackage, options);
+            return true;
+        }
+        catch
+        {
+            // Fallback for desktop clipboard pipelines: add Windows-recognized
+            // metadata formats that request no history and no cloud sync.
+            try
+            {
+                var data = new System.Windows.DataObject();
+                data.SetText(text);
+                data.SetData("CanIncludeInClipboardHistory", false);
+                data.SetData("CanUploadToCloudClipboard", false);
+                System.Windows.Clipboard.SetDataObject(data, true);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+    }
 
     private void ScheduleClipboardClear(string copiedText)
     {
