@@ -192,8 +192,141 @@ public partial class MainWindow : Window
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool SetForegroundWindow(IntPtr hWnd);
 
+    [DllImport("user32.dll")]
+    private static extern uint SendInput(uint nInputs, INPUT[] pInputs, int cbSize);
+
+    [DllImport("user32.dll")]
+    private static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr GetFocus();
+
+    [DllImport("user32.dll", CharSet = CharSet.Auto)]
+    private static extern int GetClassName(IntPtr hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
+
+    [DllImport("user32.dll")]
+    private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+    private const uint WM_PASTE = 0x0302;
+
     [StructLayout(LayoutKind.Sequential)]
     private struct POINT { public int X; public int Y; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct KEYBDINPUT
+    {
+        public ushort wVk;
+        public ushort wScan;
+        public uint dwFlags;
+        public uint time;
+        public IntPtr dwExtraInfo;
+    }
+
+    [StructLayout(LayoutKind.Explicit)]
+    private struct InputUnion
+    {
+        [FieldOffset(0)] public KEYBDINPUT ki;
+        // Pad to match the largest union member (MOUSEINPUT = 28 bytes on x64)
+        [FieldOffset(0)] private long _pad0;
+        [FieldOffset(8)] private long _pad1;
+        [FieldOffset(16)] private long _pad2;
+        [FieldOffset(24)] private int _pad3;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct INPUT
+    {
+        public uint type;   // 1 = KEYBOARD
+        public InputUnion u;
+    }
+
+    private static void SendPaste()
+    {
+        const ushort VK_CONTROL = 0x11;
+        const ushort VK_V       = 0x56;
+        const uint KEYEVENTF_KEYUP = 0x0002;
+
+        var inputs = new INPUT[]
+        {
+            new INPUT { type = 1, u = new InputUnion { ki = new KEYBDINPUT { wVk = VK_CONTROL } } },
+            new INPUT { type = 1, u = new InputUnion { ki = new KEYBDINPUT { wVk = VK_V } } },
+            new INPUT { type = 1, u = new InputUnion { ki = new KEYBDINPUT { wVk = VK_V,       dwFlags = KEYEVENTF_KEYUP } } },
+            new INPUT { type = 1, u = new InputUnion { ki = new KEYBDINPUT { wVk = VK_CONTROL, dwFlags = KEYEVENTF_KEYUP } } },
+        };
+        SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
+    }
+
+    // Pastes the clipboard content into hWnd using the most reliable method for
+    // the target control type.
+    //
+    // Win32 Edit / RichEdit / ComboBox controls (e.g. RDCMan credential prompts,
+    // Windows Security dialogs, classic apps): WM_PASTE is sent directly to the
+    // focused child control. This bypasses the input queue entirely and works
+    // even when synthesized keystrokes are blocked.
+    //
+    // Modern apps (browsers, terminals, Electron): they don't process WM_PASTE,
+    // so we fall back to SendInput Ctrl+V which their message loops handle.
+    private static void SendPasteToWindow(IntPtr hWnd)
+    {
+        var targetTid  = GetWindowThreadProcessId(hWnd, out _);
+        var currentTid = GetCurrentThreadId();
+        bool attached  = false;
+        bool usedWmPaste = false;
+        try
+        {
+            if (targetTid != 0 && targetTid != currentTid)
+                attached = AttachThreadInput(currentTid, targetTid, true);
+
+            SetForegroundWindow(hWnd);
+
+            // With input queues attached, GetFocus() returns the child control
+            // that actually has keyboard focus (e.g. the username text field).
+            IntPtr focusedCtrl = GetFocus();
+            IntPtr pasteTarget = focusedCtrl != IntPtr.Zero ? focusedCtrl : hWnd;
+
+            var sb = new System.Text.StringBuilder(256);
+            GetClassName(pasteTarget, sb, sb.Capacity);
+            string cls = sb.ToString();
+
+            // Standard Win32 edit-type controls all accept WM_PASTE directly.
+            bool isEditClass = cls.Equals("Edit", StringComparison.OrdinalIgnoreCase)
+                            || cls.Equals("ComboBox", StringComparison.OrdinalIgnoreCase)
+                            || cls.IndexOf("RichEdit", StringComparison.OrdinalIgnoreCase) >= 0;
+
+            if (isEditClass)
+            {
+                SendMessage(pasteTarget, WM_PASTE, IntPtr.Zero, IntPtr.Zero);
+                usedWmPaste = true;
+            }
+        }
+        finally
+        {
+            if (attached)
+                AttachThreadInput(currentTid, targetTid, false);
+        }
+
+        // Fall back to synthesized Ctrl+V for apps that don't use standard edit
+        // controls (browsers, terminals, Electron-based apps).
+        if (!usedWmPaste)
+            SendPaste();
+    }
+
+    // Polls until hWnd is the foreground window, or the timeout elapses.
+    private static async Task WaitForForegroundAsync(IntPtr hWnd, int timeoutMs = 800)
+    {
+        var deadline = Environment.TickCount64 + timeoutMs;
+        while (Environment.TickCount64 < deadline)
+        {
+            if (GetForegroundWindow() == hWnd) return;
+            await Task.Delay(25);
+        }
+    }
 
     private readonly string _textFilePath;
     private readonly string _settingsFilePath;
@@ -220,6 +353,9 @@ public partial class MainWindow : Window
 
     // Clipboard clear setting (0 = disabled)
     private int _clipboardClearSeconds = 0;
+
+    // Quick Enter: auto-paste into previously focused window after QWERTY pick
+    private bool _quickEnterEnabled = false;
 
     // Shortcut hotkey state
     private string _shortcutsFilePath = string.Empty;
@@ -248,6 +384,8 @@ public partial class MainWindow : Window
         public string? MonitorDeviceName { get; set; }
         // 0 = disabled; 30 / 60 / 120 = clear after N seconds
         public int ClipboardClearSeconds { get; set; } = 0;
+        // When true, QWERTY picker auto-pastes into the previously focused window
+        public bool QuickEnterEnabled { get; set; } = false;
     }
 
     public MainWindow()
@@ -279,6 +417,7 @@ public partial class MainWindow : Window
         UpdateClearClipMenuChecks();
         UpdateBiometricUi();
         DarkThemeMenuItem.IsChecked = _isDarkTheme;
+        QuickEnterMenuItem.IsChecked = _quickEnterEnabled;
         
         // Ensure window topmost behavior follows saved pin state.
         Topmost = _isPinned;
@@ -1253,11 +1392,11 @@ public partial class MainWindow : Window
         return IntPtr.Zero;
     }
 
-    private void HandleHotkey(int id, IntPtr prevHwnd)
+    private async void HandleHotkey(int id, IntPtr prevHwnd)
     {
         if (id == HotkeyIdQwertyPicker)
         {
-            ShowQwertyPicker(prevHwnd);
+            await ShowQwertyPicker(prevHwnd);
             return;
         }
 
@@ -1629,7 +1768,7 @@ public partial class MainWindow : Window
 
     // ── QWERTY quick-paste picker ────────────────────────────────────────────
 
-    private void ShowQwertyPicker(IntPtr prevHwnd)
+    private async Task ShowQwertyPicker(IntPtr prevHwnd)
     {
         LoadSnippets();
 
@@ -1849,6 +1988,16 @@ public partial class MainWindow : Window
 
         if (prevHwnd != IntPtr.Zero)
             SetForegroundWindow(prevHwnd);
+
+        // Quick Enter: auto-paste into the previously focused window.
+        // AttachThreadInput (inside SendPasteToWindow) synchronises input queues so
+        // credential dialogs and security windows accept the Ctrl+V reliably.
+        if (_quickEnterEnabled && !string.IsNullOrEmpty(copiedSnippet) && prevHwnd != IntPtr.Zero)
+        {
+            await WaitForForegroundAsync(prevHwnd);
+            await Task.Delay(60); // small settle margin after focus lands
+            SendPasteToWindow(prevHwnd);
+        }
     }
 
     // ── Edit Snippets (existing) ────────────────────────────────────────────
@@ -2875,6 +3024,13 @@ public partial class MainWindow : Window
         SaveUiSettings();
     }
 
+    private void QuickEnter_Click(object sender, RoutedEventArgs e)
+    {
+        _quickEnterEnabled = !_quickEnterEnabled;
+        QuickEnterMenuItem.IsChecked = _quickEnterEnabled;
+        SaveUiSettings();
+    }
+
     private void ResetPreferences_Click(object sender, RoutedEventArgs e)
     {
         var result = System.Windows.MessageBox.Show(
@@ -2890,9 +3046,11 @@ public partial class MainWindow : Window
         _isPinned = DefaultIsPinned;
         _isDarkTheme = DefaultIsDarkTheme;
         ShowInTaskbar = DefaultShowInTaskbar;
+        _quickEnterEnabled = false;
 
         Topmost = _isPinned;
         DarkThemeMenuItem.IsChecked = _isDarkTheme;
+        QuickEnterMenuItem.IsChecked = _quickEnterEnabled;
         ApplyExpandedPanelTheme();
         BuildBubbles();
         UpdateBackdropOpacityMenuChecks();
@@ -2959,6 +3117,7 @@ public partial class MainWindow : Window
                 _savedWindowTop = settings.WindowTop;
                 _savedMonitorDeviceName = settings.MonitorDeviceName;
                 _clipboardClearSeconds = settings.ClipboardClearSeconds;
+                _quickEnterEnabled = settings.QuickEnterEnabled;
             }
         }
         catch
@@ -2991,7 +3150,8 @@ public partial class MainWindow : Window
                 WindowLeft = Left,
                 WindowTop = Top,
                 MonitorDeviceName = currentScreen.DeviceName,
-                ClipboardClearSeconds = _clipboardClearSeconds
+                ClipboardClearSeconds = _clipboardClearSeconds,
+                QuickEnterEnabled = _quickEnterEnabled
             };
             var json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(_settingsFilePath, json);

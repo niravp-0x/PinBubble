@@ -50,6 +50,7 @@
             <ContextMenu>
                 <MenuItem Header="Edit snippets" Click="EditSnippets_Click"/>
                 <MenuItem Header="Manage Shortcuts" Click="EditShortcuts_Click"/>
+                <MenuItem x:Name="QuickEnterMenuItem" Header="Quick Enter (QWERTY)" IsCheckable="True" Click="QuickEnter_Click"/>
                 <MenuItem Header="Clear Clipboard After Copy">
                     <MenuItem x:Name="ClearClipDisabledMenuItem" Header="Disabled" IsCheckable="True" IsChecked="True" Tag="0" Click="ClearClip_Click"/>
                     <MenuItem x:Name="ClearClip30MenuItem" Header="30 seconds" IsCheckable="True" Tag="30" Click="ClearClip_Click"/>
