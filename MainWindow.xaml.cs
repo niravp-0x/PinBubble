@@ -35,6 +35,19 @@ class SnippetRow
     public DateTime Created { get; set; } = DateTime.Now;
     public DateTime Modified { get; set; } = DateTime.Now;
     public DateTime ExpiryDate { get; set; } = DateTime.Now.AddDays(30);
+    
+    // TOTP (Time-based One-Time Password) support
+    public string? TotpSecret { get; set; } // Base32-encoded TOTP secret from FreeIPA
+    
+    /// <summary>Gets the current TOTP code if a secret is configured</summary>
+    public string? CurrentTotp => TotpProvider.GetCurrentTotp(TotpSecret);
+    
+    /// <summary>Gets the current TOTP code with expiry info if a secret is configured</summary>
+    public (string Code, int RemainingSeconds)? TotpWithExpiry => TotpProvider.GetTotpWithExpiry(TotpSecret);
+    
+    /// <summary>Gets the provisioning URI for QR code generation</summary>
+    public string GetTotpProvisioningUri(string issuer = "PinBubble") => 
+        string.IsNullOrWhiteSpace(TotpSecret) ? string.Empty : TotpProvider.GetProvisioningUri(TotpSecret, Label, issuer);
 }
 
 // Lightweight DTO for JSON persistence (no UI-only fields)
@@ -45,6 +58,9 @@ class SnippetEntry
     public DateTime Created { get; set; } = DateTime.Now;
     public DateTime Modified { get; set; } = DateTime.Now;
     public DateTime ExpiryDate { get; set; } = DateTime.Now.AddDays(30);
+    
+    // TOTP (Time-based One-Time Password) support
+    public string? TotpSecret { get; set; } // Base32-encoded TOTP secret from FreeIPA
 }
 
 // Maps a global hotkey to a pinned snippet
@@ -74,7 +90,8 @@ public partial class MainWindow : Window
                 Value = r.ActualValue,
                 Created = r.Created,
                 Modified = r.Modified,
-                ExpiryDate = r.ExpiryDate
+                ExpiryDate = r.ExpiryDate,
+                TotpSecret = r.TotpSecret
             })
             .ToList();
         return JsonSerializer.Serialize(entries, s_jsonOptions);
@@ -95,7 +112,8 @@ public partial class MainWindow : Window
                 IsEncrypted = true,
                 Created = e.Created,
                 Modified = e.Modified,
-                ExpiryDate = e.ExpiryDate
+                ExpiryDate = e.ExpiryDate,
+                TotpSecret = e.TotpSecret
             }).ToList();
         }
 
@@ -334,6 +352,7 @@ public partial class MainWindow : Window
     private string[] _labels = Array.Empty<string>();
     private string[] _fullLabels = Array.Empty<string>();
     private string[] _snippets = Array.Empty<string>();
+    private SnippetRow[] _snippetRows = Array.Empty<SnippetRow>(); // Store full SnippetRow for TOTP access
     private FileSystemWatcher? _watcher;
     private System.Windows.Threading.DispatcherTimer? _reloadDebounce;
     private WinForms.NotifyIcon? _trayIcon;
@@ -946,6 +965,7 @@ public partial class MainWindow : Window
                 _labels = Array.Empty<string>();
                 _fullLabels = Array.Empty<string>();
                 _snippets = Array.Empty<string>();
+                _snippetRows = Array.Empty<SnippetRow>();
                 return;
             }
 
@@ -954,6 +974,7 @@ public partial class MainWindow : Window
                 _labels = Array.Empty<string>();
                 _fullLabels = Array.Empty<string>();
                 _snippets = Array.Empty<string>();
+                _snippetRows = Array.Empty<SnippetRow>();
                 return;
             }
 
@@ -962,6 +983,7 @@ public partial class MainWindow : Window
             _labels = new string[parsed.Count];
             _fullLabels = new string[parsed.Count];
             _snippets = new string[parsed.Count];
+            _snippetRows = new SnippetRow[parsed.Count];
 
             for (int i = 0; i < parsed.Count; i++)
             {
@@ -969,6 +991,7 @@ public partial class MainWindow : Window
                 _fullLabels[i] = parsed[i].Label;
                 _labels[i] = displayLabel;
                 _snippets[i] = parsed[i].ActualValue;
+                _snippetRows[i] = parsed[i];
             }
         }
         catch { }
@@ -1030,6 +1053,16 @@ public partial class MainWindow : Window
             var tipText = shortcutLookup.TryGetValue(fullLbl, out var sc)
                 ? $"{fullLbl}\n\nShortcut: {sc}"
                 : fullLbl;
+            
+            // Add TOTP info if configured
+            if (i < _snippetRows.Length && !string.IsNullOrWhiteSpace(_snippetRows[i].TotpSecret))
+            {
+                var totpInfo = _snippetRows[i].TotpWithExpiry;
+                if (totpInfo.HasValue)
+                {
+                    tipText += $"\n\nTOTP: {totpInfo.Value.Code} ({totpInfo.Value.RemainingSeconds}s)";
+                }
+            }
 
             var btn = new WpfButton
             {
@@ -2229,11 +2262,22 @@ public partial class MainWindow : Window
             ReadOnly = true,
             SortMode = WinForms.DataGridViewColumnSortMode.NotSortable
         };
+        
+        var colTotp = new WinForms.DataGridViewTextBoxColumn
+        {
+            HeaderText = "🔐",
+            Name = "Totp",
+            FillWeight = 15,
+            Width = 80,
+            ReadOnly = true,
+            SortMode = WinForms.DataGridViewColumnSortMode.NotSortable
+        };
 
         grid.Columns.Add(colAge);
         grid.Columns.Add(colLabel);
         grid.Columns.Add(colValue);
         grid.Columns.Add(colToggle);
+        grid.Columns.Add(colTotp);
         
         // Increase header height for cleaner look
         grid.ColumnHeadersHeight = 35;
@@ -2241,7 +2285,7 @@ public partial class MainWindow : Window
         // Populate grid - Age column will be empty, clock icon shown via painting
         foreach (var row in snippetRows)
         {
-            grid.Rows.Add("", row.Label, row.Value);
+            grid.Rows.Add("", row.Label, row.Value, "", "");
             grid.Rows[grid.Rows.Count - 2].Tag = row; // Store the SnippetRow in Tag
         }
 
@@ -2382,6 +2426,55 @@ public partial class MainWindow : Window
                 
                 ev.Handled = true;
             }
+            // TOTP column (column 4) - display TOTP code if secret is configured
+            else if (ev.ColumnIndex == 4 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count - 1)
+            {
+                ev.Paint(ev.CellBounds, WinForms.DataGridViewPaintParts.Background | WinForms.DataGridViewPaintParts.Border);
+                
+                var row = grid.Rows[ev.RowIndex];
+                if (row.Tag is SnippetRow snippetRow && ev.Graphics != null)
+                {
+                    // Show TOTP code if secret is configured
+                    if (!string.IsNullOrWhiteSpace(snippetRow.TotpSecret))
+                    {
+                        var totpInfo = snippetRow.TotpWithExpiry;
+                        if (totpInfo.HasValue)
+                        {
+                            var code = totpInfo.Value.Code;
+                            var remaining = totpInfo.Value.RemainingSeconds;
+                            
+                            // Format: "123456 (15s)"
+                            var displayText = $"{code}\n({remaining}s)";
+                            var totpFont = new Drawing.Font("Courier New", 9f, Drawing.FontStyle.Bold);
+                            var totpBrush = new System.Drawing.SolidBrush(Drawing.Color.FromArgb(0, 180, 0));
+                            var sf = new System.Drawing.StringFormat
+                            {
+                                Alignment = System.Drawing.StringAlignment.Center,
+                                LineAlignment = System.Drawing.StringAlignment.Center
+                            };
+                            ev.Graphics.DrawString(displayText, totpFont, totpBrush, ev.CellBounds, sf);
+                            totpBrush.Dispose();
+                            totpFont.Dispose();
+                        }
+                    }
+                    else if (hoveredRowIndex == ev.RowIndex && hoveredColumnIndex == ev.ColumnIndex)
+                    {
+                        // Show "add" icon on hover if no TOTP secret
+                        var addFont = new Drawing.Font("Segoe UI Emoji", 14f);
+                        var addBrush = new System.Drawing.SolidBrush(Drawing.Color.FromArgb(100, 150, 200));
+                        var sf = new System.Drawing.StringFormat
+                        {
+                            Alignment = System.Drawing.StringAlignment.Center,
+                            LineAlignment = System.Drawing.StringAlignment.Center
+                        };
+                        ev.Graphics.DrawString("➕", addFont, addBrush, ev.CellBounds, sf);
+                        addBrush.Dispose();
+                        addFont.Dispose();
+                    }
+                }
+                
+                ev.Handled = true;
+            }
         };
         
         // Track mouse movement for hover effect and tooltip
@@ -2402,7 +2495,7 @@ public partial class MainWindow : Window
                 }
             }
             
-            if ((ev.ColumnIndex == 0 || ev.ColumnIndex == 3) && ev.RowIndex >= 0)
+            if ((ev.ColumnIndex == 0 || ev.ColumnIndex == 3 || ev.ColumnIndex == 4) && ev.RowIndex >= 0)
             {
                 hoveredRowIndex = ev.RowIndex;
                 hoveredColumnIndex = ev.ColumnIndex;
@@ -2412,7 +2505,7 @@ public partial class MainWindow : Window
         
         grid.CellMouseLeave += (s, ev) =>
         {
-            if ((ev.ColumnIndex == 0 || ev.ColumnIndex == 3) && ev.RowIndex >= 0)
+            if ((ev.ColumnIndex == 0 || ev.ColumnIndex == 3 || ev.ColumnIndex == 4) && ev.RowIndex >= 0)
             {
                 hoveredRowIndex = -1;
                 hoveredColumnIndex = -1;
@@ -2669,6 +2762,134 @@ public partial class MainWindow : Window
                     grid.InvalidateCell(3, ev.RowIndex);
                 }
             }
+            // TOTP column - manage TOTP secret
+            else if (ev.ColumnIndex == 4 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count - 1)
+            {
+                var row = grid.Rows[ev.RowIndex];
+                if (row.Tag is SnippetRow snippetRow)
+                {
+                    // Open TOTP management dialog
+                    using var totpForm = new WinForms.Form
+                    {
+                        Width = 500,
+                        Height = 350,
+                        FormBorderStyle = WinForms.FormBorderStyle.FixedDialog,
+                        Text = "Manage TOTP",
+                        StartPosition = WinForms.FormStartPosition.CenterParent,
+                        MaximizeBox = false,
+                        MinimizeBox = false,
+                        TopMost = true,
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White,
+                        Padding = new WinForms.Padding(20)
+                    };
+
+                    var labelEntry = new WinForms.Label
+                    {
+                        Left = 30,
+                        Top = 20,
+                        Width = 420,
+                        Height = 25,
+                        Text = $"Entry: {snippetRow.Label}",
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
+                        Font = new Drawing.Font("Segoe UI", 10f, Drawing.FontStyle.Bold),
+                        AutoSize = false
+                    };
+
+                    var labelSecret = new WinForms.Label
+                    {
+                        Left = 30,
+                        Top = 60,
+                        Width = 420,
+                        Height = 20,
+                        Text = "Base32-Encoded Secret (from FreeIPA):",
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(160, 160, 165) : Drawing.Color.DarkGray,
+                        Font = new Drawing.Font("Segoe UI", 9f),
+                        AutoSize = false
+                    };
+
+                    var textSecret = new WinForms.TextBox
+                    {
+                        Left = 30,
+                        Top = 85,
+                        Width = 420,
+                        Height = 60,
+                        Font = new Drawing.Font("Courier New", 10f),
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 50) : Drawing.Color.White,
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
+                        Multiline = true,
+                        Text = snippetRow.TotpSecret ?? string.Empty,
+                        BorderStyle = WinForms.BorderStyle.FixedSingle
+                    };
+
+                    var labelInfo = new WinForms.Label
+                    {
+                        Left = 30,
+                        Top = 155,
+                        Width = 420,
+                        Height = 40,
+                        Text = "To get the secret: ipa otptoken-show <USERNAME> (look for 'Key')",
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(100, 180, 220) : Drawing.Color.FromArgb(0, 100, 150),
+                        Font = new Drawing.Font("Segoe UI", 8f, Drawing.FontStyle.Italic),
+                        AutoSize = false
+                    };
+
+                    var btnSaveTOTP = new WinForms.Button
+                    {
+                        Text = "Save",
+                        Left = 280,
+                        Top = 265,
+                        Width = 80,
+                        Height = 40,
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(0, 120, 80) : Drawing.Color.LightGreen,
+                        ForeColor = Drawing.Color.White,
+                        FlatStyle = WinForms.FlatStyle.Flat,
+                        Font = new Drawing.Font("Segoe UI", 10f, Drawing.FontStyle.Bold),
+                        Cursor = WinForms.Cursors.Hand,
+                        DialogResult = WinForms.DialogResult.OK
+                    };
+                    btnSaveTOTP.FlatAppearance.BorderSize = 0;
+
+                    var btnClearTOTP = new WinForms.Button
+                    {
+                        Text = "Clear",
+                        Left = 370,
+                        Top = 265,
+                        Width = 80,
+                        Height = 40,
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(80, 40, 40) : Drawing.Color.LightCoral,
+                        ForeColor = Drawing.Color.White,
+                        FlatStyle = WinForms.FlatStyle.Flat,
+                        Font = new Drawing.Font("Segoe UI", 10f, Drawing.FontStyle.Bold),
+                        Cursor = WinForms.Cursors.Hand
+                    };
+                    btnClearTOTP.FlatAppearance.BorderSize = 0;
+                    btnClearTOTP.Click += (s2, e2) =>
+                    {
+                        textSecret.Text = string.Empty;
+                    };
+
+                    totpForm.Controls.Add(labelEntry);
+                    totpForm.Controls.Add(labelSecret);
+                    totpForm.Controls.Add(textSecret);
+                    totpForm.Controls.Add(labelInfo);
+                    totpForm.Controls.Add(btnSaveTOTP);
+                    totpForm.Controls.Add(btnClearTOTP);
+                    totpForm.AcceptButton = btnSaveTOTP;
+
+                    if (totpForm.ShowDialog() == WinForms.DialogResult.OK)
+                    {
+                        snippetRow.TotpSecret = textSecret.Text.Trim();
+                        if (string.IsNullOrWhiteSpace(snippetRow.TotpSecret))
+                        {
+                            snippetRow.TotpSecret = null;
+                        }
+                        hasChanges = true;
+                        btnSave.Visible = true;
+                        // Refresh TOTP display
+                        grid.InvalidateCell(4, ev.RowIndex);
+                    }
+                }
+            }
         };
 
         // Decrypt All button click handler
@@ -2892,6 +3113,25 @@ public partial class MainWindow : Window
         dialog.Controls.Add(grid);
         dialog.Controls.Add(toolbar);
         dialog.AcceptButton = btnSave;
+
+        // Add a timer to refresh TOTP display every second
+        var totpRefreshTimer = new System.Windows.Forms.Timer
+        {
+            Interval = 1000 // Refresh every second
+        };
+        totpRefreshTimer.Tick += (s, e) =>
+        {
+            // Invalidate all TOTP cells (column 4) to trigger repaint
+            for (int i = 0; i < grid.Rows.Count - 1; i++)
+            {
+                if (grid.Rows[i].Tag is SnippetRow row && !string.IsNullOrWhiteSpace(row.TotpSecret))
+                {
+                    grid.InvalidateCell(4, i);
+                }
+            }
+        };
+        totpRefreshTimer.Start();
+        dialog.FormClosed += (s, e) => totpRefreshTimer.Dispose();
 
         if (dialog.ShowDialog() != WinForms.DialogResult.OK)
             return;
