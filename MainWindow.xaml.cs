@@ -172,7 +172,7 @@ public partial class MainWindow : Window
         return SerializeSnippetsToJson(rows);
     }
 
-    private const double DefaultBackdropOpacity = 0.50;
+    private const double DefaultBackdropOpacity = 0.80;
     private const bool DefaultIsPinned = true;
     private const bool DefaultIsDarkTheme = true;
     private const bool DefaultShowInTaskbar = true;
@@ -379,6 +379,13 @@ public partial class MainWindow : Window
     // TOTP copy behavior: when true, copy value + TOTP code together
     private bool _copyTotpTogether = true;
 
+    // Default expiry for new/updated entries.
+    private int _defaultExpiryDays = 30;
+
+    private static readonly string s_appVersion = typeof(MainWindow).Assembly.GetName().Version is { } version
+        ? version.ToString(3)
+        : "2.1.0";
+
     // Shortcut hotkey state
     private string _shortcutsFilePath = string.Empty;
     private List<ShortcutEntry> _shortcuts = new();
@@ -405,11 +412,13 @@ public partial class MainWindow : Window
         public double? WindowTop { get; set; }
         public string? MonitorDeviceName { get; set; }
         // 0 = disabled; 30 / 60 / 120 = clear after N seconds
-        public int ClipboardClearSeconds { get; set; } = 0;
+        public int ClipboardClearSeconds { get; set; } = 60;
         // When true, QWERTY picker auto-pastes into the previously focused window
         public bool QuickEnterEnabled { get; set; } = false;
         // When true, copying a snippet with TOTP will copy both value and TOTP code together
         public bool CopyTotpTogether { get; set; } = true;
+        // Default number of days before a snippet is considered expired.
+        public int DefaultExpiryDays { get; set; } = 30;
     }
 
     public MainWindow()
@@ -2535,7 +2544,7 @@ public partial class MainWindow : Window
             if (row.Tag is not SnippetRow snippetRow)
             {
                 // New row - create SnippetRow with 30 days default expiry
-                snippetRow = new SnippetRow { IsEncrypted = true, Created = DateTime.Now, Modified = DateTime.Now, ExpiryDate = DateTime.Now.AddDays(30) };
+                snippetRow = new SnippetRow { IsEncrypted = true, Created = DateTime.Now, Modified = DateTime.Now, ExpiryDate = DateTime.Now.AddDays(_defaultExpiryDays) };
                 row.Tag = snippetRow;
             }
 
@@ -2556,6 +2565,7 @@ public partial class MainWindow : Window
                 if (snippetRow.IsEncrypted && newValue != "••••••••" && !newValue.All(c => c == '•'))
                 {
                     snippetRow.ActualValue = newValue;
+                    snippetRow.ExpiryDate = DateTime.Now.AddDays(_defaultExpiryDays);
                     
                     // Re-encrypt display after a brief delay
                     var timer = new System.Windows.Forms.Timer { Interval = 150 };
@@ -2576,6 +2586,7 @@ public partial class MainWindow : Window
                 {
                     // Decrypted - just update actual value
                     snippetRow.ActualValue = newValue;
+                    snippetRow.ExpiryDate = DateTime.Now.AddDays(_defaultExpiryDays);
                 }
             }
         };
@@ -2687,7 +2698,7 @@ public partial class MainWindow : Window
                         Height = 35,
                         Font = new Drawing.Font("Segoe UI", 11f),
                         Format = WinForms.DateTimePickerFormat.Short,
-                        Value = snippetRow.ExpiryDate < DateTime.Now ? DateTime.Now.AddDays(30) : snippetRow.ExpiryDate,
+                        Value = snippetRow.ExpiryDate < DateTime.Now ? DateTime.Now.AddDays(_defaultExpiryDays) : snippetRow.ExpiryDate,
                         BackColor = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 50) : Drawing.Color.White,
                         ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
                         CalendarForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
@@ -2780,34 +2791,59 @@ public partial class MainWindow : Window
                 var row = grid.Rows[ev.RowIndex];
                 if (row.Tag is SnippetRow snippetRow && !string.IsNullOrWhiteSpace(snippetRow.TotpSecret))
                 {
-                    // Check if Control key is held
                     bool ctrlHeld = (WinForms.Control.ModifierKeys & WinForms.Keys.Control) != 0;
-                    
+                    var totp = snippetRow.CurrentTotp;
+                    if (string.IsNullOrWhiteSpace(totp)) return;
+
                     if (ctrlHeld)
                     {
-                        // Ctrl+Click: Copy password + TOTP together
-                        var password = snippetRow.ActualValue;
-                        var totp = snippetRow.CurrentTotp;
-                        if (!string.IsNullOrWhiteSpace(totp))
+                        var textToCopy = $"{snippetRow.ActualValue}{totp}";
+                        if (!TrySetClipboardWithoutHistory(textToCopy))
+                            System.Windows.Clipboard.SetText(textToCopy);
+
+                        row.Cells[2].Selected = true;
+                        row.Cells[4].Selected = true;
+                        grid.CurrentCell = row.Cells[2];
+                        grid.Invalidate();
+
+                        if (btnDecryptAll.Text == "Show All")
                         {
-                            var textToCopy = $"{password}{totp}";
-                            if (!TrySetClipboardWithoutHistory(textToCopy))
-                                System.Windows.Clipboard.SetText(textToCopy);
-                            
-                            WinForms.MessageBox.Show("Password + TOTP copied to clipboard.", "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Information);
+                            btnDecryptAll.Visible = false;
+                            btnDecryptAll.Enabled = false;
                         }
+
+                        var copyTimer = new System.Windows.Forms.Timer { Interval = 350 };
+                        copyTimer.Tick += (_, _) =>
+                        {
+                            copyTimer.Stop();
+                            copyTimer.Dispose();
+                            grid.ClearSelection();
+                        };
+                        copyTimer.Start();
                     }
                     else
                     {
-                        // Single click: Copy just TOTP code
-                        var totp = snippetRow.CurrentTotp;
-                        if (!string.IsNullOrWhiteSpace(totp))
+                        if (!TrySetClipboardWithoutHistory(totp))
+                            System.Windows.Clipboard.SetText(totp);
+
+                        row.Cells[4].Selected = true;
+                        grid.CurrentCell = row.Cells[4];
+                        grid.Invalidate();
+
+                        if (btnDecryptAll.Text == "Show All")
                         {
-                            if (!TrySetClipboardWithoutHistory(totp))
-                                System.Windows.Clipboard.SetText(totp);
-                            
-                            WinForms.MessageBox.Show("TOTP copied to clipboard.", "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Information);
+                            btnDecryptAll.Visible = false;
+                            btnDecryptAll.Enabled = false;
                         }
+
+                        var copyTimer = new System.Windows.Forms.Timer { Interval = 350 };
+                        copyTimer.Tick += (_, _) =>
+                        {
+                            copyTimer.Stop();
+                            copyTimer.Dispose();
+                            grid.ClearSelection();
+                        };
+                        copyTimer.Start();
                     }
                 }
             }
@@ -3412,6 +3448,7 @@ public partial class MainWindow : Window
                 _clipboardClearSeconds = settings.ClipboardClearSeconds;
                 _quickEnterEnabled = settings.QuickEnterEnabled;
                 _copyTotpTogether = settings.CopyTotpTogether;
+                _defaultExpiryDays = Math.Max(1, settings.DefaultExpiryDays);
             }
         }
         catch
@@ -3446,7 +3483,8 @@ public partial class MainWindow : Window
                 MonitorDeviceName = currentScreen.DeviceName,
                 ClipboardClearSeconds = _clipboardClearSeconds,
                 QuickEnterEnabled = _quickEnterEnabled,
-                CopyTotpTogether = _copyTotpTogether
+                CopyTotpTogether = _copyTotpTogether,
+                DefaultExpiryDays = _defaultExpiryDays
             };
             var json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(_settingsFilePath, json);
@@ -3576,26 +3614,50 @@ public partial class MainWindow : Window
         base.OnClosed(e);
     }
 
+    private static Drawing.Drawing2D.GraphicsPath RoundedRectPath(Drawing.Rectangle bounds, int radius)
+    {
+        var diameter = radius * 2;
+        var path = new Drawing.Drawing2D.GraphicsPath();
+        path.AddArc(bounds.X, bounds.Y, diameter, diameter, 180, 90);
+        path.AddArc(bounds.Right - diameter, bounds.Y, diameter, diameter, 270, 90);
+        path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
+        path.AddArc(bounds.X, bounds.Bottom - diameter, diameter, diameter, 90, 90);
+        path.CloseFigure();
+        return path;
+    }
+
     private void About_Click(object sender, RoutedEventArgs e)
     {
-        var dimColor = _isDarkTheme ? Drawing.Color.FromArgb(140, 140, 145) : Drawing.Color.FromArgb(120, 120, 120);
-        var accentColor = _isDarkTheme ? Drawing.Color.FromArgb(102, 185, 51) : Drawing.Color.FromArgb(80, 150, 40);
-        var textColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black;
+        var dimColor = _isDarkTheme ? Drawing.Color.FromArgb(150, 150, 156) : Drawing.Color.FromArgb(120, 120, 120);
+        var accentColor = _isDarkTheme ? Drawing.Color.FromArgb(110, 195, 60) : Drawing.Color.FromArgb(70, 140, 35);
+        var textColor = _isDarkTheme ? Drawing.Color.FromArgb(210, 210, 216) : Drawing.Color.FromArgb(40, 40, 40);
+        var separatorColor = _isDarkTheme ? Drawing.Color.FromArgb(70, 70, 78) : Drawing.Color.FromArgb(225, 225, 230);
+        var cardTopColor = _isDarkTheme ? Drawing.Color.FromArgb(48, 48, 55) : Drawing.Color.FromArgb(255, 255, 255);
+        var cardBottomColor = _isDarkTheme ? Drawing.Color.FromArgb(38, 38, 44) : Drawing.Color.FromArgb(246, 247, 249);
+        var cardBorderColor = _isDarkTheme ? Drawing.Color.FromArgb(255, 255, 255) : Drawing.Color.FromArgb(0, 0, 0);
+
+        // The rounded card *is* the window: borderless, region-clipped to match the drawn shape.
+        const int cardWidth = 492;
+        const int cardHeight = 612;
+        const int cornerRadius = 18;
 
         using var aboutDialog = new WinForms.Form
         {
-            Width = 500,
-            Height = 560,
-            FormBorderStyle = WinForms.FormBorderStyle.FixedDialog,
+            FormBorderStyle = WinForms.FormBorderStyle.None,
             StartPosition = WinForms.FormStartPosition.CenterScreen,
+            ClientSize = new Drawing.Size(cardWidth, cardHeight),
             Text = "About PinBubble",
-            MaximizeBox = false,
-            MinimizeBox = false,
             ShowInTaskbar = false,
             TopMost = true,
-            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White,
+            AutoScaleMode = WinForms.AutoScaleMode.None,
+            BackColor = cardBottomColor,
             KeyPreview = true
         };
+
+        using (var formRegionPath = RoundedRectPath(new Drawing.Rectangle(0, 0, aboutDialog.Width - 1, aboutDialog.Height - 1), cornerRadius))
+        {
+            aboutDialog.Region = new Drawing.Region(formRegionPath);
+        }
 
         aboutDialog.KeyDown += (s, e) =>
         {
@@ -3603,38 +3665,144 @@ public partial class MainWindow : Window
                 aboutDialog.Close();
         };
 
-        // ── Pin icon ────────────────────────────────────────────────────────
-        var pinIcon = new WinForms.PictureBox { Left = 220, Top = 15, Width = 60, Height = 60, BackColor = Drawing.Color.Transparent };
-        var pinBitmap = new System.Drawing.Bitmap(60, 60);
-        using (var g = System.Drawing.Graphics.FromImage(pinBitmap))
+        // ── Glass card: fills the whole window, rounded corners, subtle gradient + border ──
+        var card = new WinForms.Panel
         {
-            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            using (var brush = new System.Drawing.SolidBrush(accentColor))
-            {
-                g.FillEllipse(brush, 15, 5, 30, 30);
-                g.FillPolygon(brush, new System.Drawing.Point[] {
-                    new(26, 35), new(34, 35), new(30, 52) });
-            }
+            Left = 0,
+            Top = 0,
+            Width = cardWidth,
+            Height = cardHeight,
+            BackColor = cardBottomColor
+        };
+        card.Paint += (s, e) =>
+        {
+            var rect = new Drawing.Rectangle(0, 0, card.Width - 1, card.Height - 1);
+            e.Graphics.SmoothingMode = Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using var path = RoundedRectPath(rect, cornerRadius);
+            using var fill = new Drawing.Drawing2D.LinearGradientBrush(rect, cardTopColor, cardBottomColor, 90f);
+            e.Graphics.FillPath(fill, path);
+            using var borderPen = new Drawing.Pen(Drawing.Color.FromArgb(_isDarkTheme ? 22 : 18, cardBorderColor), 1f);
+            e.Graphics.DrawPath(borderPen, path);
+            using var highlightPen = new Drawing.Pen(Drawing.Color.FromArgb(_isDarkTheme ? 14 : 130, Drawing.Color.White), 1f);
+            e.Graphics.DrawLine(highlightPen, 18, 1, card.Width - 18, 1);
+        };
+        using (var cardRegionPath = RoundedRectPath(new Drawing.Rectangle(0, 0, card.Width - 1, card.Height - 1), cornerRadius))
+        {
+            card.Region = new Drawing.Region(cardRegionPath);
+        }
+
+        // Fancy circular close button, top-right corner.
+        const int closeSize = 28;
+        var closeButtonNormalBack = _isDarkTheme ? Drawing.Color.FromArgb(58, 58, 66) : Drawing.Color.FromArgb(228, 229, 233);
+        var closeButton = new WinForms.Button
+        {
+            Left = card.Width - closeSize - 16,
+            Top = 16,
+            Width = closeSize,
+            Height = closeSize,
+            Text = "✕",
+            Font = new Drawing.Font("Segoe UI", 9.5f, Drawing.FontStyle.Bold),
+            FlatStyle = WinForms.FlatStyle.Flat,
+            ForeColor = dimColor,
+            BackColor = closeButtonNormalBack,
+            Cursor = WinForms.Cursors.Hand,
+            TabStop = false,
+            UseVisualStyleBackColor = false
+        };
+        closeButton.FlatAppearance.BorderSize = 0;
+        using (var closeRegionPath = RoundedRectPath(new Drawing.Rectangle(0, 0, closeSize - 1, closeSize - 1), closeSize / 2))
+        {
+            closeButton.Region = new Drawing.Region(closeRegionPath);
+        }
+        closeButton.MouseEnter += (_, _) =>
+        {
+            closeButton.BackColor = Drawing.Color.FromArgb(232, 17, 35);
+            closeButton.ForeColor = Drawing.Color.White;
+        };
+        closeButton.MouseLeave += (_, _) =>
+        {
+            closeButton.BackColor = closeButtonNormalBack;
+            closeButton.ForeColor = dimColor;
+        };
+        closeButton.Click += (_, _) => aboutDialog.Close();
+
+        // Content is laid out relative to the card, with equal left/right padding.
+        const int pad = 28;
+        var sectionWidth = card.Width - pad * 2;
+        const int sectionLeft = pad;
+
+        var pinIcon = new WinForms.PictureBox
+        {
+            Left = sectionLeft + (sectionWidth - 60) / 2,
+            Top = 24,
+            Width = 60,
+            Height = 60,
+            BackColor = Drawing.Color.Transparent
+        };
+        var pinBitmap = new Drawing.Bitmap(60, 60);
+        using (var g = Drawing.Graphics.FromImage(pinBitmap))
+        {
+            g.SmoothingMode = Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using var brush = new Drawing.SolidBrush(accentColor);
+            g.FillEllipse(brush, 15, 5, 30, 30);
+            g.FillPolygon(brush, new Drawing.Point[] { new(26, 35), new(34, 35), new(30, 52) });
         }
         pinIcon.Image = pinBitmap;
 
-        // ── Title ───────────────────────────────────────────────────────────
+        // Idle bounce for the main pin icon.
+        var pinBaseTop = pinIcon.Top;
+        var pinBounceTimer = new WinForms.Timer { Interval = 18 };
+        double pinBouncePhase = 0;
+        pinBounceTimer.Tick += (_, _) =>
+        {
+            pinBouncePhase += 0.085;
+            pinIcon.Top = pinBaseTop + (int)Math.Round(Math.Sin(pinBouncePhase) * 4.5);
+        };
+        pinBounceTimer.Start();
+
         var titleLabel = new WinForms.Label
         {
-            Left = 20, Top = 80, Width = 460, Height = 35,
+            Left = sectionLeft,
+            Top = 98,
+            Width = sectionWidth,
+            Height = 40,
             Text = "PinBubble",
             Font = new Drawing.Font("Segoe UI", 24f, Drawing.FontStyle.Bold),
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(230, 230, 235) : Drawing.Color.FromArgb(25, 25, 25),
             BackColor = Drawing.Color.Transparent,
             TextAlign = Drawing.ContentAlignment.MiddleCenter
         };
 
-        // ── Version (right of centre) + GitHub link (left of centre) ───────
+        // Meta row (version | star | github link) — built as one unit and centered as a whole.
+        var versionText = $"Version {s_appVersion}";
+        var versionFont = new Drawing.Font("Segoe UI", 9f);
+        var starFont = new Drawing.Font("Segoe UI Emoji", 13f);
+        var githubFont = new Drawing.Font("Segoe UI", 9f);
+        const string githubLinkText = "View on GitHub";
+        var versionWidth = WinForms.TextRenderer.MeasureText(versionText, versionFont).Width + 2;
+        var starWidth = WinForms.TextRenderer.MeasureText("⭐", starFont).Width + 2;
+        var githubWidth = WinForms.TextRenderer.MeasureText(githubLinkText, githubFont).Width + 4;
+        const int pipeWidth = 18;
+        const int starGap = 2;
+        var metaRowWidth = versionWidth + pipeWidth + starWidth + starGap + githubWidth;
+
+        var metaRow = new WinForms.Panel
+        {
+            Left = sectionLeft + (sectionWidth - metaRowWidth) / 2,
+            Top = 148,
+            Width = metaRowWidth,
+            Height = 22,
+            BackColor = Drawing.Color.Transparent
+        };
+
         var versionLabel = new WinForms.Label
         {
-            Left = 20, Top = 120, Width = 200, Height = 22,
-            Text = "Version 2.0.0",
-            Font = new Drawing.Font("Segoe UI", 9f),
+            Left = 0,
+            Top = 0,
+            Width = versionWidth,
+            Height = 22,
+            Text = versionText,
+            Font = versionFont,
             ForeColor = dimColor,
             BackColor = Drawing.Color.Transparent,
             TextAlign = Drawing.ContentAlignment.MiddleRight
@@ -3642,19 +3810,48 @@ public partial class MainWindow : Window
 
         var pipeLbl = new WinForms.Label
         {
-            Left = 223, Top = 120, Width = 12, Height = 22,
+            Left = versionWidth,
+            Top = 0,
+            Width = pipeWidth,
+            Height = 22,
             Text = "│",
-            Font = new Drawing.Font("Segoe UI", 9f),
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(70, 70, 75) : Drawing.Color.FromArgb(200, 200, 200),
+            Font = versionFont,
+            ForeColor = separatorColor,
             BackColor = Drawing.Color.Transparent,
             TextAlign = Drawing.ContentAlignment.MiddleCenter
         };
 
+        var starLabel = new WinForms.Label
+        {
+            Left = versionWidth + pipeWidth,
+            Top = 0,
+            Width = starWidth,
+            Height = 22,
+            Text = "⭐",
+            Font = starFont,
+            ForeColor = accentColor,
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.MiddleCenter,
+            Cursor = WinForms.Cursors.Hand
+        };
+        starLabel.Click += (_, _) =>
+        {
+            try
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                    "https://github.com/niravp-0x/PinBubble") { UseShellExecute = true });
+            }
+            catch { }
+        };
+
         var githubLink = new WinForms.LinkLabel
         {
-            Left = 238, Top = 120, Width = 200, Height = 22,
-            Text = "⭐ View on GitHub",
-            Font = new Drawing.Font("Segoe UI", 9f),
+            Left = versionWidth + pipeWidth + starWidth + starGap,
+            Top = 0,
+            Width = githubWidth,
+            Height = 22,
+            Text = githubLinkText,
+            Font = githubFont,
             BackColor = Drawing.Color.Transparent,
             TextAlign = Drawing.ContentAlignment.MiddleLeft,
             LinkColor = accentColor,
@@ -3663,64 +3860,70 @@ public partial class MainWindow : Window
         };
         githubLink.LinkClicked += (_, _) =>
         {
-            try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
-                "https://github.com/niravp-0x/PinBubble") { UseShellExecute = true }); }
+            try
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                    "https://github.com/niravp-0x/PinBubble") { UseShellExecute = true });
+            }
             catch { }
         };
+        metaRow.Controls.AddRange(new WinForms.Control[] { versionLabel, pipeLbl, starLabel, githubLink });
 
-        // ── Separator 1 ─────────────────────────────────────────────────────
-        var separator1 = new WinForms.Panel
-        {
-            Left = 20, Top = 152, Width = 440, Height = 1,
-            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(70, 70, 75) : Drawing.Color.FromArgb(200, 200, 200)
-        };
+        var separator1 = new WinForms.Panel { Left = sectionLeft, Top = 188, Width = sectionWidth, Height = 1, BackColor = separatorColor };
 
-        // ── Description ─────────────────────────────────────────────────────
         var descriptionLabel = new WinForms.Label
         {
-            Left = 30, Top = 162, Width = 440, Height = 45,
+            Left = sectionLeft,
+            Top = 204,
+            Width = sectionWidth,
+            Height = 64,
             Text = "A lightweight, always-on-screen snippet manager\nthat keeps your frequently used text snippets\nat your fingertips.",
-            Font = new Drawing.Font("Segoe UI", 9f),
+            Font = new Drawing.Font("Segoe UI", 10f),
             ForeColor = textColor,
             BackColor = Drawing.Color.Transparent,
             TextAlign = Drawing.ContentAlignment.TopCenter
         };
 
-        // ── Features ────────────────────────────────────────────────────────
         var featuresLabel = new WinForms.Label
         {
-            Left = 40, Top = 218, Width = 420, Height = 20,
+            Left = sectionLeft + 12,
+            Top = 282,
+            Width = sectionWidth - 12,
+            Height = 20,
             Text = "KEY FEATURES",
             Font = new Drawing.Font("Segoe UI", 8.5f, Drawing.FontStyle.Bold),
             ForeColor = accentColor,
-            BackColor = Drawing.Color.Transparent
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.MiddleLeft
         };
 
         WinForms.Label MakeFeat(string text, int top) => new WinForms.Label
         {
-            Left = 60, Top = top, Width = 390, Height = 22,
+            Left = sectionLeft + 18,
+            Top = top,
+            Width = sectionWidth - 18,
+            Height = 22,
             Text = text,
             Font = new Drawing.Font("Segoe UI", 8.5f),
             ForeColor = textColor,
-            BackColor = Drawing.Color.Transparent
-        };
-        var feature1 = MakeFeat("> Encrypted snippet storage with master password", 244);
-        var feature2 = MakeFeat("> Global hotkeys & QWERTY picker for instant copy",  266);
-        var feature3 = MakeFeat("> Pin/unpin to stay on top of other windows",         288);
-        var feature4 = MakeFeat("> Dark theme support for comfortable viewing",         310);
-        var feature5 = MakeFeat("> Auto-clear clipboard after copy (configurable)",     332);
-
-        // ── Separator 2 ─────────────────────────────────────────────────────
-        var separator2 = new WinForms.Panel
-        {
-            Left = 20, Top = 366, Width = 440, Height = 1,
-            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(70, 70, 75) : Drawing.Color.FromArgb(200, 200, 200)
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.MiddleLeft
         };
 
-        // ── Authors ─────────────────────────────────────────────────────────
+        var feature1 = MakeFeat("•  Encrypted snippet storage with master password", 310);
+        var feature2 = MakeFeat("•  TOTP support with quick copy and Ctrl+click behavior", 334);
+        var feature3 = MakeFeat("•  Global hotkeys, QWERTY picker, and instant paste", 358);
+        var feature4 = MakeFeat("•  Pin/unpin and dark theme support for comfortable viewing", 382);
+        var feature5 = MakeFeat("•  Configurable default expiry and clipboard auto-clear", 406);
+
+        var separator2 = new WinForms.Panel { Left = sectionLeft, Top = 444, Width = sectionWidth, Height = 1, BackColor = separatorColor };
+
         var authorsHeaderLbl = new WinForms.Label
         {
-            Left = 20, Top = 378, Width = 460, Height = 18,
+            Left = sectionLeft,
+            Top = 460,
+            Width = sectionWidth,
+            Height = 20,
             Text = "AUTHORS",
             Font = new Drawing.Font("Segoe UI", 8.5f, Drawing.FontStyle.Bold),
             ForeColor = accentColor,
@@ -3730,7 +3933,10 @@ public partial class MainWindow : Window
 
         var authorNamesLbl = new WinForms.Label
         {
-            Left = 20, Top = 398, Width = 460, Height = 20,
+            Left = sectionLeft,
+            Top = 486,
+            Width = sectionWidth,
+            Height = 24,
             Text = "niravp-0x  ·  biggrocer",
             Font = new Drawing.Font("Segoe UI", 9f),
             ForeColor = dimColor,
@@ -3738,11 +3944,55 @@ public partial class MainWindow : Window
             TextAlign = Drawing.ContentAlignment.MiddleCenter
         };
 
+        // Hidden easter egg: hovering the main pin icon flashes the author names.
+        var authorOriginalColor = authorNamesLbl.ForeColor;
+        var authorOriginalFont = authorNamesLbl.Font;
+        var authorFlashFont = new Drawing.Font(authorOriginalFont, Drawing.FontStyle.Bold);
+        var authorFlashColors = new[]
+        {
+            Drawing.Color.FromArgb(255, 90, 90),
+            Drawing.Color.FromArgb(255, 170, 60),
+            Drawing.Color.FromArgb(255, 225, 60),
+            Drawing.Color.FromArgb(120, 220, 120),
+            Drawing.Color.FromArgb(90, 170, 255),
+            Drawing.Color.FromArgb(190, 120, 255)
+        };
+        var authorFlashTimer = new WinForms.Timer { Interval = 90 };
+        var authorFlashIndex = 0;
+        authorFlashTimer.Tick += (_, _) =>
+        {
+            authorNamesLbl.ForeColor = authorFlashColors[authorFlashIndex % authorFlashColors.Length];
+            authorFlashIndex++;
+        };
+        pinIcon.MouseEnter += (_, _) =>
+        {
+            authorNamesLbl.Font = authorFlashFont;
+            authorFlashIndex = 0;
+            authorFlashTimer.Start();
+        };
+        pinIcon.MouseLeave += (_, _) =>
+        {
+            authorFlashTimer.Stop();
+            authorNamesLbl.ForeColor = authorOriginalColor;
+            authorNamesLbl.Font = authorOriginalFont;
+        };
+        aboutDialog.FormClosed += (_, _) =>
+        {
+            pinBounceTimer.Stop();
+            pinBounceTimer.Dispose();
+            authorFlashTimer.Stop();
+            authorFlashTimer.Dispose();
+            authorFlashFont.Dispose();
+        };
+
         var licenseLink = new WinForms.LinkLabel
         {
-            Left = 20, Top = 420, Width = 460, Height = 18,
+            Left = sectionLeft,
+            Top = 516,
+            Width = sectionWidth,
+            Height = 20,
             Text = "Released under the MIT License",
-            Font = new Drawing.Font("Segoe UI", 8f),
+            Font = new Drawing.Font("Segoe UI", 8.5f),
             BackColor = Drawing.Color.Transparent,
             TextAlign = Drawing.ContentAlignment.MiddleCenter,
             LinkColor = dimColor,
@@ -3751,61 +4001,351 @@ public partial class MainWindow : Window
         };
         licenseLink.LinkClicked += (_, _) =>
         {
-            try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
-                "https://github.com/niravp-0x/PinBubble/blob/main/LICENSE") { UseShellExecute = true }); }
+            try
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                    "https://github.com/niravp-0x/PinBubble/blob/main/LICENSE") { UseShellExecute = true });
+            }
             catch { }
         };
 
-        // ── Separator 3 ─────────────────────────────────────────────────────
-        var separator3 = new WinForms.Panel
+        var separator3 = new WinForms.Panel { Left = sectionLeft, Top = 552, Width = sectionWidth, Height = 1, BackColor = separatorColor };
+
+        // Credit row (robot icon + text) — measured and built as one unit so the icon never overlaps the text.
+        const string creditText = "Proudly vibecoded with GitHub Copilot";
+        var creditFont = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Italic);
+        var creditTextWidth = WinForms.TextRenderer.MeasureText(creditText, creditFont).Width + 4;
+        const int robotSize = 32;
+        const int robotTextGap = 6;
+        var creditRowWidth = robotSize + robotTextGap + creditTextWidth;
+        var creditRowHeight = robotSize + 4;
+
+        var creditRow = new WinForms.Panel
         {
-            Left = 20, Top = 448, Width = 440, Height = 1,
-            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(70, 70, 75) : Drawing.Color.FromArgb(200, 200, 200)
+            Left = sectionLeft + (sectionWidth - creditRowWidth) / 2,
+            Top = 562,
+            Width = creditRowWidth,
+            Height = creditRowHeight,
+            BackColor = Drawing.Color.Transparent
         };
 
-        // ── Copilot credit (centered) ────────────────────────────────────────
-        // "Proudly vibecoded with GitHub Copilot" ≈ 258px at 9f italic
-        // icon 18px + 5px gap + text 258px = 281px → left = 20 + (460-281)/2 = 110
-        var robotIcon = new WinForms.PictureBox { Left = 110, Top = 463, Width = 18, Height = 18, BackColor = Drawing.Color.Transparent };
-        var robotBitmap = new System.Drawing.Bitmap(18, 18);
-        using (var g = System.Drawing.Graphics.FromImage(robotBitmap))
+        var robotEyeColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White;
+
+        Drawing.Bitmap DrawRobotBitmap(float angleDeg)
         {
-            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            using (var brush = new System.Drawing.SolidBrush(dimColor))
-                g.FillRectangle(brush, 3, 5, 12, 10);
-            using (var brush = new System.Drawing.SolidBrush(_isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White))
+            var bmp = new Drawing.Bitmap(robotSize, robotSize);
+            using var g = Drawing.Graphics.FromImage(bmp);
+            g.SmoothingMode = Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            g.TranslateTransform(robotSize / 2f, robotSize / 2f);
+            g.RotateTransform(angleDeg);
+            g.TranslateTransform(-robotSize / 2f, -robotSize / 2f);
+            var scale = robotSize / 18f;
+            using (var brush = new Drawing.SolidBrush(dimColor))
+                g.FillRectangle(brush, 3 * scale, 5 * scale, 12 * scale, 10 * scale);
+            using (var brush = new Drawing.SolidBrush(robotEyeColor))
             {
-                g.FillEllipse(brush, 6, 8, 3, 3);
-                g.FillEllipse(brush, 11, 8, 3, 3);
+                g.FillEllipse(brush, 6 * scale, 8 * scale, 3 * scale, 3 * scale);
+                g.FillEllipse(brush, 11 * scale, 8 * scale, 3 * scale, 3 * scale);
             }
-            using (var pen = new System.Drawing.Pen(dimColor, 1.5f))
-                g.DrawLine(pen, 9, 2, 9, 5);
-            using (var brush = new System.Drawing.SolidBrush(dimColor))
-                g.FillEllipse(brush, 7, 0, 4, 4);
+            using (var pen = new Drawing.Pen(dimColor, 1.5f * scale))
+                g.DrawLine(pen, 9 * scale, 2 * scale, 9 * scale, 5 * scale);
+            using (var brush = new Drawing.SolidBrush(dimColor))
+                g.FillEllipse(brush, 7 * scale, 0, 4 * scale, 4 * scale);
+            return bmp;
         }
-        robotIcon.Image = robotBitmap;
+
+        var robotIcon = new WinForms.PictureBox
+        {
+            Left = 0,
+            Top = 2,
+            Width = robotSize,
+            Height = robotSize,
+            BackColor = Drawing.Color.Transparent,
+            Cursor = WinForms.Cursors.Hand,
+            Image = DrawRobotBitmap(0f)
+        };
+
+        // Hidden easter egg: click the robot for a spin + a random message; every 5th click throws confetti.
+        var robotRng = new Random();
+        var robotClickCount = 0;
+        var robotMessages = new (string Emoji, string Text)[]
+        {
+            ("🤖", "Beep boop! You found me!"),
+            ("☕", "Powered by coffee & Copilot"),
+            ("🎉", "Shhh… it's a secret!"),
+            ("🚀", "To the moon and back!"),
+            ("🐛", "No bugs here (probably)"),
+            ("✨", "You have curious hands!"),
+            ("🎯", "Bullseye! Nice click!"),
+            ("🧠", "Beep... calculating awesomeness"),
+            ("🍪", "Here, have a virtual cookie!"),
+            ("🌈", "You just found a bit of magic"),
+            ("🔋", "Recharging... beep beep!"),
+            ("🎈", "Pop! Another secret found")
+        };
+        WinForms.Panel? robotBubble = null;
+        WinForms.Timer? robotBubbleTimer = null;
+
+        // Emoji glyphs need the dedicated emoji font; mixing them into a plain "Segoe UI"
+        // string leaves them as blank squares, so the icon and text are separate labels.
+        void ShowRobotBubble(string emoji, string text)
+        {
+            robotBubbleTimer?.Stop();
+            robotBubbleTimer?.Dispose();
+            robotBubble?.Dispose();
+
+            var emojiFont = new Drawing.Font("Segoe UI Emoji", 12f);
+            var textFont = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Regular);
+            var emojiWidth = WinForms.TextRenderer.MeasureText(emoji, emojiFont).Width + 4;
+            var textWidth = WinForms.TextRenderer.MeasureText(text, textFont).Width + 4;
+            var rowWidth = Math.Min(sectionWidth, emojiWidth + textWidth);
+
+            robotBubble = new WinForms.Panel
+            {
+                Left = creditRow.Left + (creditRow.Width - rowWidth) / 2,
+                Top = creditRow.Top - 24,
+                Width = rowWidth,
+                Height = 22,
+                BackColor = Drawing.Color.Transparent
+            };
+
+            var emojiLbl = new WinForms.Label
+            {
+                Left = 0,
+                Top = 0,
+                Width = emojiWidth,
+                Height = 22,
+                Text = emoji,
+                Font = emojiFont,
+                ForeColor = accentColor,
+                BackColor = Drawing.Color.Transparent,
+                TextAlign = Drawing.ContentAlignment.MiddleCenter
+            };
+            var textLbl = new WinForms.Label
+            {
+                Left = emojiWidth,
+                Top = 0,
+                Width = textWidth,
+                Height = 22,
+                Text = text,
+                Font = textFont,
+                ForeColor = accentColor,
+                BackColor = Drawing.Color.Transparent,
+                TextAlign = Drawing.ContentAlignment.MiddleLeft
+            };
+            robotBubble.Controls.AddRange(new WinForms.Control[] { emojiLbl, textLbl });
+            card.Controls.Add(robotBubble);
+            robotBubble.BringToFront();
+
+            robotBubbleTimer = new WinForms.Timer { Interval = 1700 };
+            robotBubbleTimer.Tick += (_, _) =>
+            {
+                robotBubbleTimer?.Stop();
+                robotBubbleTimer?.Dispose();
+                robotBubbleTimer = null;
+                robotBubble?.Dispose();
+                robotBubble = null;
+            };
+            robotBubbleTimer.Start();
+        }
+
+        void SpinRobot()
+        {
+            var step = 0;
+            const int totalSteps = 16;
+            var spinTimer = new WinForms.Timer { Interval = 25 };
+            spinTimer.Tick += (_, _) =>
+            {
+                step++;
+                var oldImage = robotIcon.Image;
+                robotIcon.Image = DrawRobotBitmap(step * (720f / totalSteps) % 360);
+                oldImage?.Dispose();
+                if (step >= totalSteps)
+                {
+                    spinTimer.Stop();
+                    spinTimer.Dispose();
+                }
+            };
+            spinTimer.Start();
+        }
+
+        var authorBigFont = new Drawing.Font(authorOriginalFont.FontFamily, authorOriginalFont.Size + 7, Drawing.FontStyle.Bold);
+
+        Drawing.Bitmap DrawCoinBitmap(int size)
+        {
+            var bmp = new Drawing.Bitmap(size, size);
+            using var g = Drawing.Graphics.FromImage(bmp);
+            g.SmoothingMode = Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using (var fill = new Drawing.Drawing2D.LinearGradientBrush(
+                new Drawing.Rectangle(0, 0, size, size),
+                Drawing.Color.FromArgb(255, 235, 180), Drawing.Color.FromArgb(230, 170, 40), 45f))
+                g.FillEllipse(fill, 0, 0, size - 1, size - 1);
+            using (var pen = new Drawing.Pen(Drawing.Color.FromArgb(160, 110, 20), 1.2f))
+                g.DrawEllipse(pen, 0, 0, size - 1, size - 1);
+            using (var innerPen = new Drawing.Pen(Drawing.Color.FromArgb(120, 255, 255, 255), 1f))
+                g.DrawEllipse(innerPen, size * 0.22f, size * 0.22f, size * 0.56f, size * 0.56f);
+            return bmp;
+        }
+
+        // The robot throws a big burst of confetti + coins up toward the authors, who
+        // briefly grow larger while it happens.
+        void ConfettiBurst()
+        {
+            var confettiColors = new[]
+            {
+                Drawing.Color.FromArgb(255, 90, 90),
+                Drawing.Color.FromArgb(255, 170, 60),
+                Drawing.Color.FromArgb(255, 225, 60),
+                Drawing.Color.FromArgb(120, 220, 120),
+                Drawing.Color.FromArgb(90, 170, 255),
+                Drawing.Color.FromArgb(190, 120, 255)
+            };
+            var originX = creditRow.Left + robotIcon.Width / 2;
+            var originY = creditRow.Top + 4;
+
+            authorNamesLbl.Font = authorBigFont;
+
+            const int pieceCount = 28;
+            var pieces = new List<WinForms.Control>();
+            var velocities = new List<(int dx, int dy)>();
+            for (var i = 0; i < pieceCount; i++)
+            {
+                WinForms.Control piece;
+                var jitterX = robotRng.Next(-5, 6);
+                var jitterY = robotRng.Next(-4, 5);
+
+                if (i % 3 == 0)
+                {
+                    var coinSize = robotRng.Next(14, 19);
+                    piece = new WinForms.PictureBox
+                    {
+                        Width = coinSize,
+                        Height = coinSize,
+                        BackColor = Drawing.Color.Transparent,
+                        Left = originX - coinSize / 2 + jitterX,
+                        Top = originY - coinSize / 2 + jitterY,
+                        Image = DrawCoinBitmap(coinSize)
+                    };
+                }
+                else
+                {
+                    var dotSize = robotRng.Next(12, 18);
+                    piece = new WinForms.Label
+                    {
+                        AutoSize = false,
+                        Text = "●",
+                        Font = new Drawing.Font("Segoe UI", dotSize * 0.7f, Drawing.FontStyle.Bold),
+                        ForeColor = confettiColors[robotRng.Next(confettiColors.Length)],
+                        BackColor = Drawing.Color.Transparent,
+                        Width = dotSize,
+                        Height = dotSize,
+                        Left = originX - dotSize / 2 + jitterX,
+                        Top = originY - dotSize / 2 + jitterY
+                    };
+                }
+
+                card.Controls.Add(piece);
+                piece.BringToFront();
+                pieces.Add(piece);
+                velocities.Add((robotRng.Next(-8, 9), robotRng.Next(-13, -6)));
+            }
+
+            var frame = 0;
+            const int totalFrames = 50;
+            var confettiTimer = new WinForms.Timer { Interval = 28 };
+            confettiTimer.Tick += (_, _) =>
+            {
+                frame++;
+                for (var i = 0; i < pieces.Count; i++)
+                {
+                    pieces[i].Left += velocities[i].dx;
+                    pieces[i].Top += velocities[i].dy + frame / 3;
+                }
+                if (frame > totalFrames)
+                {
+                    confettiTimer.Stop();
+                    confettiTimer.Dispose();
+                    foreach (var piece in pieces)
+                    {
+                        if (piece is WinForms.PictureBox pb) pb.Image?.Dispose();
+                        piece.Dispose();
+                    }
+                    authorNamesLbl.Font = authorOriginalFont;
+                }
+            };
+            confettiTimer.Start();
+        }
+
+
+        robotIcon.Click += (_, _) =>
+        {
+            robotClickCount++;
+            SpinRobot();
+            var msg = robotMessages[robotRng.Next(robotMessages.Length)];
+            ShowRobotBubble(msg.Emoji, msg.Text);
+            if (robotClickCount % 5 == 0)
+                ConfettiBurst();
+        };
+
+        aboutDialog.FormClosed += (_, _) =>
+        {
+            robotIcon.Image?.Dispose();
+            robotBubbleTimer?.Stop();
+            robotBubbleTimer?.Dispose();
+            authorBigFont.Dispose();
+        };
 
         var copilotLabel = new WinForms.Label
         {
-            Left = 133, Top = 463, Width = 260, Height = 22,
-            Text = "Proudly vibecoded with GitHub Copilot",
-            Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Italic),
+            Left = robotSize + robotTextGap,
+            Top = (creditRowHeight - 22) / 2,
+            Width = creditTextWidth,
+            Height = 22,
+            Text = creditText,
+            Font = creditFont,
             ForeColor = dimColor,
             BackColor = Drawing.Color.Transparent,
             TextAlign = Drawing.ContentAlignment.MiddleLeft
         };
+        creditRow.Controls.AddRange(new WinForms.Control[] { robotIcon, copilotLabel });
 
-        aboutDialog.Controls.AddRange(new WinForms.Control[]
+        // Borderless window needs manual drag support via the card's empty background.
+        bool dragging = false;
+        Drawing.Point dragCursor = Drawing.Point.Empty;
+        Drawing.Point dragForm = Drawing.Point.Empty;
+        card.MouseDown += (s, e) =>
         {
-            pinIcon, titleLabel, versionLabel, pipeLbl, githubLink,
-            separator1, descriptionLabel,
-            featuresLabel, feature1, feature2, feature3, feature4, feature5,
+            dragging = true;
+            dragCursor = WinForms.Cursor.Position;
+            dragForm = aboutDialog.Location;
+        };
+        card.MouseMove += (s, e) =>
+        {
+            if (!dragging) return;
+            var diff = Drawing.Point.Subtract(WinForms.Cursor.Position, new Drawing.Size(dragCursor));
+            aboutDialog.Location = Drawing.Point.Add(dragForm, new Drawing.Size(diff));
+        };
+        card.MouseUp += (s, e) => dragging = false;
+
+        card.Controls.AddRange(new WinForms.Control[]
+        {
+            pinIcon,
+            titleLabel,
+            metaRow,
+            separator1,
+            descriptionLabel,
+            featuresLabel,
+            feature1, feature2, feature3, feature4, feature5,
             separator2,
-            authorsHeaderLbl, authorNamesLbl, licenseLink,
+            authorsHeaderLbl,
+            authorNamesLbl,
+            licenseLink,
             separator3,
-            robotIcon, copilotLabel
+            creditRow,
+            closeButton
         });
 
+        aboutDialog.Controls.Add(card);
         aboutDialog.ShowDialog();
     }
 
