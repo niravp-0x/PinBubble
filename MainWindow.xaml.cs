@@ -376,6 +376,9 @@ public partial class MainWindow : Window
     // Quick Enter: auto-paste into previously focused window after QWERTY pick
     private bool _quickEnterEnabled = false;
 
+    // TOTP copy behavior: when true, copy value + TOTP code together
+    private bool _copyTotpTogether = true;
+
     // Shortcut hotkey state
     private string _shortcutsFilePath = string.Empty;
     private List<ShortcutEntry> _shortcuts = new();
@@ -405,6 +408,8 @@ public partial class MainWindow : Window
         public int ClipboardClearSeconds { get; set; } = 0;
         // When true, QWERTY picker auto-pastes into the previously focused window
         public bool QuickEnterEnabled { get; set; } = false;
+        // When true, copying a snippet with TOTP will copy both value and TOTP code together
+        public bool CopyTotpTogether { get; set; } = true;
     }
 
     public MainWindow()
@@ -437,6 +442,7 @@ public partial class MainWindow : Window
         UpdateBiometricUi();
         DarkThemeMenuItem.IsChecked = _isDarkTheme;
         QuickEnterMenuItem.IsChecked = _quickEnterEnabled;
+        CopyTotpTogetherMenuItem.IsChecked = _copyTotpTogether;
         
         // Ensure window topmost behavior follows saved pin state.
         Topmost = _isPinned;
@@ -1054,13 +1060,14 @@ public partial class MainWindow : Window
                 ? $"{fullLbl}\n\nShortcut: {sc}"
                 : fullLbl;
             
-            // Add TOTP info if configured
+            // Add TOTP info if configured with improved formatting
             if (i < _snippetRows.Length && !string.IsNullOrWhiteSpace(_snippetRows[i].TotpSecret))
             {
                 var totpInfo = _snippetRows[i].TotpWithExpiry;
                 if (totpInfo.HasValue)
                 {
-                    tipText += $"\n\nTOTP: {totpInfo.Value.Code} ({totpInfo.Value.RemainingSeconds}s)";
+                    var progress = (int)((30 - totpInfo.Value.RemainingSeconds) / 30.0 * 100);
+                    tipText += $"\n━━━━━━━━━━━━━━━━━━\n🔐 TOTP: {totpInfo.Value.Code}\n⏱ Expires in {totpInfo.Value.RemainingSeconds}s [{'█'} {progress}%]";
                 }
             }
 
@@ -1115,7 +1122,8 @@ public partial class MainWindow : Window
         {
             try
             {
-                CopySnippetToClipboard(_snippets[idx]);
+                var snippetRow = idx < _snippetRows.Length ? _snippetRows[idx] : null;
+                CopySnippetToClipboard(_snippets[idx], snippetRow);
                 b.Background = BubbleClicked;
                 await Task.Delay(150);
                 b.Background = new SolidColorBrush(_isDarkTheme ? BubbleDefaultColorDark : BubbleDefaultColorLight);
@@ -1444,7 +1452,8 @@ public partial class MainWindow : Window
 
         try
         {
-            CopySnippetToClipboard(_snippets[snippetIdx]);
+            var snippetRow = snippetIdx < _snippetRows.Length ? _snippetRows[snippetIdx] : null;
+            CopySnippetToClipboard(_snippets[snippetIdx], snippetRow);
         }
         catch { }
 
@@ -2014,7 +2023,10 @@ public partial class MainWindow : Window
         {
             try
             {
-                CopySnippetToClipboard(copiedSnippet);
+                // Find the index of the snippet to get its SnippetRow for TOTP
+                int snippetIdx = Array.IndexOf(_snippets, copiedSnippet);
+                var snippetRow = snippetIdx >= 0 && snippetIdx < _snippetRows.Length ? _snippetRows[snippetIdx] : null;
+                CopySnippetToClipboard(copiedSnippet, snippetRow);
             }
             catch { }
         }
@@ -2762,8 +2774,49 @@ public partial class MainWindow : Window
                     grid.InvalidateCell(3, ev.RowIndex);
                 }
             }
-            // TOTP column - manage TOTP secret
+            // TOTP column - copy TOTP or manage TOTP secret
             else if (ev.ColumnIndex == 4 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count - 1)
+            {
+                var row = grid.Rows[ev.RowIndex];
+                if (row.Tag is SnippetRow snippetRow && !string.IsNullOrWhiteSpace(snippetRow.TotpSecret))
+                {
+                    // Check if Control key is held
+                    bool ctrlHeld = (WinForms.Control.ModifierKeys & WinForms.Keys.Control) != 0;
+                    
+                    if (ctrlHeld)
+                    {
+                        // Ctrl+Click: Copy password + TOTP together
+                        var password = snippetRow.ActualValue;
+                        var totp = snippetRow.CurrentTotp;
+                        if (!string.IsNullOrWhiteSpace(totp))
+                        {
+                            var textToCopy = $"{password}{totp}";
+                            if (!TrySetClipboardWithoutHistory(textToCopy))
+                                System.Windows.Clipboard.SetText(textToCopy);
+                            
+                            WinForms.MessageBox.Show("Password + TOTP copied to clipboard.", "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Information);
+                        }
+                    }
+                    else
+                    {
+                        // Single click: Copy just TOTP code
+                        var totp = snippetRow.CurrentTotp;
+                        if (!string.IsNullOrWhiteSpace(totp))
+                        {
+                            if (!TrySetClipboardWithoutHistory(totp))
+                                System.Windows.Clipboard.SetText(totp);
+                            
+                            WinForms.MessageBox.Show("TOTP copied to clipboard.", "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Information);
+                        }
+                    }
+                }
+            }
+        };
+
+        // Handle right-click on TOTP column to edit/manage TOTP secret
+        grid.CellMouseDown += (s, ev) =>
+        {
+            if (ev.Button == WinForms.MouseButtons.Right && ev.ColumnIndex == 4 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count - 1)
             {
                 var row = grid.Rows[ev.RowIndex];
                 if (row.Tag is SnippetRow snippetRow)
@@ -3358,6 +3411,7 @@ public partial class MainWindow : Window
                 _savedMonitorDeviceName = settings.MonitorDeviceName;
                 _clipboardClearSeconds = settings.ClipboardClearSeconds;
                 _quickEnterEnabled = settings.QuickEnterEnabled;
+                _copyTotpTogether = settings.CopyTotpTogether;
             }
         }
         catch
@@ -3391,7 +3445,8 @@ public partial class MainWindow : Window
                 WindowTop = Top,
                 MonitorDeviceName = currentScreen.DeviceName,
                 ClipboardClearSeconds = _clipboardClearSeconds,
-                QuickEnterEnabled = _quickEnterEnabled
+                QuickEnterEnabled = _quickEnterEnabled,
+                CopyTotpTogether = _copyTotpTogether
             };
             var json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(_settingsFilePath, json);
@@ -3404,12 +3459,23 @@ public partial class MainWindow : Window
 
     // ── Clipboard auto-clear ────────────────────────────────────────────────
 
-    private void CopySnippetToClipboard(string text)
+    private void CopySnippetToClipboard(string text, SnippetRow? snippetRow = null)
     {
-        if (!TrySetClipboardWithoutHistory(text))
-            System.Windows.Clipboard.SetText(text);
+        // If snippet has TOTP and config says to copy together, append TOTP to text
+        var textToCopy = text;
+        if (_copyTotpTogether && snippetRow != null && !string.IsNullOrWhiteSpace(snippetRow.TotpSecret))
+        {
+            var totpCode = snippetRow.CurrentTotp;
+            if (!string.IsNullOrWhiteSpace(totpCode))
+            {
+                textToCopy = $"{text}{totpCode}";
+            }
+        }
 
-        ScheduleClipboardClear(text);
+        if (!TrySetClipboardWithoutHistory(textToCopy))
+            System.Windows.Clipboard.SetText(textToCopy);
+
+        ScheduleClipboardClear(textToCopy);
     }
 
     private static bool TrySetClipboardWithoutHistory(string text)
@@ -3483,6 +3549,13 @@ public partial class MainWindow : Window
         ClearClip30MenuItem.IsChecked       = _clipboardClearSeconds == 30;
         ClearClip60MenuItem.IsChecked       = _clipboardClearSeconds == 60;
         ClearClip120MenuItem.IsChecked      = _clipboardClearSeconds == 120;
+    }
+
+    private void CopyTotpTogether_Click(object sender, RoutedEventArgs e)
+    {
+        _copyTotpTogether = !_copyTotpTogether;
+        CopyTotpTogetherMenuItem.IsChecked = _copyTotpTogether;
+        SaveUiSettings();
     }
 
     private void Window_StateChanged(object? sender, EventArgs e)
