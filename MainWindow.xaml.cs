@@ -176,6 +176,7 @@ public partial class MainWindow : Window
     private const bool DefaultIsPinned = true;
     private const bool DefaultIsDarkTheme = true;
     private const bool DefaultShowInTaskbar = true;
+    private const int DefaultClipboardClearSeconds = 60;
 
     // Hotkey constants
     private const int WmHotkey = 0x0312;
@@ -371,7 +372,7 @@ public partial class MainWindow : Window
     private double? _preExpandWindowTop;
 
     // Clipboard clear setting (0 = disabled)
-    private int _clipboardClearSeconds = 0;
+    private int _clipboardClearSeconds = DefaultClipboardClearSeconds;
 
     // Quick Enter: auto-paste into previously focused window after QWERTY pick
     private bool _quickEnterEnabled = false;
@@ -412,7 +413,7 @@ public partial class MainWindow : Window
         public double? WindowTop { get; set; }
         public string? MonitorDeviceName { get; set; }
         // 0 = disabled; 30 / 60 / 120 = clear after N seconds
-        public int ClipboardClearSeconds { get; set; } = 60;
+        public int ClipboardClearSeconds { get; set; } = DefaultClipboardClearSeconds;
         // When true, QWERTY picker auto-pastes into the previously focused window
         public bool QuickEnterEnabled { get; set; } = false;
         // When true, copying a snippet with TOTP will copy both value and TOTP code together
@@ -3376,6 +3377,7 @@ public partial class MainWindow : Window
         _isDarkTheme = DefaultIsDarkTheme;
         ShowInTaskbar = DefaultShowInTaskbar;
         _quickEnterEnabled = false;
+        _clipboardClearSeconds = DefaultClipboardClearSeconds;
 
         Topmost = _isPinned;
         DarkThemeMenuItem.IsChecked = _isDarkTheme;
@@ -3385,6 +3387,7 @@ public partial class MainWindow : Window
         UpdateBackdropOpacityMenuChecks();
         UpdatePinMenuText();
         UpdateTaskbarMenuText();
+        UpdateClearClipMenuChecks();
         SaveUiSettings();
     }
 
