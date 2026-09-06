@@ -1677,6 +1677,83 @@ public partial class MainWindow : Window
             btnSave.Visible = true;
         }
 
+        // Tooltip label for shortcut column hover
+        var tooltipLabel = new WinForms.Label
+        {
+            Visible = false,
+            AutoSize = true,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(48, 48, 55) : Drawing.Color.FromArgb(255, 255, 255),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.FromArgb(30, 30, 35),
+            BorderStyle = WinForms.BorderStyle.FixedSingle,
+            Font = new Drawing.Font("Segoe UI", 9f),
+            Padding = new WinForms.Padding(6, 4, 6, 4),
+            Text = "Right-click to edit shortcut key",
+            Anchor = WinForms.AnchorStyles.None
+        };
+        dlg.Controls.Add(tooltipLabel);
+        tooltipLabel.BringToFront();
+
+        var tooltipTimer = new System.Windows.Forms.Timer { Interval = 2000 };
+        var hideTooltipTimer = new System.Windows.Forms.Timer { Interval = 2000 };
+        var currentHitItem = (WinForms.ListViewItem?)null;
+        var lastMousePos = Drawing.Point.Empty;
+
+        list.MouseMove += (_, mouseArgs) =>
+        {
+            var hit = list.HitTest(mouseArgs.Location);
+            lastMousePos = mouseArgs.Location;
+            
+            if (hit.Item is null || hit.SubItem is null || hit.Item.SubItems.IndexOf(hit.SubItem) != 0)
+            {
+                tooltipTimer.Stop();
+                hideTooltipTimer.Stop();
+                tooltipLabel.Visible = false;
+                currentHitItem = null;
+                return;
+            }
+
+            // Only start timer if hovering over a different item
+            if (!ReferenceEquals(currentHitItem, hit.Item))
+            {
+                tooltipTimer.Stop();
+                hideTooltipTimer.Stop();
+                tooltipLabel.Visible = false;
+                currentHitItem = hit.Item;
+                tooltipTimer.Start();
+            }
+
+            // Update tooltip position while visible
+            if (tooltipLabel.Visible)
+            {
+                var tooltipX = Math.Max(0, lastMousePos.X + 10);
+                var tooltipY = Math.Max(0, lastMousePos.Y + 15);
+                tooltipLabel.Location = new Drawing.Point(tooltipX, tooltipY);
+            }
+        };
+        tooltipTimer.Tick += (_, _) =>
+        {
+            tooltipTimer.Stop();
+            tooltipLabel.Visible = true;
+            // Position tooltip below cursor when it appears
+            var tooltipX = Math.Max(0, lastMousePos.X + 10);
+            var tooltipY = Math.Max(0, lastMousePos.Y + 15);
+            tooltipLabel.Location = new Drawing.Point(tooltipX, tooltipY);
+            // Start hide timer - tooltip will be visible for 2 seconds
+            hideTooltipTimer.Start();
+        };
+        hideTooltipTimer.Tick += (_, _) =>
+        {
+            hideTooltipTimer.Stop();
+            tooltipLabel.Visible = false;
+        };
+        list.MouseLeave += (_, _) =>
+        {
+            tooltipTimer.Stop();
+            hideTooltipTimer.Stop();
+            tooltipLabel.Visible = false;
+            currentHitItem = null;
+        };
+
         list.MouseUp += (_, mouseArgs) =>
         {
             if (mouseArgs.Button != WinForms.MouseButtons.Right)
@@ -2848,6 +2925,15 @@ public partial class MainWindow : Window
                     row.Cells[ev.ColumnIndex].ToolTipText = tooltipText;
                 }
             }
+            // Set tooltip on TOTP column (4) for right-click hint
+            else if (ev.ColumnIndex == 4 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count)
+            {
+                var row = grid.Rows[ev.RowIndex];
+                if (!row.IsNewRow && row.Tag is SnippetRow snippetRow && !string.IsNullOrWhiteSpace(snippetRow.TotpSecret))
+                {
+                    row.Cells[4].ToolTipText = "Right-click to edit TOTP secret";
+                }
+            }
             
             if ((ev.ColumnIndex == 0 || ev.ColumnIndex == 3 || ev.ColumnIndex == 4) && ev.RowIndex >= 0)
             {
@@ -3161,7 +3247,43 @@ public partial class MainWindow : Window
                     grid.InvalidateCell(3, ev.RowIndex);
                 }
             }
-            // TOTP column - copy TOTP or manage TOTP secret
+            // Value column (column 2) - copy value with blink highlight
+            else if (ev.ColumnIndex == 2 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count - 1)
+            {
+                var row = grid.Rows[ev.RowIndex];
+                if (row.Tag is SnippetRow snippetRow)
+                {
+                    var value = snippetRow.ActualValue;
+                    if (string.IsNullOrWhiteSpace(value)) return;
+
+                    if (!TrySetClipboardWithoutHistory(value))
+                        System.Windows.Clipboard.SetText(value);
+
+                    // Clear any row selection to prevent whole row highlighting
+                    grid.ClearSelection();
+
+                    // Blink effect: briefly highlight the value cell with background color
+                    var originalBackColor = row.Cells[2].Style.BackColor;
+                    var highlightColor = _isDarkTheme ? Drawing.Color.FromArgb(60, 120, 80) : Drawing.Color.FromArgb(180, 220, 180);
+                    row.Cells[2].Style.BackColor = highlightColor;
+
+                    if (btnDecryptAll.Text == "Show All")
+                    {
+                        btnDecryptAll.Visible = false;
+                        btnDecryptAll.Enabled = false;
+                    }
+
+                    var blinkTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+                    blinkTimer.Tick += (_, _) =>
+                    {
+                        blinkTimer.Stop();
+                        blinkTimer.Dispose();
+                        row.Cells[2].Style.BackColor = originalBackColor;
+                    };
+                    blinkTimer.Start();
+                }
+            }
+            // TOTP column - copy TOTP or manage TOTP secret with blink highlight
             else if (ev.ColumnIndex == 4 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count - 1)
             {
                 var row = grid.Rows[ev.RowIndex];
@@ -3171,16 +3293,23 @@ public partial class MainWindow : Window
                     var totp = snippetRow.CurrentTotp;
                     if (string.IsNullOrWhiteSpace(totp)) return;
 
+                    var highlightColor = _isDarkTheme ? Drawing.Color.FromArgb(60, 120, 80) : Drawing.Color.FromArgb(180, 220, 180);
+                    var blinkDuration = 1000;
+
+                    // Clear any row selection to prevent whole row highlighting
+                    grid.ClearSelection();
+
                     if (ctrlHeld)
                     {
                         var textToCopy = $"{snippetRow.ActualValue}{totp}";
                         if (!TrySetClipboardWithoutHistory(textToCopy))
                             System.Windows.Clipboard.SetText(textToCopy);
 
-                        row.Cells[2].Selected = true;
-                        row.Cells[4].Selected = true;
-                        grid.CurrentCell = row.Cells[2];
-                        grid.Invalidate();
+                        // Blink effect: highlight only value (2) and TOTP (4) cells, NOT label (1)
+                        var originalBackColor2 = row.Cells[2].Style.BackColor;
+                        var originalBackColor4 = row.Cells[4].Style.BackColor;
+                        row.Cells[2].Style.BackColor = highlightColor;
+                        row.Cells[4].Style.BackColor = highlightColor;
 
                         if (btnDecryptAll.Text == "Show All")
                         {
@@ -3188,23 +3317,24 @@ public partial class MainWindow : Window
                             btnDecryptAll.Enabled = false;
                         }
 
-                        var copyTimer = new System.Windows.Forms.Timer { Interval = 350 };
-                        copyTimer.Tick += (_, _) =>
+                        var blinkTimer = new System.Windows.Forms.Timer { Interval = blinkDuration };
+                        blinkTimer.Tick += (_, _) =>
                         {
-                            copyTimer.Stop();
-                            copyTimer.Dispose();
-                            grid.ClearSelection();
+                            blinkTimer.Stop();
+                            blinkTimer.Dispose();
+                            row.Cells[2].Style.BackColor = originalBackColor2;
+                            row.Cells[4].Style.BackColor = originalBackColor4;
                         };
-                        copyTimer.Start();
+                        blinkTimer.Start();
                     }
                     else
                     {
                         if (!TrySetClipboardWithoutHistory(totp))
                             System.Windows.Clipboard.SetText(totp);
 
-                        row.Cells[4].Selected = true;
-                        grid.CurrentCell = row.Cells[4];
-                        grid.Invalidate();
+                        // Blink effect: briefly highlight only the TOTP cell
+                        var originalBackColor = row.Cells[4].Style.BackColor;
+                        row.Cells[4].Style.BackColor = highlightColor;
 
                         if (btnDecryptAll.Text == "Show All")
                         {
@@ -3212,14 +3342,14 @@ public partial class MainWindow : Window
                             btnDecryptAll.Enabled = false;
                         }
 
-                        var copyTimer = new System.Windows.Forms.Timer { Interval = 350 };
-                        copyTimer.Tick += (_, _) =>
+                        var blinkTimer = new System.Windows.Forms.Timer { Interval = blinkDuration };
+                        blinkTimer.Tick += (_, _) =>
                         {
-                            copyTimer.Stop();
-                            copyTimer.Dispose();
-                            grid.ClearSelection();
+                            blinkTimer.Stop();
+                            blinkTimer.Dispose();
+                            row.Cells[4].Style.BackColor = originalBackColor;
                         };
-                        copyTimer.Start();
+                        blinkTimer.Start();
                     }
                 }
             }
