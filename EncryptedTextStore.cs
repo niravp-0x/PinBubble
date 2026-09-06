@@ -86,4 +86,48 @@ internal static class EncryptedTextStore
             return false;
         }
     }
+
+    public static bool TryChangePassword(string filePath, string currentPassword, string newPassword, out string error)
+    {
+        error = string.Empty;
+
+        if (!TryDecrypt(filePath, currentPassword, out var plaintext))
+        {
+            error = "The current vault could not be decrypted.";
+            return false;
+        }
+
+        var temporaryPath = filePath + "." + Guid.NewGuid().ToString("N") + ".tmp";
+        try
+        {
+            EncryptAndSave(temporaryPath, newPassword, plaintext);
+
+            if (!TryDecrypt(temporaryPath, newPassword, out var verifiedPlaintext)
+                || !string.Equals(plaintext, verifiedPlaintext, StringComparison.Ordinal))
+            {
+                error = "The new vault could not be verified.";
+                return false;
+            }
+
+            File.Replace(temporaryPath, filePath, destinationBackupFileName: null, ignoreMetadataErrors: true);
+            return true;
+        }
+        catch
+        {
+            error = "The vault could not be replaced safely. The existing vault was left unchanged.";
+            return false;
+        }
+        finally
+        {
+            try
+            {
+                if (File.Exists(temporaryPath))
+                    File.Delete(temporaryPath);
+            }
+            catch
+            {
+                // Best effort cleanup; the temporary file contains encrypted data only.
+            }
+        }
+    }
 }

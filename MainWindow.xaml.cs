@@ -898,6 +898,161 @@ public partial class MainWindow : Window
         return dialog.ShowDialog() == WinForms.DialogResult.OK ? textBox.Text : null;
     }
 
+    private static string? PromptForNewMasterPassword()
+    {
+        using var dialog = new WinForms.Form
+        {
+            Width = 420,
+            Height = 300,
+            FormBorderStyle = WinForms.FormBorderStyle.None,
+            StartPosition = WinForms.FormStartPosition.CenterScreen,
+            BackColor = Drawing.Color.FromArgb(30, 30, 35),
+            MaximizeBox = false,
+            MinimizeBox = false,
+            ShowInTaskbar = false,
+            TopMost = true,
+            KeyPreview = true
+        };
+
+        dialog.Paint += (_, paintArgs) =>
+        {
+            using var pen = new Drawing.Pen(Drawing.Color.FromArgb(70, 70, 75), 1);
+            paintArgs.Graphics.DrawRectangle(pen, 0, 0, dialog.Width - 1, dialog.Height - 1);
+        };
+
+        var titleLabel = new WinForms.Label
+        {
+            Left = 20,
+            Top = 15,
+            Width = 380,
+            Height = 25,
+            Text = "CHANGE MASTER PASSWORD",
+            ForeColor = Drawing.Color.FromArgb(220, 220, 225),
+            Font = new Drawing.Font("Segoe UI", 10.5f, Drawing.FontStyle.Bold)
+        };
+
+        var instructionLabel = new WinForms.Label
+        {
+            Left = 20,
+            Top = 48,
+            Width = 380,
+            Height = 22,
+            Text = "Create a new password for this vault",
+            ForeColor = Drawing.Color.FromArgb(160, 160, 165),
+            Font = new Drawing.Font("Segoe UI", 9f)
+        };
+
+        var newPasswordLabel = new WinForms.Label
+        {
+            Left = 20,
+            Top = 78,
+            Width = 160,
+            Height = 20,
+            Text = "New password",
+            ForeColor = Drawing.Color.FromArgb(200, 200, 205),
+            Font = new Drawing.Font("Segoe UI", 9f)
+        };
+
+        var newPasswordBox = new WinForms.TextBox
+        {
+            Left = 20,
+            Top = 98,
+            Width = 380,
+            Height = 34,
+            UseSystemPasswordChar = true,
+            BackColor = Drawing.Color.FromArgb(45, 45, 50),
+            ForeColor = Drawing.Color.FromArgb(220, 220, 225),
+            BorderStyle = WinForms.BorderStyle.FixedSingle,
+            Font = new Drawing.Font("Segoe UI", 11f)
+        };
+
+        var confirmPasswordLabel = new WinForms.Label
+        {
+            Left = 20,
+            Top = 140,
+            Width = 180,
+            Height = 20,
+            Text = "Confirm new password",
+            ForeColor = Drawing.Color.FromArgb(200, 200, 205),
+            Font = new Drawing.Font("Segoe UI", 9f)
+        };
+
+        var confirmPasswordBox = new WinForms.TextBox
+        {
+            Left = 20,
+            Top = 160,
+            Width = 380,
+            Height = 34,
+            UseSystemPasswordChar = true,
+            BackColor = Drawing.Color.FromArgb(45, 45, 50),
+            ForeColor = Drawing.Color.FromArgb(220, 220, 225),
+            BorderStyle = WinForms.BorderStyle.FixedSingle,
+            Font = new Drawing.Font("Segoe UI", 11f)
+        };
+
+        var okButton = new WinForms.Button
+        {
+            Text = "CHANGE",
+            Left = 205,
+            Top = 220,
+            Width = 95,
+            Height = 38,
+            FlatStyle = WinForms.FlatStyle.Flat,
+            BackColor = Drawing.Color.FromArgb(0, 120, 212),
+            ForeColor = Drawing.Color.White,
+            Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
+            Cursor = WinForms.Cursors.Hand
+        };
+        okButton.FlatAppearance.BorderSize = 0;
+
+        var cancelButton = new WinForms.Button
+        {
+            Text = "CANCEL",
+            Left = 305,
+            Top = 220,
+            Width = 95,
+            Height = 38,
+            DialogResult = WinForms.DialogResult.Cancel,
+            FlatStyle = WinForms.FlatStyle.Flat,
+            BackColor = Drawing.Color.FromArgb(55, 55, 60),
+            ForeColor = Drawing.Color.FromArgb(200, 200, 205),
+            Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
+            Cursor = WinForms.Cursors.Hand
+        };
+        cancelButton.FlatAppearance.BorderSize = 0;
+
+        okButton.Click += (_, _) =>
+        {
+            if (newPasswordBox.Text.Length < 4)
+            {
+                WinForms.MessageBox.Show("Master password must be at least 4 characters.", "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (!string.Equals(newPasswordBox.Text, confirmPasswordBox.Text, StringComparison.Ordinal))
+            {
+                WinForms.MessageBox.Show("The passwords do not match.", "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Warning);
+                return;
+            }
+
+            dialog.DialogResult = WinForms.DialogResult.OK;
+        };
+
+        dialog.Controls.Add(titleLabel);
+        dialog.Controls.Add(instructionLabel);
+        dialog.Controls.Add(newPasswordLabel);
+        dialog.Controls.Add(newPasswordBox);
+        dialog.Controls.Add(confirmPasswordLabel);
+        dialog.Controls.Add(confirmPasswordBox);
+        dialog.Controls.Add(okButton);
+        dialog.Controls.Add(cancelButton);
+        dialog.AcceptButton = okButton;
+        dialog.CancelButton = cancelButton;
+
+        newPasswordBox.Select();
+        return dialog.ShowDialog() == WinForms.DialogResult.OK ? newPasswordBox.Text : null;
+    }
+
     private void SetupTrayIcon()
     {
         try
@@ -2982,6 +3137,16 @@ public partial class MainWindow : Window
                     row.Cells[ev.ColumnIndex].ToolTipText = tooltipText;
                 }
             }
+            // Set tooltip on Value column (2) for password generator hint
+            if (ev.ColumnIndex == 2 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count)
+            {
+                var row = grid.Rows[ev.RowIndex];
+                if (!row.IsNewRow && row.Tag is SnippetRow)
+                {
+                    row.Cells[2].ToolTipText = "Right-click to generate a custom random string";
+                }
+            }
+
             // Set tooltip on TOTP column (4) for right-click hint
             else if (ev.ColumnIndex == 4 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count)
             {
@@ -3411,6 +3576,49 @@ public partial class MainWindow : Window
                 }
             }
         };
+
+        // Helper function to generate a secure password
+        string GenerateSecurePassword(int length = 16)
+        {
+            const string uppercase = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+            const string lowercase = "abcdefghijklmnopqrstuvwxyz";
+            const string digits = "0123456789";
+            const string specialChars = "!@#$%^&*-_+="; // RHEL-safe characters
+            
+            var rng = new System.Random();
+            var password = new System.Text.StringBuilder();
+            
+            // Ensure at least one of each required character type
+            password.Append(uppercase[rng.Next(uppercase.Length)]);
+            password.Append(lowercase[rng.Next(lowercase.Length)]);
+            password.Append(digits[rng.Next(digits.Length)]);
+            password.Append(specialChars[rng.Next(specialChars.Length)]);
+            
+            // Fill the rest randomly
+            var allChars = uppercase + lowercase + digits + specialChars;
+            while (password.Length < length)
+            {
+                var nextChar = allChars[rng.Next(allChars.Length)];
+                
+                // Avoid repeating characters back-to-back
+                if (password.Length > 0 && password[password.Length - 1] != nextChar)
+                {
+                    password.Append(nextChar);
+                }
+            }
+            
+            // Shuffle to mix required chars with random ones
+            var shuffled = password.ToString().ToCharArray();
+            for (int i = shuffled.Length - 1; i > 0; i--)
+            {
+                int randomIndex = rng.Next(i + 1);
+                var temp = shuffled[i];
+                shuffled[i] = shuffled[randomIndex];
+                shuffled[randomIndex] = temp;
+            }
+            
+            return new string(shuffled);
+        }
 
         // Handle right-click on TOTP column to edit/manage TOTP secret
         grid.CellMouseDown += (s, ev) =>
@@ -3854,6 +4062,363 @@ public partial class MainWindow : Window
                     }
                 }
             }
+            else if (ev.Button == WinForms.MouseButtons.Right && ev.ColumnIndex == 2 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count - 1)
+            {
+                // Handle right-click on Value column to open password generator
+                var row = grid.Rows[ev.RowIndex];
+                if (row.Tag is SnippetRow snippetRow)
+                {
+                    var currentValue = snippetRow.ActualValue;
+                    var hasExistingValue = !string.IsNullOrWhiteSpace(currentValue);
+
+                    // Open password generator dialog - larger to accommodate slider
+                    using var genDialog = new WinForms.Form
+                    {
+                        ClientSize = new Drawing.Size(500, hasExistingValue ? 402 : 342),
+                        FormBorderStyle = WinForms.FormBorderStyle.None,
+                        StartPosition = WinForms.FormStartPosition.CenterParent,
+                        Text = "Password Generator",
+                        KeyPreview = true,
+                        ShowInTaskbar = false,
+                        TopMost = true,
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(38, 38, 44) : Drawing.Color.FromArgb(248, 249, 251)
+                    };
+
+                    // Apply rounded corners
+                    using (var genRegionPath = RoundedRectPath(new Drawing.Rectangle(0, 0, genDialog.Width - 1, genDialog.Height - 1), 18))
+                        genDialog.Region = new Drawing.Region(genRegionPath);
+                    genDialog.Paint += (_, pe) =>
+                    {
+                        pe.Graphics.SmoothingMode = Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                        using var path = RoundedRectPath(new Drawing.Rectangle(0, 0, genDialog.Width - 1, genDialog.Height - 1), 18);
+                        using var pen = new Drawing.Pen(_isDarkTheme ? Drawing.Color.FromArgb(72, 72, 82) : Drawing.Color.FromArgb(210, 214, 220), 1f);
+                        pe.Graphics.DrawPath(pen, path);
+                    };
+
+                    // Title label (for window dragging)
+                    var titleLabel = new WinForms.Label
+                    {
+                        Text = "Password Generator",
+                        Font = new Drawing.Font("Segoe UI", 12f, Drawing.FontStyle.Bold),
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.FromArgb(30, 32, 36),
+                        AutoSize = false,
+                        Left = 20,
+                        Top = 20,
+                        Width = 460,
+                        Height = 24,
+                        Cursor = WinForms.Cursors.Hand
+                    };
+
+                    var entryLabel = new WinForms.Label
+                    {
+                        Text = snippetRow.Label,
+                        Font = new Drawing.Font("Segoe UI", 10f, Drawing.FontStyle.Bold),
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(190, 190, 198) : Drawing.Color.FromArgb(65, 68, 76),
+                        AutoSize = true,
+                        Left = 20,
+                        Top = 50,
+                        Cursor = WinForms.Cursors.Hand
+                    };
+
+                    // Last modified label
+                    var modifiedLabel = new WinForms.Label
+                    {
+                        Text = $"Last modified: {snippetRow.Modified:G}",
+                        Font = new Drawing.Font("Segoe UI", 8f),
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(155, 155, 165) : Drawing.Color.FromArgb(95, 100, 108),
+                        AutoSize = true,
+                        Left = 20,
+                        Top = 72
+                    };
+
+                    // Enable window dragging from title label
+                    bool genDragging = false;
+                    Drawing.Point genDragCursor = Drawing.Point.Empty;
+                    Drawing.Point genDragDialog = Drawing.Point.Empty;
+                    WinForms.MouseEventHandler dragMouseDown = (_, mouseArgs) =>
+                    {
+                        if (mouseArgs.Button != WinForms.MouseButtons.Left) return;
+                        genDragging = true;
+                        genDragCursor = WinForms.Cursor.Position;
+                        genDragDialog = genDialog.Location;
+                    };
+                    WinForms.MouseEventHandler dragMouseMove = (_, _) =>
+                    {
+                        if (!genDragging) return;
+                        var diff = Drawing.Point.Subtract(WinForms.Cursor.Position, new Drawing.Size(genDragCursor));
+                        genDialog.Location = Drawing.Point.Add(genDragDialog, new Drawing.Size(diff));
+                    };
+                    WinForms.MouseEventHandler dragMouseUp = (_, _) => genDragging = false;
+                    titleLabel.MouseDown += dragMouseDown;
+                    titleLabel.MouseMove += dragMouseMove;
+                    titleLabel.MouseUp += dragMouseUp;
+                    modifiedLabel.MouseDown += dragMouseDown;
+                    modifiedLabel.MouseMove += dragMouseMove;
+                    modifiedLabel.MouseUp += dragMouseUp;
+                    entryLabel.MouseDown += dragMouseDown;
+                    entryLabel.MouseMove += dragMouseMove;
+                    entryLabel.MouseUp += dragMouseUp;
+                    genDialog.MouseDown += dragMouseDown;
+                    genDialog.MouseMove += dragMouseMove;
+                    genDialog.MouseUp += dragMouseUp;
+                    genDialog.KeyDown += (_, keyArgs) =>
+                    {
+                        if (keyArgs.KeyCode != WinForms.Keys.Escape) return;
+                        keyArgs.Handled = true;
+                        genDialog.DialogResult = WinForms.DialogResult.Cancel;
+                    };
+
+                    // Password length control (default 16, range 16-32)
+                    var selectedLength = 16;
+
+                    // If there's an existing value, show it with eye toggle
+                    WinForms.TextBox? existingValueBox = null;
+                    WinForms.Button? toggleEyeBtn = null;
+                    var showingExistingValue = false;
+
+                    if (hasExistingValue)
+                    {
+                        var existingLabel = new WinForms.Label
+                        {
+                            Text = $"Current Value ({currentValue.Length} chars):",
+                            Font = new Drawing.Font("Segoe UI", 10f),
+                            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(155, 155, 165) : Drawing.Color.FromArgb(95, 100, 108),
+                            AutoSize = true,
+                            Left = 20,
+                            Top = 92
+                        };
+                        genDialog.Controls.Add(existingLabel);
+
+                        existingValueBox = new WinForms.TextBox
+                        {
+                            Text = "••••••••",
+                            ReadOnly = true,
+                            Left = 20,
+                            Top = 117,
+                            Width = 412,
+                            Height = 35,
+                            Font = new Drawing.Font("Consolas", 10f),
+                            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 52) : Drawing.Color.FromArgb(244, 245, 247),
+                            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
+                            BorderStyle = WinForms.BorderStyle.FixedSingle
+                        };
+                        genDialog.Controls.Add(existingValueBox);
+
+                        toggleEyeBtn = new WinForms.Button
+                        {
+                            Text = "👁",
+                            Left = 440,
+                            Top = 117,
+                            Width = 40,
+                            Height = 35,
+                            Font = new Drawing.Font("Segoe UI Emoji", 12f),
+                            FlatStyle = WinForms.FlatStyle.Flat,
+                            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(60, 60, 68) : Drawing.Color.FromArgb(225, 226, 230),
+                            ForeColor = _isDarkTheme ? Drawing.Color.White : Drawing.Color.FromArgb(40, 40, 40),
+                            Cursor = WinForms.Cursors.Hand
+                        };
+                        toggleEyeBtn.FlatAppearance.BorderSize = 0;
+                        toggleEyeBtn.Click += (_, _) =>
+                        {
+                            showingExistingValue = !showingExistingValue;
+                            if (existingValueBox != null)
+                                existingValueBox.Text = showingExistingValue ? currentValue : "••••••••";
+                        };
+                        genDialog.Controls.Add(toggleEyeBtn);
+                    }
+
+                    // Generated value label and textbox
+                    var genLabel = new WinForms.Label
+                    {
+                        Text = hasExistingValue ? "Generated Value:" : "New Value:",
+                        Font = new Drawing.Font("Segoe UI", 10f),
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(155, 155, 165) : Drawing.Color.FromArgb(95, 100, 108),
+                        AutoSize = true,
+                        Left = 20,
+                        Top = hasExistingValue ? 167 : 92
+                    };
+                    genDialog.Controls.Add(genLabel);
+
+                    var generatedValue = GenerateSecurePassword(selectedLength);
+                    var genValueBox = new WinForms.TextBox
+                    {
+                        Text = generatedValue,
+                        ReadOnly = true,
+                        Left = 20,
+                        Top = hasExistingValue ? 192 : 117,
+                        Width = 460,
+                        Height = 35,
+                        Font = new Drawing.Font("Consolas", 10f),
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 52) : Drawing.Color.FromArgb(244, 245, 247),
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(0, 180, 0) : Drawing.Color.FromArgb(0, 120, 0),
+                        BorderStyle = WinForms.BorderStyle.FixedSingle
+                    };
+                    genDialog.Controls.Add(genValueBox);
+
+                    // Password length slider (positioned under generated value)
+                    var lengthLabel = new WinForms.Label
+                    {
+                        Text = "Length:",
+                        Font = new Drawing.Font("Segoe UI", 9f),
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(155, 155, 165) : Drawing.Color.FromArgb(95, 100, 108),
+                        AutoSize = true,
+                        Left = 20,
+                        Top = hasExistingValue ? 237 : 162
+                    };
+                    genDialog.Controls.Add(lengthLabel);
+
+                    var lengthSlider = new WinForms.TrackBar
+                    {
+                        Left = 80,
+                        Top = hasExistingValue ? 232 : 157,
+                        Width = 350,
+                        Height = 30,
+                        Minimum = 16,
+                        Maximum = 32,
+                        Value = 16,
+                        TickFrequency = 1,
+                        TickStyle = WinForms.TickStyle.BottomRight,
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(38, 38, 44) : Drawing.Color.FromArgb(248, 249, 251)
+                    };
+                    genDialog.Controls.Add(lengthSlider);
+
+                    var lengthValueLabel = new WinForms.Label
+                    {
+                        Text = "16",
+                        Font = new Drawing.Font("Segoe UI", 10f, Drawing.FontStyle.Bold),
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(0, 180, 0) : Drawing.Color.FromArgb(0, 120, 0),
+                        AutoSize = true,
+                        Left = 440,
+                        Top = hasExistingValue ? 235 : 160
+                    };
+                    genDialog.Controls.Add(lengthValueLabel);
+
+                    lengthSlider.ValueChanged += (_, _) =>
+                    {
+                        selectedLength = lengthSlider.Value;
+                        lengthValueLabel.Text = selectedLength.ToString();
+                        genValueBox.Text = GenerateSecurePassword(selectedLength);
+                    };
+
+                    // Regenerate button
+                    var regenBtn = new WinForms.Button
+                    {
+                        Text = "↻ Regenerate",
+                        Left = 20,
+                        Top = hasExistingValue ? 277 : 202,
+                        Width = 460,
+                        Height = 35,
+                        Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
+                        FlatStyle = WinForms.FlatStyle.Flat,
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(60, 60, 68) : Drawing.Color.FromArgb(225, 226, 230),
+                        ForeColor = _isDarkTheme ? Drawing.Color.White : Drawing.Color.FromArgb(40, 40, 40),
+                        Cursor = WinForms.Cursors.Hand
+                    };
+                    regenBtn.FlatAppearance.BorderSize = 0;
+                    regenBtn.Click += (_, _) =>
+                    {
+                        genValueBox.Text = GenerateSecurePassword(selectedLength);
+                    };
+                    genDialog.Controls.Add(regenBtn);
+
+                    // Accept button
+                    var acceptBtn = new WinForms.Button
+                    {
+                        Text = hasExistingValue ? "Use Generated" : "Use Value",
+                        Left = 20,
+                        Top = hasExistingValue ? 327 : 252,
+                        Width = 225,
+                        Height = 40,
+                        Font = new Drawing.Font("Segoe UI", 10f, Drawing.FontStyle.Bold),
+                        FlatStyle = WinForms.FlatStyle.Flat,
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(0, 120, 80) : Drawing.Color.FromArgb(0, 145, 90),
+                        ForeColor = Drawing.Color.White,
+                        DialogResult = WinForms.DialogResult.OK,
+                        Cursor = WinForms.Cursors.Hand
+                    };
+                    acceptBtn.FlatAppearance.BorderSize = 0;
+                    
+                    // Handle Ctrl+Click for save + copy to clipboard
+                    acceptBtn.Click += (_, _) =>
+                    {
+                        // Check if Ctrl key is pressed during click
+                        if ((WinForms.Control.ModifierKeys & WinForms.Keys.Control) == WinForms.Keys.Control)
+                        {
+                            // Copy the generated password to clipboard
+                            try
+                            {
+                                WinForms.Clipboard.SetText(genValueBox.Text);
+                                
+                                // Show tooltip/hint about clipboard copy
+                                var copiedHint = new WinForms.ToolTip();
+                                copiedHint.Show("Password copied to clipboard! Will auto-clear if configured.", acceptBtn, 0, -40, 2000);
+                            }
+                            catch (Exception ex)
+                            {
+                                WinForms.MessageBox.Show($"Failed to copy to clipboard: {ex.Message}", "Copy Error", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Error);
+                            }
+                        }
+                    };
+                    
+                    genDialog.Controls.Add(acceptBtn);
+
+                    // Cancel button
+                    var cancelBtn = new WinForms.Button
+                    {
+                        Text = "Cancel",
+                        Left = 255,
+                        Top = hasExistingValue ? 327 : 252,
+                        Width = 225,
+                        Height = 40,
+                        Font = new Drawing.Font("Segoe UI", 10f, Drawing.FontStyle.Bold),
+                        FlatStyle = WinForms.FlatStyle.Flat,
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(60, 60, 68) : Drawing.Color.FromArgb(225, 226, 230),
+                        ForeColor = _isDarkTheme ? Drawing.Color.White : Drawing.Color.FromArgb(40, 40, 40),
+                        DialogResult = WinForms.DialogResult.Cancel,
+                        Cursor = WinForms.Cursors.Hand
+                    };
+                    cancelBtn.FlatAppearance.BorderSize = 0;
+                    genDialog.Controls.Add(cancelBtn);
+
+                    // Hint label for Ctrl+Click feature
+                    var hintLabel = new WinForms.Label
+                    {
+                        Text = "Ctrl+Click: Save + Copy",
+                        Font = new Drawing.Font("Segoe UI", 8f),
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(155, 155, 165) : Drawing.Color.FromArgb(95, 100, 108),
+                        AutoSize = true,
+                        Left = 20,
+                        Top = hasExistingValue ? 372 : 297
+                    };
+                    genDialog.Controls.Add(hintLabel);
+
+                    genDialog.Controls.Add(titleLabel);
+                    genDialog.Controls.Add(entryLabel);
+                    genDialog.Controls.Add(modifiedLabel);
+
+                    if (genDialog.ShowDialog() == WinForms.DialogResult.OK)
+                    {
+                        // Update the snippet value with generated password
+                        snippetRow.ActualValue = genValueBox.Text;
+                        snippetRow.IsEncrypted = false;
+                        grid.Rows[ev.RowIndex].Cells[2].Value = genValueBox.Text;
+                        hasChanges = true;
+                        btnSave.Visible = true;
+
+                        // Auto-save the snippets
+                        try
+                        {
+                            EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword!, BuildGridSaveJson(grid));
+                            hasChanges = false;
+                            btnSave.Visible = false;
+                        }
+                        catch
+                        {
+                            WinForms.MessageBox.Show("Failed to save generated password.", "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Error);
+                        }
+                    }
+                }
+            }
         };
 
         // Decrypt All button click handler
@@ -4236,6 +4801,67 @@ public partial class MainWindow : Window
     private void UpdateBiometricUi()
     {
         UpdateBiometricMenuText();
+    }
+
+    private void ChangeMasterPassword_Click(object sender, RoutedEventArgs e)
+    {
+        if (string.IsNullOrWhiteSpace(_masterPassword))
+        {
+            System.Windows.MessageBox.Show(
+                "Unlock the vault before changing its master password.",
+                "PinBubble",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+            return;
+        }
+
+        var newPassword = PromptForNewMasterPassword();
+        if (newPassword is null || string.Equals(newPassword, _masterPassword, StringComparison.Ordinal))
+            return;
+
+        var oldPassword = _masterPassword;
+        var biometricCacheEnabled = BiometricMasterPasswordStore.HasCachedPassword();
+
+        if (!EncryptedTextStore.TryChangePassword(_textFilePath, oldPassword, newPassword, out var error))
+        {
+            System.Windows.MessageBox.Show(
+                error,
+                "Master Password Not Changed",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+            return;
+        }
+
+        if (biometricCacheEnabled && !BiometricMasterPasswordStore.CachePassword(newPassword))
+        {
+            var rollbackSucceeded = EncryptedTextStore.TryChangePassword(_textFilePath, newPassword, oldPassword, out _);
+            if (rollbackSucceeded)
+            {
+                System.Windows.MessageBox.Show(
+                    "The biometric credential could not be updated, so the vault was safely left with its previous password.",
+                    "Master Password Not Changed",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+            }
+            else
+            {
+                System.Windows.MessageBox.Show(
+                    "The vault password changed, but the biometric credential could not be updated. Use the new password to unlock.",
+                    "PinBubble",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+            }
+
+            return;
+        }
+
+        _masterPassword = newPassword;
+        UpdateBiometricUi();
+        System.Windows.MessageBox.Show(
+            "Master password changed. Your vault contents and app settings were preserved.",
+            "PinBubble",
+            MessageBoxButton.OK,
+            MessageBoxImage.Information);
     }
 
     private void UpdateBiometricMenuText()
