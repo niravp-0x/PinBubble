@@ -23,6 +23,7 @@ A secure, lightweight Windows desktop application for storing and quickly access
 ### 📝 Snippet Management
 - **Visual Editor** - Modern DataGridView-based editor with dark/light theme support
 - **Encryption Toggle** - Show/hide individual snippets with eye icon
+- **TOTP Support** - Store TOTP secrets and copy either the code alone or value+TOTP together via Ctrl+click
 - **LED Status Indicator** - Visual feedback for encryption state:
   - 🟢 Green: All encrypted (secure)
   - 🔴 Red: Some visible (warning)
@@ -31,6 +32,7 @@ A secure, lightweight Windows desktop application for storing and quickly access
   - 🔴 Red: < 7 days remaining
   - 🟡 Yellow: 7-14 days remaining
   - 🔵 Blue: 15+ days (hover-only visibility)
+- **Configurable Defaults** - Set the default snippet expiry days in the app settings file
 - **Auto-Save with Live Preview** - Changes saved automatically on edit
 
 ### 🎨 User Experience
@@ -86,9 +88,10 @@ dotnet run
    - **Label**: Display name (uppercase letters/numbers shown on bubble, max 6 chars)
    - **Value**: The actual snippet text (shows `••••••••` when encrypted)
    - **Eye Icon**: Click to toggle encryption visibility
-3. Each new snippet automatically gets **30 days expiry** by default
-4. Changes auto-save on edit
-5. Click **Save** or close dialog to finalize
+3. Each new or updated snippet automatically gets the configured default expiry window
+4. Default expiry is stored in `%AppData%\PinBubble\settings.json` as `DefaultExpiryDays` and defaults to `30`
+5. Changes auto-save on edit
+6. Click **Save** or close dialog to finalize
 
 ### Using Snippets
 1. **Click the green bubble** to expand and show all snippet buttons
@@ -121,8 +124,11 @@ Right-click the bubble to access:
 - **Backdrop Opacity**: Choose 20%, 50%, or 80% transparency
 - **Pin to Top**: Toggle always-on-top behavior
 - **Show in Taskbar**: Toggle taskbar visibility
+- **Copy TOTP Together**: Toggle whether quick-copy includes the TOTP code with the value
 - **Biometric Settings**: Manage fingerprint unlock
 - **Exit**: Close application
+
+The app settings are stored in `%AppData%\PinBubble\settings.json`, including `DefaultExpiryDays`, `CopyTotpTogether`, and clipboard settings.
 
 ## 🗂️ Data Storage
 

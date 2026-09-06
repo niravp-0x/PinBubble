@@ -14,6 +14,7 @@ using System.Windows.Media;
 using System.Windows.Media.Effects;
 using Drawing = System.Drawing;
 using WinForms = System.Windows.Forms;
+using QRCoder;
 using WinClipboard = Windows.ApplicationModel.DataTransfer.Clipboard;
 using WinDataPackage = Windows.ApplicationModel.DataTransfer.DataPackage;
 using WinClipboardContentOptions = Windows.ApplicationModel.DataTransfer.ClipboardContentOptions;
@@ -35,6 +36,19 @@ class SnippetRow
     public DateTime Created { get; set; } = DateTime.Now;
     public DateTime Modified { get; set; } = DateTime.Now;
     public DateTime ExpiryDate { get; set; } = DateTime.Now.AddDays(30);
+    
+    // TOTP (Time-based One-Time Password) support
+    public string? TotpSecret { get; set; } // Base32-encoded TOTP secret from FreeIPA
+    
+    /// <summary>Gets the current TOTP code if a secret is configured</summary>
+    public string? CurrentTotp => TotpProvider.GetCurrentTotp(TotpSecret);
+    
+    /// <summary>Gets the current TOTP code with expiry info if a secret is configured</summary>
+    public (string Code, int RemainingSeconds)? TotpWithExpiry => TotpProvider.GetTotpWithExpiry(TotpSecret);
+    
+    /// <summary>Gets the provisioning URI for QR code generation</summary>
+    public string GetTotpProvisioningUri(string issuer = "PinBubble") => 
+        string.IsNullOrWhiteSpace(TotpSecret) ? string.Empty : TotpProvider.GetProvisioningUri(TotpSecret, Label, issuer);
 }
 
 // Lightweight DTO for JSON persistence (no UI-only fields)
@@ -45,6 +59,9 @@ class SnippetEntry
     public DateTime Created { get; set; } = DateTime.Now;
     public DateTime Modified { get; set; } = DateTime.Now;
     public DateTime ExpiryDate { get; set; } = DateTime.Now.AddDays(30);
+    
+    // TOTP (Time-based One-Time Password) support
+    public string? TotpSecret { get; set; } // Base32-encoded TOTP secret from FreeIPA
 }
 
 // Maps a global hotkey to a pinned snippet
@@ -74,7 +91,8 @@ public partial class MainWindow : Window
                 Value = r.ActualValue,
                 Created = r.Created,
                 Modified = r.Modified,
-                ExpiryDate = r.ExpiryDate
+                ExpiryDate = r.ExpiryDate,
+                TotpSecret = r.TotpSecret
             })
             .ToList();
         return JsonSerializer.Serialize(entries, s_jsonOptions);
@@ -95,7 +113,8 @@ public partial class MainWindow : Window
                 IsEncrypted = true,
                 Created = e.Created,
                 Modified = e.Modified,
-                ExpiryDate = e.ExpiryDate
+                ExpiryDate = e.ExpiryDate,
+                TotpSecret = e.TotpSecret
             }).ToList();
         }
 
@@ -154,10 +173,11 @@ public partial class MainWindow : Window
         return SerializeSnippetsToJson(rows);
     }
 
-    private const double DefaultBackdropOpacity = 0.50;
+    private const double DefaultBackdropOpacity = 0.80;
     private const bool DefaultIsPinned = true;
     private const bool DefaultIsDarkTheme = true;
     private const bool DefaultShowInTaskbar = true;
+    private const int DefaultClipboardClearSeconds = 60;
 
     // Hotkey constants
     private const int WmHotkey = 0x0312;
@@ -334,6 +354,7 @@ public partial class MainWindow : Window
     private string[] _labels = Array.Empty<string>();
     private string[] _fullLabels = Array.Empty<string>();
     private string[] _snippets = Array.Empty<string>();
+    private SnippetRow[] _snippetRows = Array.Empty<SnippetRow>(); // Store full SnippetRow for TOTP access
     private FileSystemWatcher? _watcher;
     private System.Windows.Threading.DispatcherTimer? _reloadDebounce;
     private WinForms.NotifyIcon? _trayIcon;
@@ -352,10 +373,20 @@ public partial class MainWindow : Window
     private double? _preExpandWindowTop;
 
     // Clipboard clear setting (0 = disabled)
-    private int _clipboardClearSeconds = 0;
+    private int _clipboardClearSeconds = DefaultClipboardClearSeconds;
 
     // Quick Enter: auto-paste into previously focused window after QWERTY pick
     private bool _quickEnterEnabled = false;
+
+    // TOTP copy behavior: when true, copy value + TOTP code together
+    private bool _copyTotpTogether = true;
+
+    // Default expiry for new/updated entries.
+    private int _defaultExpiryDays = 30;
+
+    private static readonly string s_appVersion = typeof(MainWindow).Assembly.GetName().Version is { } version
+        ? version.ToString(3)
+        : "2.1.0";
 
     // Shortcut hotkey state
     private string _shortcutsFilePath = string.Empty;
@@ -383,9 +414,13 @@ public partial class MainWindow : Window
         public double? WindowTop { get; set; }
         public string? MonitorDeviceName { get; set; }
         // 0 = disabled; 30 / 60 / 120 = clear after N seconds
-        public int ClipboardClearSeconds { get; set; } = 0;
+        public int ClipboardClearSeconds { get; set; } = DefaultClipboardClearSeconds;
         // When true, QWERTY picker auto-pastes into the previously focused window
         public bool QuickEnterEnabled { get; set; } = false;
+        // When true, copying a snippet with TOTP will copy both value and TOTP code together
+        public bool CopyTotpTogether { get; set; } = true;
+        // Default number of days before a snippet is considered expired.
+        public int DefaultExpiryDays { get; set; } = 30;
     }
 
     public MainWindow()
@@ -418,6 +453,7 @@ public partial class MainWindow : Window
         UpdateBiometricUi();
         DarkThemeMenuItem.IsChecked = _isDarkTheme;
         QuickEnterMenuItem.IsChecked = _quickEnterEnabled;
+        CopyTotpTogetherMenuItem.IsChecked = _copyTotpTogether;
         
         // Ensure window topmost behavior follows saved pin state.
         Topmost = _isPinned;
@@ -862,6 +898,161 @@ public partial class MainWindow : Window
         return dialog.ShowDialog() == WinForms.DialogResult.OK ? textBox.Text : null;
     }
 
+    private static string? PromptForNewMasterPassword()
+    {
+        using var dialog = new WinForms.Form
+        {
+            Width = 420,
+            Height = 300,
+            FormBorderStyle = WinForms.FormBorderStyle.None,
+            StartPosition = WinForms.FormStartPosition.CenterScreen,
+            BackColor = Drawing.Color.FromArgb(30, 30, 35),
+            MaximizeBox = false,
+            MinimizeBox = false,
+            ShowInTaskbar = false,
+            TopMost = true,
+            KeyPreview = true
+        };
+
+        dialog.Paint += (_, paintArgs) =>
+        {
+            using var pen = new Drawing.Pen(Drawing.Color.FromArgb(70, 70, 75), 1);
+            paintArgs.Graphics.DrawRectangle(pen, 0, 0, dialog.Width - 1, dialog.Height - 1);
+        };
+
+        var titleLabel = new WinForms.Label
+        {
+            Left = 20,
+            Top = 15,
+            Width = 380,
+            Height = 25,
+            Text = "CHANGE MASTER PASSWORD",
+            ForeColor = Drawing.Color.FromArgb(220, 220, 225),
+            Font = new Drawing.Font("Segoe UI", 10.5f, Drawing.FontStyle.Bold)
+        };
+
+        var instructionLabel = new WinForms.Label
+        {
+            Left = 20,
+            Top = 48,
+            Width = 380,
+            Height = 22,
+            Text = "Create a new password for this vault",
+            ForeColor = Drawing.Color.FromArgb(160, 160, 165),
+            Font = new Drawing.Font("Segoe UI", 9f)
+        };
+
+        var newPasswordLabel = new WinForms.Label
+        {
+            Left = 20,
+            Top = 78,
+            Width = 160,
+            Height = 20,
+            Text = "New password",
+            ForeColor = Drawing.Color.FromArgb(200, 200, 205),
+            Font = new Drawing.Font("Segoe UI", 9f)
+        };
+
+        var newPasswordBox = new WinForms.TextBox
+        {
+            Left = 20,
+            Top = 98,
+            Width = 380,
+            Height = 34,
+            UseSystemPasswordChar = true,
+            BackColor = Drawing.Color.FromArgb(45, 45, 50),
+            ForeColor = Drawing.Color.FromArgb(220, 220, 225),
+            BorderStyle = WinForms.BorderStyle.FixedSingle,
+            Font = new Drawing.Font("Segoe UI", 11f)
+        };
+
+        var confirmPasswordLabel = new WinForms.Label
+        {
+            Left = 20,
+            Top = 140,
+            Width = 180,
+            Height = 20,
+            Text = "Confirm new password",
+            ForeColor = Drawing.Color.FromArgb(200, 200, 205),
+            Font = new Drawing.Font("Segoe UI", 9f)
+        };
+
+        var confirmPasswordBox = new WinForms.TextBox
+        {
+            Left = 20,
+            Top = 160,
+            Width = 380,
+            Height = 34,
+            UseSystemPasswordChar = true,
+            BackColor = Drawing.Color.FromArgb(45, 45, 50),
+            ForeColor = Drawing.Color.FromArgb(220, 220, 225),
+            BorderStyle = WinForms.BorderStyle.FixedSingle,
+            Font = new Drawing.Font("Segoe UI", 11f)
+        };
+
+        var okButton = new WinForms.Button
+        {
+            Text = "CHANGE",
+            Left = 205,
+            Top = 220,
+            Width = 95,
+            Height = 38,
+            FlatStyle = WinForms.FlatStyle.Flat,
+            BackColor = Drawing.Color.FromArgb(0, 120, 212),
+            ForeColor = Drawing.Color.White,
+            Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
+            Cursor = WinForms.Cursors.Hand
+        };
+        okButton.FlatAppearance.BorderSize = 0;
+
+        var cancelButton = new WinForms.Button
+        {
+            Text = "CANCEL",
+            Left = 305,
+            Top = 220,
+            Width = 95,
+            Height = 38,
+            DialogResult = WinForms.DialogResult.Cancel,
+            FlatStyle = WinForms.FlatStyle.Flat,
+            BackColor = Drawing.Color.FromArgb(55, 55, 60),
+            ForeColor = Drawing.Color.FromArgb(200, 200, 205),
+            Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
+            Cursor = WinForms.Cursors.Hand
+        };
+        cancelButton.FlatAppearance.BorderSize = 0;
+
+        okButton.Click += (_, _) =>
+        {
+            if (newPasswordBox.Text.Length < 4)
+            {
+                WinForms.MessageBox.Show("Master password must be at least 4 characters.", "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Warning);
+                return;
+            }
+
+            if (!string.Equals(newPasswordBox.Text, confirmPasswordBox.Text, StringComparison.Ordinal))
+            {
+                WinForms.MessageBox.Show("The passwords do not match.", "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Warning);
+                return;
+            }
+
+            dialog.DialogResult = WinForms.DialogResult.OK;
+        };
+
+        dialog.Controls.Add(titleLabel);
+        dialog.Controls.Add(instructionLabel);
+        dialog.Controls.Add(newPasswordLabel);
+        dialog.Controls.Add(newPasswordBox);
+        dialog.Controls.Add(confirmPasswordLabel);
+        dialog.Controls.Add(confirmPasswordBox);
+        dialog.Controls.Add(okButton);
+        dialog.Controls.Add(cancelButton);
+        dialog.AcceptButton = okButton;
+        dialog.CancelButton = cancelButton;
+
+        newPasswordBox.Select();
+        return dialog.ShowDialog() == WinForms.DialogResult.OK ? newPasswordBox.Text : null;
+    }
+
     private void SetupTrayIcon()
     {
         try
@@ -946,6 +1137,7 @@ public partial class MainWindow : Window
                 _labels = Array.Empty<string>();
                 _fullLabels = Array.Empty<string>();
                 _snippets = Array.Empty<string>();
+                _snippetRows = Array.Empty<SnippetRow>();
                 return;
             }
 
@@ -954,6 +1146,7 @@ public partial class MainWindow : Window
                 _labels = Array.Empty<string>();
                 _fullLabels = Array.Empty<string>();
                 _snippets = Array.Empty<string>();
+                _snippetRows = Array.Empty<SnippetRow>();
                 return;
             }
 
@@ -962,6 +1155,7 @@ public partial class MainWindow : Window
             _labels = new string[parsed.Count];
             _fullLabels = new string[parsed.Count];
             _snippets = new string[parsed.Count];
+            _snippetRows = new SnippetRow[parsed.Count];
 
             for (int i = 0; i < parsed.Count; i++)
             {
@@ -969,6 +1163,7 @@ public partial class MainWindow : Window
                 _fullLabels[i] = parsed[i].Label;
                 _labels[i] = displayLabel;
                 _snippets[i] = parsed[i].ActualValue;
+                _snippetRows[i] = parsed[i];
             }
         }
         catch { }
@@ -1030,6 +1225,17 @@ public partial class MainWindow : Window
             var tipText = shortcutLookup.TryGetValue(fullLbl, out var sc)
                 ? $"{fullLbl}\n\nShortcut: {sc}"
                 : fullLbl;
+            
+            // Add TOTP info if configured with improved formatting
+            if (i < _snippetRows.Length && !string.IsNullOrWhiteSpace(_snippetRows[i].TotpSecret))
+            {
+                var totpInfo = _snippetRows[i].TotpWithExpiry;
+                if (totpInfo.HasValue)
+                {
+                    var progress = (int)((30 - totpInfo.Value.RemainingSeconds) / 30.0 * 100);
+                    tipText += $"\n━━━━━━━━━━━━━━━━━━\n🔐 TOTP: {totpInfo.Value.Code}\n⏱ Expires in {totpInfo.Value.RemainingSeconds}s [{'█'} {progress}%]";
+                }
+            }
 
             var btn = new WpfButton
             {
@@ -1082,7 +1288,8 @@ public partial class MainWindow : Window
         {
             try
             {
-                CopySnippetToClipboard(_snippets[idx]);
+                var snippetRow = idx < _snippetRows.Length ? _snippetRows[idx] : null;
+                CopySnippetToClipboard(_snippets[idx], snippetRow);
                 b.Background = BubbleClicked;
                 await Task.Delay(150);
                 b.Background = new SolidColorBrush(_isDarkTheme ? BubbleDefaultColorDark : BubbleDefaultColorLight);
@@ -1411,7 +1618,8 @@ public partial class MainWindow : Window
 
         try
         {
-            CopySnippetToClipboard(_snippets[snippetIdx]);
+            var snippetRow = snippetIdx < _snippetRows.Length ? _snippetRows[snippetIdx] : null;
+            CopySnippetToClipboard(_snippets[snippetIdx], snippetRow);
         }
         catch { }
 
@@ -1474,32 +1682,61 @@ public partial class MainWindow : Window
 
         using var dlg = new WinForms.Form
         {
-            Width = 680,
-            Height = 480,
-            MinimumSize = new Drawing.Size(580, 380),
-            FormBorderStyle = WinForms.FormBorderStyle.Sizable,
+            ClientSize = new Drawing.Size(680, 480),
+            FormBorderStyle = WinForms.FormBorderStyle.None,
             StartPosition = WinForms.FormStartPosition.CenterScreen,
-            Text = "PinBubble – Manage Shortcuts",
+            Text = "Manage Shortcuts",
             MinimizeBox = false,
             MaximizeBox = false,
             TopMost = true,
             KeyPreview = true,
-            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(38, 38, 44) : Drawing.Color.FromArgb(248, 249, 251),
             ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black
         };
+        using (var dialogRegionPath = RoundedRectPath(new Drawing.Rectangle(0, 0, dlg.Width - 1, dlg.Height - 1), 18))
+            dlg.Region = new Drawing.Region(dialogRegionPath);
+        dlg.Paint += (_, pe) =>
+        {
+            pe.Graphics.SmoothingMode = Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using var path = RoundedRectPath(new Drawing.Rectangle(0, 0, dlg.Width - 1, dlg.Height - 1), 18);
+            using var pen = new Drawing.Pen(_isDarkTheme ? Drawing.Color.FromArgb(72, 72, 82) : Drawing.Color.FromArgb(210, 214, 220), 1f);
+            pe.Graphics.DrawPath(pen, path);
+        };
+
+        bool shortcutsDirty = false;
+        bool allowShortcutClose = false;
 
         // ── Toolbar ──────────────────────────────────────────────────────────
         var toolbar = new WinForms.Panel
         {
             Dock = WinForms.DockStyle.Top,
-            Height = 64,
-            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(40, 40, 44) : Drawing.Color.FromArgb(240, 240, 240)
+            Height = 82,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(48, 48, 55) : Drawing.Color.White
+        };
+        toolbar.Padding = new WinForms.Padding(0);
+
+        var shortcutIcon = new WinForms.Label
+        {
+            Left = 20, Top = 18, Width = 38, Height = 38,
+            Text = "⌨",
+            Font = new Drawing.Font("Segoe UI Emoji", 22f),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(110, 195, 60) : Drawing.Color.FromArgb(55, 135, 45),
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.MiddleCenter
+        };
+        var shortcutTitle = new WinForms.Label
+        {
+            Left = 66, Top = 12, Width = 190, Height = 28,
+            Text = "Manage Shortcuts",
+            Font = new Drawing.Font("Segoe UI", 15f, Drawing.FontStyle.Bold),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(232, 232, 238) : Drawing.Color.FromArgb(30, 32, 36),
+            BackColor = Drawing.Color.Transparent
         };
 
         var infoLbl = new WinForms.Label
         {
-            Left = 14, Top = 10, Width = 254, Height = 44,
-            Text = "Shortcuts copy a snippet instantly.\nCtrl+Alt+P always opens the QWERTY picker.",
+            Left = 66, Top = 42, Width = 190, Height = 30,
+            Text = "Copy snippets instantly.\nCtrl+Alt+P opens the picker.",
             ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(130, 130, 140) : Drawing.Color.Gray,
             Font = new Drawing.Font("Segoe UI", 8.5f),
             BackColor = Drawing.Color.Transparent
@@ -1507,24 +1744,30 @@ public partial class MainWindow : Window
 
         WinForms.Button MakeToolBtn(string text, Drawing.Color bg, int left) => new WinForms.Button
         {
-            Text = text, Left = left, Top = 12, Width = 85, Height = 40,
+            Text = text, Left = left, Top = 21, Width = 86, Height = 40,
             FlatStyle = WinForms.FlatStyle.Flat,
             BackColor = bg,
             ForeColor = Drawing.Color.White,
             Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
-            Cursor = WinForms.Cursors.Hand
+            Cursor = WinForms.Cursors.Hand,
+            UseVisualStyleBackColor = false,
+            TabStop = false
         };
 
-        var btnAdd    = MakeToolBtn("＋ Add",    Drawing.Color.FromArgb(0, 110, 70),  272);
-        var btnRemove = MakeToolBtn("✕ Remove",  Drawing.Color.FromArgb(130, 40, 40), 364);
-        var btnSave   = MakeToolBtn("Save",      Drawing.Color.FromArgb(0, 100, 180), 456);
-        var btnClose  = MakeToolBtn("Close",     Drawing.Color.FromArgb(60, 60, 68),  548);
+        var btnAdd    = MakeToolBtn("＋ Add",    Drawing.Color.FromArgb(0, 110, 70),  280);
+        var btnRemove = MakeToolBtn("✕ Remove",  Drawing.Color.FromArgb(130, 40, 40), 372);
+        var btnSave   = MakeToolBtn("Save",      Drawing.Color.FromArgb(0, 100, 180), 464);
+        var btnClose  = MakeToolBtn("Close",     Drawing.Color.FromArgb(60, 60, 68),  556);
 
         foreach (var b in new[] { btnAdd, btnRemove, btnSave, btnClose })
         {
             b.FlatAppearance.BorderSize = 0;
+            b.FlatAppearance.MouseOverBackColor = b.BackColor;
+            b.FlatAppearance.MouseDownBackColor = b.BackColor;
             toolbar.Controls.Add(b);
         }
+        toolbar.Controls.Add(shortcutIcon);
+        toolbar.Controls.Add(shortcutTitle);
         toolbar.Controls.Add(infoLbl);
 
         // ── ListView ─────────────────────────────────────────────────────────
@@ -1538,10 +1781,37 @@ public partial class MainWindow : Window
             BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White,
             ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
             Font = new Drawing.Font("Segoe UI", 10f),
-            BorderStyle = WinForms.BorderStyle.None
+            BorderStyle = WinForms.BorderStyle.None,
+            OwnerDraw = true,
+            HeaderStyle = WinForms.ColumnHeaderStyle.Nonclickable
         };
-        list.Columns.Add("Shortcut", 200);
+        var listFrame = new WinForms.Panel
+        {
+            Dock = WinForms.DockStyle.Fill,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(72, 72, 82) : Drawing.Color.FromArgb(210, 214, 220),
+            Padding = new WinForms.Padding(1)
+        };
+        listFrame.Controls.Add(list);
+        list.Columns.Add("Shortcut", 220);
         list.Columns.Add("Linked Snippet", -2);
+        list.DrawColumnHeader += (_, e) =>
+        {
+            using var brush = new Drawing.SolidBrush(_isDarkTheme ? Drawing.Color.FromArgb(48, 48, 55) : Drawing.Color.FromArgb(240, 241, 244));
+            e.Graphics.FillRectangle(brush, e.Bounds);
+            using var pen = new Drawing.Pen(_isDarkTheme ? Drawing.Color.FromArgb(72, 72, 82) : Drawing.Color.FromArgb(210, 214, 220));
+            e.Graphics.DrawRectangle(pen, e.Bounds.Left, e.Bounds.Top, e.Bounds.Width - 1, e.Bounds.Height - 1);
+            var headerTextColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.FromArgb(40, 40, 45);
+            var textBounds = Drawing.Rectangle.Inflate(e.Bounds, -8, -2);
+            TextRenderer.DrawText(
+                e.Graphics,
+                e.Header?.Text ?? string.Empty,
+                list.Font,
+                textBounds,
+                headerTextColor,
+                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPrefix | TextFormatFlags.EndEllipsis);
+        };
+        list.DrawItem += (_, e) => e.DrawDefault = true;
+        list.DrawSubItem += (_, e) => e.DrawDefault = true;
 
         void RefreshList()
         {
@@ -1556,6 +1826,207 @@ public partial class MainWindow : Window
         }
         RefreshList();
 
+        void MarkShortcutsDirty()
+        {
+            shortcutsDirty = true;
+            btnSave.Visible = true;
+        }
+
+        // Tooltip label for shortcut column hover
+        var tooltipLabel = new WinForms.Label
+        {
+            Visible = false,
+            AutoSize = true,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(48, 48, 55) : Drawing.Color.FromArgb(255, 255, 255),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.FromArgb(30, 30, 35),
+            BorderStyle = WinForms.BorderStyle.FixedSingle,
+            Font = new Drawing.Font("Segoe UI", 9f),
+            Padding = new WinForms.Padding(6, 4, 6, 4),
+            Text = "Right-click to edit shortcut key",
+            Anchor = WinForms.AnchorStyles.None
+        };
+        dlg.Controls.Add(tooltipLabel);
+        tooltipLabel.BringToFront();
+
+        var tooltipTimer = new System.Windows.Forms.Timer { Interval = 2000 };
+        var hideTooltipTimer = new System.Windows.Forms.Timer { Interval = 2000 };
+        var currentHitItem = (WinForms.ListViewItem?)null;
+        var lastMousePos = Drawing.Point.Empty;
+
+        list.MouseMove += (_, mouseArgs) =>
+        {
+            var hit = list.HitTest(mouseArgs.Location);
+            lastMousePos = mouseArgs.Location;
+            
+            if (hit.Item is null || hit.SubItem is null || hit.Item.SubItems.IndexOf(hit.SubItem) != 0)
+            {
+                tooltipTimer.Stop();
+                hideTooltipTimer.Stop();
+                tooltipLabel.Visible = false;
+                currentHitItem = null;
+                return;
+            }
+
+            // Only start timer if hovering over a different item
+            if (!ReferenceEquals(currentHitItem, hit.Item))
+            {
+                tooltipTimer.Stop();
+                hideTooltipTimer.Stop();
+                tooltipLabel.Visible = false;
+                currentHitItem = hit.Item;
+                tooltipTimer.Start();
+            }
+
+            // Update tooltip position while visible
+            if (tooltipLabel.Visible)
+            {
+                var tooltipX = Math.Max(0, lastMousePos.X + 10);
+                var tooltipY = Math.Max(0, lastMousePos.Y + 15);
+                tooltipLabel.Location = new Drawing.Point(tooltipX, tooltipY);
+            }
+        };
+        tooltipTimer.Tick += (_, _) =>
+        {
+            tooltipTimer.Stop();
+            tooltipLabel.Visible = true;
+            // Position tooltip below cursor when it appears
+            var tooltipX = Math.Max(0, lastMousePos.X + 10);
+            var tooltipY = Math.Max(0, lastMousePos.Y + 15);
+            tooltipLabel.Location = new Drawing.Point(tooltipX, tooltipY);
+            // Start hide timer - tooltip will be visible for 2 seconds
+            hideTooltipTimer.Start();
+        };
+        hideTooltipTimer.Tick += (_, _) =>
+        {
+            hideTooltipTimer.Stop();
+            tooltipLabel.Visible = false;
+        };
+        list.MouseLeave += (_, _) =>
+        {
+            tooltipTimer.Stop();
+            hideTooltipTimer.Stop();
+            tooltipLabel.Visible = false;
+            currentHitItem = null;
+        };
+
+        list.MouseUp += (_, mouseArgs) =>
+        {
+            if (mouseArgs.Button != WinForms.MouseButtons.Right)
+                return;
+
+            var hit = list.HitTest(mouseArgs.Location);
+            if (hit.Item is null || hit.SubItem is null || hit.Item.Tag is not ShortcutEntry shortcut)
+                return;
+            if (hit.Item.SubItems.IndexOf(hit.SubItem) != 0)
+                return;
+
+            (int mods, int vk, string display)? recaptured = null;
+            using var recorder = new WinForms.Form
+            {
+                ClientSize = new Drawing.Size(420, 220),
+                FormBorderStyle = WinForms.FormBorderStyle.None,
+                StartPosition = WinForms.FormStartPosition.CenterParent,
+                Text = "Recapture Shortcut",
+                MaximizeBox = false,
+                MinimizeBox = false,
+                TopMost = true,
+                KeyPreview = true,
+                BackColor = _isDarkTheme ? Drawing.Color.FromArgb(38, 38, 44) : Drawing.Color.FromArgb(248, 249, 251)
+            };
+            using (var regionPath = RoundedRectPath(new Drawing.Rectangle(0, 0, recorder.Width - 1, recorder.Height - 1), 18))
+                recorder.Region = new Drawing.Region(regionPath);
+
+            var prompt = new WinForms.Label
+            {
+                Left = 28, Top = 24, Width = 364, Height = 30,
+                Text = "Recapture Shortcut",
+                Font = new Drawing.Font("Segoe UI", 14f, Drawing.FontStyle.Bold),
+                ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(232, 232, 238) : Drawing.Color.FromArgb(30, 32, 36),
+                BackColor = Drawing.Color.Transparent
+            };
+            var hint = new WinForms.Label
+            {
+                Left = 28, Top = 64, Width = 364, Height = 22,
+                Text = $"Press a new key for {shortcut.SnippetLabel}",
+                Font = new Drawing.Font("Segoe UI", 9f),
+                ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(155, 155, 165) : Drawing.Color.FromArgb(95, 100, 108),
+                BackColor = Drawing.Color.Transparent
+            };
+            var display = new WinForms.Label
+            {
+                Left = 28, Top = 92, Width = 364, Height = 38,
+                Text = shortcut.DisplayShortcut,
+                Font = new Drawing.Font("Segoe UI", 14f, Drawing.FontStyle.Bold),
+                ForeColor = Drawing.Color.FromArgb(0, 180, 120),
+                BackColor = Drawing.Color.Transparent,
+                TextAlign = Drawing.ContentAlignment.MiddleCenter
+            };
+            var use = new WinForms.Button
+            {
+                Text = "Use This", Left = 180, Top = 156, Width = 104, Height = 40,
+                DialogResult = WinForms.DialogResult.OK,
+                FlatStyle = WinForms.FlatStyle.Flat,
+                BackColor = Drawing.Color.FromArgb(0, 110, 70),
+                ForeColor = Drawing.Color.White,
+                Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
+                Enabled = false,
+                Cursor = WinForms.Cursors.Hand,
+                UseVisualStyleBackColor = false,
+                TabStop = false
+            };
+            use.FlatAppearance.BorderSize = 0;
+            use.FlatAppearance.MouseOverBackColor = use.BackColor;
+            use.FlatAppearance.MouseDownBackColor = use.BackColor;
+            var cancel = new WinForms.Button
+            {
+                Text = "Cancel", Left = 296, Top = 156, Width = 96, Height = 40,
+                DialogResult = WinForms.DialogResult.Cancel,
+                FlatStyle = WinForms.FlatStyle.Flat,
+                BackColor = Drawing.Color.FromArgb(60, 60, 68),
+                ForeColor = Drawing.Color.White,
+                Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
+                Cursor = WinForms.Cursors.Hand,
+                UseVisualStyleBackColor = false,
+                TabStop = false
+            };
+            cancel.FlatAppearance.BorderSize = 0;
+            cancel.FlatAppearance.MouseOverBackColor = cancel.BackColor;
+            cancel.FlatAppearance.MouseDownBackColor = cancel.BackColor;
+            recorder.Controls.AddRange(new WinForms.Control[] { prompt, hint, display, use, cancel });
+            recorder.AcceptButton = use;
+            recorder.CancelButton = cancel;
+            recorder.KeyDown += (_, keyArgs) =>
+            {
+                keyArgs.SuppressKeyPress = true;
+                var modifiers = 0;
+                if (keyArgs.Control) modifiers |= ModControl;
+                if (keyArgs.Alt) modifiers |= ModAlt;
+                if (keyArgs.Shift) modifiers |= ModShift;
+                if (keyArgs.KeyCode is WinForms.Keys.ControlKey or WinForms.Keys.Menu or WinForms.Keys.ShiftKey)
+                    return;
+                if (modifiers == 0) return;
+                var virtualKey = (int)keyArgs.KeyCode;
+                recaptured = (modifiers, virtualKey, BuildShortcutDisplay(modifiers, virtualKey));
+                display.Text = recaptured.Value.display;
+                use.Enabled = true;
+            };
+
+            if (recorder.ShowDialog(dlg) != WinForms.DialogResult.OK || recaptured is null)
+                return;
+
+            if (working.Any(s => !ReferenceEquals(s, shortcut) && s.VirtualKey == recaptured.Value.vk && s.Modifiers == recaptured.Value.mods))
+            {
+                WinForms.MessageBox.Show("That key combination is already assigned.", "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Warning);
+                return;
+            }
+
+            shortcut.Modifiers = recaptured.Value.mods;
+            shortcut.VirtualKey = recaptured.Value.vk;
+            shortcut.DisplayShortcut = recaptured.Value.display;
+            MarkShortcutsDirty();
+            RefreshList();
+        };
+
         // ── Add shortcut ─────────────────────────────────────────────────────
         btnAdd.Click += (_, _) =>
         {
@@ -1564,27 +2035,45 @@ public partial class MainWindow : Window
 
             using var recorder = new WinForms.Form
             {
-                Width = 420, Height = 180,
-                FormBorderStyle = WinForms.FormBorderStyle.FixedDialog,
+                ClientSize = new Drawing.Size(420, 220),
+                FormBorderStyle = WinForms.FormBorderStyle.None,
                 StartPosition = WinForms.FormStartPosition.CenterParent,
                 Text = "Record Shortcut",
                 MaximizeBox = false, MinimizeBox = false, TopMost = true,
                 KeyPreview = true,
-                BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White
+                BackColor = _isDarkTheme ? Drawing.Color.FromArgb(38, 38, 44) : Drawing.Color.FromArgb(248, 249, 251)
+            };
+            using (var recorderRegionPath = RoundedRectPath(new Drawing.Rectangle(0, 0, recorder.Width - 1, recorder.Height - 1), 18))
+                recorder.Region = new Drawing.Region(recorderRegionPath);
+            recorder.Paint += (_, pe) =>
+            {
+                pe.Graphics.SmoothingMode = Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                using var path = RoundedRectPath(new Drawing.Rectangle(0, 0, recorder.Width - 1, recorder.Height - 1), 18);
+                using var pen = new Drawing.Pen(_isDarkTheme ? Drawing.Color.FromArgb(72, 72, 82) : Drawing.Color.FromArgb(210, 214, 220), 1f);
+                pe.Graphics.DrawPath(pen, path);
+            };
+
+            var recorderTitle = new WinForms.Label
+            {
+                Left = 28, Top = 22, Width = 350, Height = 30,
+                Text = "Record Shortcut",
+                Font = new Drawing.Font("Segoe UI", 14f, Drawing.FontStyle.Bold),
+                ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(232, 232, 238) : Drawing.Color.FromArgb(30, 32, 36),
+                BackColor = Drawing.Color.Transparent
             };
 
             var recLabel = new WinForms.Label
             {
-                Left = 20, Top = 20, Width = 380, Height = 30,
-                Text = "Press your desired key combination…",
-                Font = new Drawing.Font("Segoe UI", 10f),
-                ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
+                Left = 28, Top = 62, Width = 364, Height = 24,
+                Text = "Press a key combination",
+                Font = new Drawing.Font("Segoe UI", 9f),
+                ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(155, 155, 165) : Drawing.Color.FromArgb(95, 100, 108),
                 BackColor = Drawing.Color.Transparent
             };
             var recDisplay = new WinForms.Label
             {
-                Left = 20, Top = 56, Width = 380, Height = 36,
-                Text = "",
+                Left = 28, Top = 88, Width = 364, Height = 40,
+                Text = "Waiting for input...",
                 Font = new Drawing.Font("Segoe UI", 14f, Drawing.FontStyle.Bold),
                 ForeColor = Drawing.Color.FromArgb(0, 180, 120),
                 BackColor = Drawing.Color.Transparent,
@@ -1592,27 +2081,35 @@ public partial class MainWindow : Window
             };
             var recUse = new WinForms.Button
             {
-                Text = "Use This", Left = 220, Top = 100, Width = 85, Height = 38,
+                Text = "Use This", Left = 180, Top = 156, Width = 104, Height = 40,
                 DialogResult = WinForms.DialogResult.OK,
                 FlatStyle = WinForms.FlatStyle.Flat,
                 BackColor = Drawing.Color.FromArgb(0, 110, 70),
                 ForeColor = Drawing.Color.White,
                 Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
-                Enabled = false, Cursor = WinForms.Cursors.Hand
+                Enabled = false, Cursor = WinForms.Cursors.Hand,
+                UseVisualStyleBackColor = false,
+                TabStop = false
             };
             recUse.FlatAppearance.BorderSize = 0;
+            recUse.FlatAppearance.MouseOverBackColor = recUse.BackColor;
+            recUse.FlatAppearance.MouseDownBackColor = recUse.BackColor;
             var recCancel = new WinForms.Button
             {
-                Text = "Cancel", Left = 314, Top = 100, Width = 85, Height = 38,
+                Text = "Cancel", Left = 296, Top = 156, Width = 96, Height = 40,
                 DialogResult = WinForms.DialogResult.Cancel,
                 FlatStyle = WinForms.FlatStyle.Flat,
                 BackColor = Drawing.Color.FromArgb(60, 60, 68),
                 ForeColor = Drawing.Color.White,
                 Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
-                Cursor = WinForms.Cursors.Hand
+                Cursor = WinForms.Cursors.Hand,
+                UseVisualStyleBackColor = false,
+                TabStop = false
             };
             recCancel.FlatAppearance.BorderSize = 0;
-            recorder.Controls.AddRange(new WinForms.Control[] { recLabel, recDisplay, recUse, recCancel });
+            recCancel.FlatAppearance.MouseOverBackColor = recCancel.BackColor;
+            recCancel.FlatAppearance.MouseDownBackColor = recCancel.BackColor;
+            recorder.Controls.AddRange(new WinForms.Control[] { recorderTitle, recLabel, recDisplay, recUse, recCancel });
             recorder.AcceptButton = recUse;
             recorder.CancelButton = recCancel;
 
@@ -1653,56 +2150,84 @@ public partial class MainWindow : Window
 
             using var snippetPicker = new WinForms.Form
             {
-                Width = 400, Height = 170,
-                FormBorderStyle = WinForms.FormBorderStyle.FixedDialog,
+                ClientSize = new Drawing.Size(440, 240),
+                FormBorderStyle = WinForms.FormBorderStyle.None,
                 StartPosition = WinForms.FormStartPosition.CenterParent,
                 Text = "Link to Snippet",
                 MaximizeBox = false, MinimizeBox = false, TopMost = true,
-                BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White
+                KeyPreview = true,
+                BackColor = _isDarkTheme ? Drawing.Color.FromArgb(38, 38, 44) : Drawing.Color.FromArgb(248, 249, 251)
+            };
+            using (var pickerRegionPath = RoundedRectPath(new Drawing.Rectangle(0, 0, snippetPicker.Width - 1, snippetPicker.Height - 1), 18))
+                snippetPicker.Region = new Drawing.Region(pickerRegionPath);
+            snippetPicker.Paint += (_, pe) =>
+            {
+                pe.Graphics.SmoothingMode = Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                using var path = RoundedRectPath(new Drawing.Rectangle(0, 0, snippetPicker.Width - 1, snippetPicker.Height - 1), 18);
+                using var pen = new Drawing.Pen(_isDarkTheme ? Drawing.Color.FromArgb(72, 72, 82) : Drawing.Color.FromArgb(210, 214, 220), 1f);
+                pe.Graphics.DrawPath(pen, path);
+            };
+
+            var pickerTitle = new WinForms.Label
+            {
+                Left = 28, Top = 22, Width = 350, Height = 30,
+                Text = "Link to Snippet",
+                Font = new Drawing.Font("Segoe UI", 14f, Drawing.FontStyle.Bold),
+                ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(232, 232, 238) : Drawing.Color.FromArgb(30, 32, 36),
+                BackColor = Drawing.Color.Transparent
             };
 
             var pickLabel = new WinForms.Label
             {
-                Left = 20, Top = 20, Width = 360, Height = 22,
-                Text = $"Link  {recorded.Value.display}  to:",
-                Font = new Drawing.Font("Segoe UI", 10f),
-                ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
+                Left = 28, Top = 64, Width = 384, Height = 22,
+                Text = $"Choose a snippet for {recorded.Value.display}",
+                Font = new Drawing.Font("Segoe UI", 9f),
+                ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(155, 155, 165) : Drawing.Color.FromArgb(95, 100, 108),
                 BackColor = Drawing.Color.Transparent
             };
             var combo = new WinForms.ComboBox
             {
-                Left = 20, Top = 50, Width = 360, Height = 30,
+                Left = 28, Top = 94, Width = 384, Height = 30,
                 DropDownStyle = WinForms.ComboBoxStyle.DropDownList,
                 Font = new Drawing.Font("Segoe UI", 10f),
-                BackColor = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 50) : Drawing.Color.White,
-                ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black
+                BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White,
+                ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
+                FlatStyle = WinForms.FlatStyle.Flat
             };
             combo.Items.AddRange(_fullLabels.Cast<object>().ToArray());
             if (combo.Items.Count > 0) combo.SelectedIndex = 0;
 
             var pickOk = new WinForms.Button
             {
-                Text = "Link", Left = 200, Top = 95, Width = 85, Height = 38,
+                Text = "Link", Left = 208, Top = 164, Width = 96, Height = 40,
                 DialogResult = WinForms.DialogResult.OK,
                 FlatStyle = WinForms.FlatStyle.Flat,
                 BackColor = Drawing.Color.FromArgb(0, 110, 70),
                 ForeColor = Drawing.Color.White,
                 Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
-                Cursor = WinForms.Cursors.Hand
+                Cursor = WinForms.Cursors.Hand,
+                UseVisualStyleBackColor = false,
+                TabStop = false
             };
             pickOk.FlatAppearance.BorderSize = 0;
+            pickOk.FlatAppearance.MouseOverBackColor = pickOk.BackColor;
+            pickOk.FlatAppearance.MouseDownBackColor = pickOk.BackColor;
             var pickCancel = new WinForms.Button
             {
-                Text = "Cancel", Left = 295, Top = 95, Width = 85, Height = 38,
+                Text = "Cancel", Left = 316, Top = 164, Width = 96, Height = 40,
                 DialogResult = WinForms.DialogResult.Cancel,
                 FlatStyle = WinForms.FlatStyle.Flat,
                 BackColor = Drawing.Color.FromArgb(60, 60, 68),
                 ForeColor = Drawing.Color.White,
                 Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
-                Cursor = WinForms.Cursors.Hand
+                Cursor = WinForms.Cursors.Hand,
+                UseVisualStyleBackColor = false,
+                TabStop = false
             };
             pickCancel.FlatAppearance.BorderSize = 0;
-            snippetPicker.Controls.AddRange(new WinForms.Control[] { pickLabel, combo, pickOk, pickCancel });
+            pickCancel.FlatAppearance.MouseOverBackColor = pickCancel.BackColor;
+            pickCancel.FlatAppearance.MouseDownBackColor = pickCancel.BackColor;
+            snippetPicker.Controls.AddRange(new WinForms.Control[] { pickerTitle, pickLabel, combo, pickOk, pickCancel });
             snippetPicker.AcceptButton = pickOk;
             snippetPicker.CancelButton = pickCancel;
 
@@ -1727,6 +2252,7 @@ public partial class MainWindow : Window
                 DisplayShortcut = recorded.Value.display
             });
             RefreshList();
+            MarkShortcutsDirty();
         };
 
         // ── Remove shortcut ───────────────────────────────────────────────────
@@ -1738,6 +2264,7 @@ public partial class MainWindow : Window
             {
                 working.RemoveAt(idx);
                 RefreshList();
+                MarkShortcutsDirty();
             }
         };
 
@@ -1753,15 +2280,95 @@ public partial class MainWindow : Window
             }).ToList();
             SaveShortcuts();
             RegisterShortcutHotkeys();
+            shortcutsDirty = false;
+            allowShortcutClose = true;
             dlg.DialogResult = WinForms.DialogResult.OK;
             dlg.Close();
         };
 
         // ── Close ─────────────────────────────────────────────────────────────
-        btnClose.Click += (_, _) => { dlg.DialogResult = WinForms.DialogResult.Cancel; dlg.Close(); };
-        dlg.KeyDown += (_, ke) => { if (ke.KeyCode == WinForms.Keys.Escape) btnClose.PerformClick(); };
+        void CloseShortcutDialog()
+        {
+            if (shortcutsDirty)
+            {
+                var result = WinForms.MessageBox.Show(
+                    "You have unsaved shortcut changes. Save before closing?",
+                    "PinBubble - Unsaved Changes",
+                    WinForms.MessageBoxButtons.YesNoCancel,
+                    WinForms.MessageBoxIcon.Question);
+                if (result == WinForms.DialogResult.Cancel)
+                    return;
+                if (result == WinForms.DialogResult.Yes)
+                {
+                    btnSave.PerformClick();
+                    return;
+                }
+            }
 
-        dlg.Controls.Add(list);
+            allowShortcutClose = true;
+            dlg.DialogResult = WinForms.DialogResult.Cancel;
+            dlg.Close();
+        }
+
+        btnClose.Click += (_, _) => CloseShortcutDialog();
+        dlg.KeyDown += (_, ke) =>
+        {
+            if (ke.Control && ke.KeyCode == WinForms.Keys.S)
+            {
+                ke.SuppressKeyPress = true;
+                btnSave.PerformClick();
+            }
+            else if (ke.KeyCode == WinForms.Keys.Escape)
+            {
+                ke.SuppressKeyPress = true;
+                CloseShortcutDialog();
+            }
+        };
+        dlg.FormClosing += (_, closeArgs) =>
+        {
+            if (!allowShortcutClose && shortcutsDirty)
+            {
+                closeArgs.Cancel = true;
+                CloseShortcutDialog();
+            }
+        };
+
+        bool dragging = false;
+        Drawing.Point dragCursor = Drawing.Point.Empty;
+        Drawing.Point dragDialog = Drawing.Point.Empty;
+        toolbar.MouseDown += (_, mouseArgs) =>
+        {
+            if (mouseArgs.Button != WinForms.MouseButtons.Left) return;
+            dragging = true;
+            dragCursor = WinForms.Cursor.Position;
+            dragDialog = dlg.Location;
+        };
+        toolbar.MouseMove += (_, _) =>
+        {
+            if (!dragging) return;
+            var diff = Drawing.Point.Subtract(WinForms.Cursor.Position, new Drawing.Size(dragCursor));
+            dlg.Location = Drawing.Point.Add(dragDialog, new Drawing.Size(diff));
+        };
+        toolbar.MouseUp += (_, _) => dragging = false;
+        foreach (var dragTarget in new WinForms.Control[] { shortcutIcon, shortcutTitle, infoLbl })
+        {
+            dragTarget.MouseDown += (_, mouseArgs) =>
+            {
+                if (mouseArgs.Button != WinForms.MouseButtons.Left) return;
+                dragging = true;
+                dragCursor = WinForms.Cursor.Position;
+                dragDialog = dlg.Location;
+            };
+            dragTarget.MouseMove += (_, _) =>
+            {
+                if (!dragging) return;
+                var diff = Drawing.Point.Subtract(WinForms.Cursor.Position, new Drawing.Size(dragCursor));
+                dlg.Location = Drawing.Point.Add(dragDialog, new Drawing.Size(diff));
+            };
+            dragTarget.MouseUp += (_, _) => dragging = false;
+        }
+
+        dlg.Controls.Add(listFrame);
         dlg.Controls.Add(toolbar);
         dlg.ShowDialog();
     }
@@ -1981,7 +2588,10 @@ public partial class MainWindow : Window
         {
             try
             {
-                CopySnippetToClipboard(copiedSnippet);
+                // Find the index of the snippet to get its SnippetRow for TOTP
+                int snippetIdx = Array.IndexOf(_snippets, copiedSnippet);
+                var snippetRow = snippetIdx >= 0 && snippetIdx < _snippetRows.Length ? _snippetRows[snippetIdx] : null;
+                CopySnippetToClipboard(copiedSnippet, snippetRow);
             }
             catch { }
         }
@@ -2018,17 +2628,27 @@ public partial class MainWindow : Window
 
         using var dialog = new WinForms.Form
         {
-            Width = 800,
-            Height = 600,
-            FormBorderStyle = WinForms.FormBorderStyle.Sizable,
+            ClientSize = new Drawing.Size(900, 600),
+            FormBorderStyle = WinForms.FormBorderStyle.None,
             StartPosition = WinForms.FormStartPosition.CenterScreen,
             Text = "PinBubble - Edit Snippets",
             MinimizeBox = false,
             MaximizeBox = false,
             TopMost = true,
             KeyPreview = true,
-            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(38, 38, 44) : Drawing.Color.FromArgb(248, 249, 251),
             ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black
+        };
+
+        // Apply rounded corners and border
+        using (var dialogRegionPath = RoundedRectPath(new Drawing.Rectangle(0, 0, dialog.Width - 1, dialog.Height - 1), 18))
+            dialog.Region = new Drawing.Region(dialogRegionPath);
+        dialog.Paint += (_, pe) =>
+        {
+            pe.Graphics.SmoothingMode = Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using var path = RoundedRectPath(new Drawing.Rectangle(0, 0, dialog.Width - 1, dialog.Height - 1), 18);
+            using var pen = new Drawing.Pen(_isDarkTheme ? Drawing.Color.FromArgb(72, 72, 82) : Drawing.Color.FromArgb(210, 214, 220), 1f);
+            pe.Graphics.DrawPath(pen, path);
         };
 
         var isDecrypted = false;
@@ -2039,25 +2659,25 @@ public partial class MainWindow : Window
         var toolbar = new WinForms.Panel
         {
             Dock = WinForms.DockStyle.Top,
-            Height = 70,
-            BorderStyle = WinForms.BorderStyle.FixedSingle,
-            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 48) : Drawing.Color.FromArgb(240, 240, 240)
+            Height = 82,
+            BorderStyle = WinForms.BorderStyle.None,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(38, 38, 44) : Drawing.Color.FromArgb(248, 249, 251)
         };
 
         // Status indicator - LED Light
         var statusLED = new WinForms.PictureBox
         {
-            Left = 30,
-            Top = 20,
-            Width = 30,
-            Height = 30,
+            Left = 20,
+            Top = 18,
+            Width = 34,
+            Height = 34,
             BackColor = Drawing.Color.Transparent
         };
         
         // Function to draw LED with given color
         void DrawLED(Drawing.Color color)
         {
-            var ledBitmap = new System.Drawing.Bitmap(30, 30);
+            var ledBitmap = new System.Drawing.Bitmap(34, 34);
             using (var g = System.Drawing.Graphics.FromImage(ledBitmap))
             {
                 g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
@@ -2065,36 +2685,36 @@ public partial class MainWindow : Window
                 // Outer dark ring
                 using (var brush = new System.Drawing.SolidBrush(Drawing.Color.FromArgb(40, 40, 45)))
                 {
-                    g.FillEllipse(brush, 0, 0, 30, 30);
+                    g.FillEllipse(brush, 0, 0, 34, 34);
                 }
                 
                 // Main LED body
                 using (var brush = new System.Drawing.SolidBrush(color))
                 {
-                    g.FillEllipse(brush, 3, 3, 24, 24);
+                    g.FillEllipse(brush, 3, 3, 28, 28);
                 }
                 
                 // Inner glow effect
                 using (var path = new System.Drawing.Drawing2D.GraphicsPath())
                 {
-                    path.AddEllipse(6, 6, 18, 18);
+                    path.AddEllipse(6, 6, 22, 22);
                     using (var pgb = new System.Drawing.Drawing2D.PathGradientBrush(path))
                     {
-                        pgb.CenterPoint = new System.Drawing.PointF(15, 15);
+                        pgb.CenterPoint = new System.Drawing.PointF(17, 17);
                         pgb.CenterColor = Drawing.Color.FromArgb(180, 255, 255, 255);
                         pgb.SurroundColors = new[] { Drawing.Color.FromArgb(0, 255, 255, 255) };
-                        g.FillEllipse(pgb, 6, 6, 18, 18);
+                        g.FillEllipse(pgb, 6, 6, 22, 22);
                     }
                 }
                 
                 // Highlight (glossy effect)
                 using (var brush = new System.Drawing.Drawing2D.LinearGradientBrush(
-                    new System.Drawing.Rectangle(8, 8, 10, 8),
+                    new System.Drawing.Rectangle(10, 10, 12, 10),
                     Drawing.Color.FromArgb(200, 255, 255, 255),
                     Drawing.Color.FromArgb(0, 255, 255, 255),
                     45f))
                 {
-                    g.FillEllipse(brush, 8, 8, 10, 8);
+                    g.FillEllipse(brush, 10, 10, 12, 10);
                 }
             }
             statusLED.Image = ledBitmap;
@@ -2104,57 +2724,93 @@ public partial class MainWindow : Window
         DrawLED(Drawing.Color.FromArgb(0, 220, 0));
         toolbar.Controls.Add(statusLED);
 
+        // Title label
+        var titleLabel = new WinForms.Label
+        {
+            Left = 66,
+            Top = 14,
+            Width = 200,
+            Height = 28,
+            Text = "Manage Snippets",
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(232, 232, 238) : Drawing.Color.FromArgb(30, 32, 36),
+            Font = new Drawing.Font("Segoe UI", 12f, Drawing.FontStyle.Bold),
+            BackColor = Drawing.Color.Transparent
+        };
+        toolbar.Controls.Add(titleLabel);
+
+        // Info label
+        var infoLabel = new WinForms.Label
+        {
+            Left = 66,
+            Top = 43,
+            Width = 300,
+            Height = 22,
+            Text = "Click value or TOTP column to copy",
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(155, 155, 165) : Drawing.Color.FromArgb(95, 100, 108),
+            Font = new Drawing.Font("Segoe UI", 9f),
+            BackColor = Drawing.Color.Transparent
+        };
+        toolbar.Controls.Add(infoLabel);
+
         // Button: Decrypt All (toggle) - only visible when Control key is held
         var btnDecryptAll = new WinForms.Button
         {
             Text = "Show All",
-            Left = 80,
-            Top = 12,
-            Width = 110,
-            Height = 46,
+            Left = 450,
+            Top = 21,
+            Width = 100,
+            Height = 40,
             FlatStyle = WinForms.FlatStyle.Flat,
-            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(55, 55, 60) : Drawing.Color.White,
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
-            Font = new Drawing.Font("Segoe UI", 9, Drawing.FontStyle.Bold),
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(55, 55, 60) : Drawing.Color.FromArgb(240, 240, 240),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.FromArgb(40, 40, 40),
+            Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
             Cursor = WinForms.Cursors.Hand,
             Visible = false,
             Enabled = false
         };
-        btnDecryptAll.FlatAppearance.BorderColor = _isDarkTheme ? Drawing.Color.FromArgb(80, 80, 85) : Drawing.Color.Gray;
+        btnDecryptAll.FlatAppearance.BorderSize = 0;
+        btnDecryptAll.FlatAppearance.MouseOverBackColor = btnDecryptAll.BackColor;
+        btnDecryptAll.FlatAppearance.MouseDownBackColor = btnDecryptAll.BackColor;
 
         // Button: Save - only visible when changes are made
         var btnSave = new WinForms.Button
         {
             Text = "Save",
-            Left = 580,
-            Top = 12,
+            Left = 630,
+            Top = 21,
             Width = 90,
-            Height = 46,
+            Height = 40,
             FlatStyle = WinForms.FlatStyle.Flat,
-            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(0, 100, 70) : Drawing.Color.LightGreen,
-            ForeColor = _isDarkTheme ? Drawing.Color.White : Drawing.Color.Black,
-            Font = new Drawing.Font("Segoe UI", 9, Drawing.FontStyle.Bold),
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(0, 120, 80) : Drawing.Color.FromArgb(0, 145, 90),
+            ForeColor = Drawing.Color.White,
+            Font = new Drawing.Font("Segoe UI", 10f, Drawing.FontStyle.Bold),
             Cursor = WinForms.Cursors.Hand,
             DialogResult = WinForms.DialogResult.OK,
-            Visible = false
+            Visible = false,
+            TabStop = false
         };
-        btnSave.FlatAppearance.BorderColor = _isDarkTheme ? Drawing.Color.FromArgb(0, 120, 80) : Drawing.Color.DarkGreen;
+        btnSave.FlatAppearance.BorderSize = 0;
+        btnSave.FlatAppearance.MouseOverBackColor = btnSave.BackColor;
+        btnSave.FlatAppearance.MouseDownBackColor = btnSave.BackColor;
 
         // Button: Cancel
         var btnCancel = new WinForms.Button
         {
             Text = "Cancel",
-            Left = 680,
-            Top = 12,
+            Left = 750,
+            Top = 21,
             Width = 90,
-            Height = 46,
+            Height = 40,
             FlatStyle = WinForms.FlatStyle.Flat,
-            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(80, 40, 40) : Drawing.Color.LightCoral,
-            ForeColor = _isDarkTheme ? Drawing.Color.White : Drawing.Color.Black,
-            Font = new Drawing.Font("Segoe UI", 9, Drawing.FontStyle.Bold),
-            Cursor = WinForms.Cursors.Hand
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(60, 60, 68) : Drawing.Color.FromArgb(225, 226, 230),
+            ForeColor = _isDarkTheme ? Drawing.Color.White : Drawing.Color.FromArgb(40, 40, 40),
+            Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
+            Cursor = WinForms.Cursors.Hand,
+            TabStop = false
         };
-        btnCancel.FlatAppearance.BorderColor = _isDarkTheme ? Drawing.Color.FromArgb(100, 50, 50) : Drawing.Color.DarkRed;
+        btnCancel.FlatAppearance.BorderSize = 0;
+        btnCancel.FlatAppearance.MouseOverBackColor = btnCancel.BackColor;
+        btnCancel.FlatAppearance.MouseDownBackColor = btnCancel.BackColor;
 
         toolbar.Controls.Add(btnDecryptAll);
         toolbar.Controls.Add(btnSave);
@@ -2163,13 +2819,24 @@ public partial class MainWindow : Window
         // Parse snippets from JSON (or legacy comma-delimited format)
         var snippetRows = ParseSnippets(plaintext);
 
+        // Create DataGridView with wrapper panel for border
+        var gridFrame = new WinForms.Panel
+        {
+            BorderStyle = WinForms.BorderStyle.FixedSingle,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White,
+            Location = new Drawing.Point(20, 82),
+            Size = new Drawing.Size(900 - 40, 600 - 102),
+            Anchor = WinForms.AnchorStyles.Top | WinForms.AnchorStyles.Bottom | WinForms.AnchorStyles.Left | WinForms.AnchorStyles.Right
+        };
+        gridFrame.Padding = new WinForms.Padding(1);
+
         // Create DataGridView
         var grid = new WinForms.DataGridView
         {
             Dock = WinForms.DockStyle.Fill,
             BackgroundColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White,
             ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
-            GridColor = _isDarkTheme ? Drawing.Color.FromArgb(60, 60, 65) : Drawing.Color.Gray,
+            GridColor = _isDarkTheme ? Drawing.Color.FromArgb(60, 60, 65) : Drawing.Color.FromArgb(200, 200, 200),
             BorderStyle = WinForms.BorderStyle.None,
             AllowUserToResizeRows = false,
             AllowUserToAddRows = true,
@@ -2185,13 +2852,22 @@ public partial class MainWindow : Window
 
         // Style the grid
         grid.ColumnHeadersDefaultCellStyle.BackColor = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 48) : Drawing.Color.FromArgb(240, 240, 240);
-        grid.ColumnHeadersDefaultCellStyle.ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black;
+        grid.ColumnHeadersDefaultCellStyle.ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.FromArgb(40, 40, 40);
         grid.EnableHeadersVisualStyles = false;
         grid.DefaultCellStyle.BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White;
         grid.DefaultCellStyle.ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black;
         grid.DefaultCellStyle.SelectionBackColor = _isDarkTheme ? Drawing.Color.FromArgb(0, 100, 150) : Drawing.Color.LightBlue;
         grid.DefaultCellStyle.SelectionForeColor = Drawing.Color.White;
         grid.RowHeadersDefaultCellStyle.BackColor = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 48) : Drawing.Color.FromArgb(240, 240, 240);
+
+        grid.UserDeletingRow += (_, ev) =>
+        {
+            if (ev.Row is not null && !ev.Row.IsNewRow && ev.Row.Tag is SnippetRow)
+            {
+                hasChanges = true;
+                btnSave.Visible = true;
+            }
+        };
 
         // Add columns
         var colAge = new WinForms.DataGridViewTextBoxColumn
@@ -2229,11 +2905,22 @@ public partial class MainWindow : Window
             ReadOnly = true,
             SortMode = WinForms.DataGridViewColumnSortMode.NotSortable
         };
+        
+        var colTotp = new WinForms.DataGridViewTextBoxColumn
+        {
+            HeaderText = "🔐",
+            Name = "Totp",
+            FillWeight = 15,
+            Width = 80,
+            ReadOnly = true,
+            SortMode = WinForms.DataGridViewColumnSortMode.NotSortable
+        };
 
         grid.Columns.Add(colAge);
         grid.Columns.Add(colLabel);
         grid.Columns.Add(colValue);
         grid.Columns.Add(colToggle);
+        grid.Columns.Add(colTotp);
         
         // Increase header height for cleaner look
         grid.ColumnHeadersHeight = 35;
@@ -2241,7 +2928,7 @@ public partial class MainWindow : Window
         // Populate grid - Age column will be empty, clock icon shown via painting
         foreach (var row in snippetRows)
         {
-            grid.Rows.Add("", row.Label, row.Value);
+            grid.Rows.Add("", row.Label, row.Value, "", "");
             grid.Rows[grid.Rows.Count - 2].Tag = row; // Store the SnippetRow in Tag
         }
 
@@ -2382,6 +3069,55 @@ public partial class MainWindow : Window
                 
                 ev.Handled = true;
             }
+            // TOTP column (column 4) - display TOTP code if secret is configured
+            else if (ev.ColumnIndex == 4 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count - 1)
+            {
+                ev.Paint(ev.CellBounds, WinForms.DataGridViewPaintParts.Background | WinForms.DataGridViewPaintParts.Border);
+                
+                var row = grid.Rows[ev.RowIndex];
+                if (row.Tag is SnippetRow snippetRow && ev.Graphics != null)
+                {
+                    // Show TOTP code if secret is configured
+                    if (!string.IsNullOrWhiteSpace(snippetRow.TotpSecret))
+                    {
+                        var totpInfo = snippetRow.TotpWithExpiry;
+                        if (totpInfo.HasValue)
+                        {
+                            var code = totpInfo.Value.Code;
+                            var remaining = totpInfo.Value.RemainingSeconds;
+                            
+                            // Format: "123456 (15s)"
+                            var displayText = $"{code}\n({remaining}s)";
+                            var totpFont = new Drawing.Font("Courier New", 9f, Drawing.FontStyle.Bold);
+                            var totpBrush = new System.Drawing.SolidBrush(Drawing.Color.FromArgb(0, 180, 0));
+                            var sf = new System.Drawing.StringFormat
+                            {
+                                Alignment = System.Drawing.StringAlignment.Center,
+                                LineAlignment = System.Drawing.StringAlignment.Center
+                            };
+                            ev.Graphics.DrawString(displayText, totpFont, totpBrush, ev.CellBounds, sf);
+                            totpBrush.Dispose();
+                            totpFont.Dispose();
+                        }
+                    }
+                    else if (hoveredRowIndex == ev.RowIndex && hoveredColumnIndex == ev.ColumnIndex)
+                    {
+                        // Show "add" icon on hover if no TOTP secret
+                        var addFont = new Drawing.Font("Segoe UI Emoji", 14f);
+                        var addBrush = new System.Drawing.SolidBrush(Drawing.Color.FromArgb(100, 150, 200));
+                        var sf = new System.Drawing.StringFormat
+                        {
+                            Alignment = System.Drawing.StringAlignment.Center,
+                            LineAlignment = System.Drawing.StringAlignment.Center
+                        };
+                        ev.Graphics.DrawString("➕", addFont, addBrush, ev.CellBounds, sf);
+                        addBrush.Dispose();
+                        addFont.Dispose();
+                    }
+                }
+                
+                ev.Handled = true;
+            }
         };
         
         // Track mouse movement for hover effect and tooltip
@@ -2401,8 +3137,27 @@ public partial class MainWindow : Window
                     row.Cells[ev.ColumnIndex].ToolTipText = tooltipText;
                 }
             }
+            // Set tooltip on Value column (2) for password generator hint
+            if (ev.ColumnIndex == 2 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count)
+            {
+                var row = grid.Rows[ev.RowIndex];
+                if (!row.IsNewRow && row.Tag is SnippetRow)
+                {
+                    row.Cells[2].ToolTipText = "Right-click to generate a custom random string";
+                }
+            }
+
+            // Set tooltip on TOTP column (4) for right-click hint
+            else if (ev.ColumnIndex == 4 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count)
+            {
+                var row = grid.Rows[ev.RowIndex];
+                if (!row.IsNewRow && row.Tag is SnippetRow snippetRow && !string.IsNullOrWhiteSpace(snippetRow.TotpSecret))
+                {
+                    row.Cells[4].ToolTipText = "Right-click to edit TOTP secret";
+                }
+            }
             
-            if ((ev.ColumnIndex == 0 || ev.ColumnIndex == 3) && ev.RowIndex >= 0)
+            if ((ev.ColumnIndex == 0 || ev.ColumnIndex == 3 || ev.ColumnIndex == 4) && ev.RowIndex >= 0)
             {
                 hoveredRowIndex = ev.RowIndex;
                 hoveredColumnIndex = ev.ColumnIndex;
@@ -2412,7 +3167,7 @@ public partial class MainWindow : Window
         
         grid.CellMouseLeave += (s, ev) =>
         {
-            if ((ev.ColumnIndex == 0 || ev.ColumnIndex == 3) && ev.RowIndex >= 0)
+            if ((ev.ColumnIndex == 0 || ev.ColumnIndex == 3 || ev.ColumnIndex == 4) && ev.RowIndex >= 0)
             {
                 hoveredRowIndex = -1;
                 hoveredColumnIndex = -1;
@@ -2430,7 +3185,7 @@ public partial class MainWindow : Window
             if (row.Tag is not SnippetRow snippetRow)
             {
                 // New row - create SnippetRow with 30 days default expiry
-                snippetRow = new SnippetRow { IsEncrypted = true, Created = DateTime.Now, Modified = DateTime.Now, ExpiryDate = DateTime.Now.AddDays(30) };
+                snippetRow = new SnippetRow { IsEncrypted = true, Created = DateTime.Now, Modified = DateTime.Now, ExpiryDate = DateTime.Now.AddDays(_defaultExpiryDays) };
                 row.Tag = snippetRow;
             }
 
@@ -2451,6 +3206,7 @@ public partial class MainWindow : Window
                 if (snippetRow.IsEncrypted && newValue != "••••••••" && !newValue.All(c => c == '•'))
                 {
                     snippetRow.ActualValue = newValue;
+                    snippetRow.ExpiryDate = DateTime.Now.AddDays(_defaultExpiryDays);
                     
                     // Re-encrypt display after a brief delay
                     var timer = new System.Windows.Forms.Timer { Interval = 150 };
@@ -2471,6 +3227,7 @@ public partial class MainWindow : Window
                 {
                     // Decrypted - just update actual value
                     snippetRow.ActualValue = newValue;
+                    snippetRow.ExpiryDate = DateTime.Now.AddDays(_defaultExpiryDays);
                 }
             }
         };
@@ -2497,138 +3254,181 @@ public partial class MainWindow : Window
                     var daysUntilExpiry = (int)(snippetRow.ExpiryDate - DateTime.Now).TotalDays;
                     var expiryText = daysUntilExpiry >= 0 ? $"Expires in {daysUntilExpiry} days" : $"Expired {Math.Abs(daysUntilExpiry)} days ago";
                     
-                    // Show a dialog with summary and date picker
+                    const int expiryWidth = 430;
+                    const int expiryHeight = 350;
+                    const int expiryRadius = 18;
+                    var expiryBack = _isDarkTheme ? Drawing.Color.FromArgb(38, 38, 44) : Drawing.Color.FromArgb(248, 249, 251);
+                    var expiryFieldBack = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White;
+                    var expiryTextColor = _isDarkTheme ? Drawing.Color.FromArgb(232, 232, 238) : Drawing.Color.FromArgb(30, 32, 36);
+                    var expiryDimColor = _isDarkTheme ? Drawing.Color.FromArgb(155, 155, 165) : Drawing.Color.FromArgb(95, 100, 108);
+                    var expiryAccent = _isDarkTheme ? Drawing.Color.FromArgb(110, 195, 60) : Drawing.Color.FromArgb(55, 135, 45);
+                    var expiryStatusColor = daysUntilExpiry < 7 ? Drawing.Color.FromArgb(255, 100, 100) :
+                                           (daysUntilExpiry <= 14 ? Drawing.Color.FromArgb(255, 200, 100) :
+                                           Drawing.Color.FromArgb(100, 200, 100));
+
                     using var inputForm = new WinForms.Form
                     {
-                        Width = 450,
-                        Height = 420,
-                        FormBorderStyle = WinForms.FormBorderStyle.FixedDialog,
+                        FormBorderStyle = WinForms.FormBorderStyle.None,
+                        ClientSize = new Drawing.Size(expiryWidth, expiryHeight),
                         Text = "Expiry Date",
                         StartPosition = WinForms.FormStartPosition.CenterParent,
-                        MaximizeBox = false,
-                        MinimizeBox = false,
+                        ShowInTaskbar = false,
                         TopMost = true,
-                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White,
-                        Padding = new WinForms.Padding(25)
+                        KeyPreview = true,
+                        BackColor = expiryBack
                     };
-                    
-                    // Entry label
+                    using (var expiryFormPath = RoundedRectPath(new Drawing.Rectangle(0, 0, expiryWidth - 1, expiryHeight - 1), expiryRadius))
+                        inputForm.Region = new Drawing.Region(expiryFormPath);
+
+                    var expiryCard = new WinForms.Panel { Dock = WinForms.DockStyle.Fill, BackColor = expiryBack };
+                    expiryCard.Paint += (_, pe) =>
+                    {
+                        pe.Graphics.SmoothingMode = Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                        using var path = RoundedRectPath(new Drawing.Rectangle(0, 0, expiryCard.Width - 1, expiryCard.Height - 1), expiryRadius);
+                        using var pen = new Drawing.Pen(_isDarkTheme ? Drawing.Color.FromArgb(72, 72, 82) : Drawing.Color.FromArgb(210, 214, 220), 1f);
+                        pe.Graphics.DrawPath(pen, path);
+                    };
+
+                    var expiryIcon = new WinForms.Label
+                    {
+                        Left = 28, Top = 22, Width = 34, Height = 34,
+                        Text = "⏰",
+                        Font = new Drawing.Font("Segoe UI Emoji", 19f),
+                        ForeColor = expiryAccent,
+                        BackColor = Drawing.Color.Transparent,
+                        TextAlign = Drawing.ContentAlignment.MiddleCenter
+                    };
+
                     var entryLabel = new WinForms.Label
                     {
-                        Left = 30,
-                        Top = 30,
-                        Width = 380,
-                        Height = 35,
-                        Text = $"Entry: {snippetRow.Label}",
-                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black,
-                        Font = new Drawing.Font("Segoe UI", 11f, Drawing.FontStyle.Bold),
-                        AutoSize = false
+                        Left = 68, Top = 24, Width = 150, Height = 28,
+                        Text = "Expiry date",
+                        ForeColor = expiryTextColor,
+                        Font = new Drawing.Font("Segoe UI", 12f, Drawing.FontStyle.Bold),
+                        BackColor = Drawing.Color.Transparent
                     };
-                    
+                    var entryHeaderText = $"|  {snippetRow.Label}";
+                    var entryHeaderFontSize = 12f;
+                    while (entryHeaderFontSize > 8f)
+                    {
+                        using var measureFont = new Drawing.Font("Segoe UI", entryHeaderFontSize, Drawing.FontStyle.Bold);
+                        if (WinForms.TextRenderer.MeasureText(entryHeaderText, measureFont).Width <= 205)
+                            break;
+                        entryHeaderFontSize -= 0.5f;
+                    }
+                    var entryNameLabel = new WinForms.Label
+                    {
+                        Left = 210, Top = 24, Width = 205, Height = 28,
+                        Text = entryHeaderText,
+                        ForeColor = expiryDimColor,
+                        Font = new Drawing.Font("Segoe UI", entryHeaderFontSize, Drawing.FontStyle.Bold),
+                        BackColor = Drawing.Color.Transparent,
+                        TextAlign = Drawing.ContentAlignment.MiddleLeft
+                    };
                     var label1 = new WinForms.Label
                     {
-                        Left = 30,
-                        Top = 75,
-                        Width = 380,
-                        Height = 30,
-                        Text = $"First Added: {snippetRow.Created:yyyy-MM-dd HH:mm}",
-                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
-                        Font = new Drawing.Font("Segoe UI", 10f),
-                        AutoSize = false
+                        Left = 34, Top = 102, Width = 145, Height = 22,
+                        Text = "First added",
+                        ForeColor = expiryDimColor,
+                        Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
+                        BackColor = Drawing.Color.Transparent
                     };
-                    
                     var label2 = new WinForms.Label
                     {
-                        Left = 30,
-                        Top = 110,
-                        Width = 380,
-                        Height = 30,
-                        Text = $"Last Modified: {snippetRow.Modified:yyyy-MM-dd HH:mm}",
-                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
-                        Font = new Drawing.Font("Segoe UI", 10f),
-                        AutoSize = false
+                        Left = 34, Top = 130, Width = 145, Height = 22,
+                        Text = "Last modified",
+                        ForeColor = expiryDimColor,
+                        Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
+                        BackColor = Drawing.Color.Transparent
                     };
-                    
                     var label3 = new WinForms.Label
                     {
-                        Left = 30,
-                        Top = 145,
-                        Width = 380,
-                        Height = 30,
-                        Text = expiryText,
-                        ForeColor = daysUntilExpiry < 7 ? Drawing.Color.FromArgb(255, 100, 100) : 
-                                   (daysUntilExpiry <= 14 ? Drawing.Color.FromArgb(255, 200, 100) : 
-                                   Drawing.Color.FromArgb(100, 200, 100)),
-                        Font = new Drawing.Font("Segoe UI", 10f, Drawing.FontStyle.Bold),
-                        AutoSize = false
+                        Left = 34, Top = 158, Width = 145, Height = 22,
+                        Text = "Expiry date",
+                        ForeColor = expiryDimColor,
+                        Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
+                        BackColor = Drawing.Color.Transparent
                     };
-                    
+                    var label1Value = new WinForms.Label
+                    {
+                        Left = 184, Top = 102, Width = 220, Height = 22,
+                        Text = snippetRow.Created.ToString("yyyy-MM-dd HH:mm"),
+                        ForeColor = expiryTextColor,
+                        Font = new Drawing.Font("Consolas", 9f),
+                        BackColor = Drawing.Color.Transparent
+                    };
+                    var label2Value = new WinForms.Label
+                    {
+                        Left = 184, Top = 130, Width = 220, Height = 22,
+                        Text = snippetRow.Modified.ToString("yyyy-MM-dd HH:mm"),
+                        ForeColor = expiryTextColor,
+                        Font = new Drawing.Font("Consolas", 9f),
+                        BackColor = Drawing.Color.Transparent
+                    };
+                    var label3Value = new WinForms.Label
+                    {
+                        Left = 184, Top = 158, Width = 220, Height = 22,
+                        Text = snippetRow.ExpiryDate.ToString("yyyy-MM-dd"),
+                        ForeColor = expiryStatusColor,
+                        Font = new Drawing.Font("Consolas", 9f, Drawing.FontStyle.Bold),
+                        BackColor = Drawing.Color.Transparent
+                    };
                     var separatorLabel = new WinForms.Label
                     {
-                        Left = 30,
-                        Top = 195,
-                        Width = 380,
-                        Height = 30,
-                        Text = "Set new expiry date:",
-                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(160, 160, 165) : Drawing.Color.DarkGray,
-                        Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold)
+                        Left = 34, Top = 190, Width = 370, Height = 22,
+                        Text = $"{expiryText}  |  Set new date",
+                        ForeColor = expiryAccent,
+                        Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
+                        BackColor = Drawing.Color.Transparent
                     };
-                    
                     var datePicker = new WinForms.DateTimePicker
                     {
-                        Left = 30,
-                        Top = 235,
-                        Width = 380,
-                        Height = 35,
-                        Font = new Drawing.Font("Segoe UI", 11f),
+                        Left = 34, Top = 218, Width = 370, Height = 32,
+                        Font = new Drawing.Font("Segoe UI", 10f),
                         Format = WinForms.DateTimePickerFormat.Short,
-                        Value = snippetRow.ExpiryDate < DateTime.Now ? DateTime.Now.AddDays(30) : snippetRow.ExpiryDate,
-                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 50) : Drawing.Color.White,
-                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
-                        CalendarForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
-                        CalendarMonthBackground = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 50) : Drawing.Color.White
+                        Value = snippetRow.ExpiryDate < DateTime.Now ? DateTime.Now.AddDays(_defaultExpiryDays) : snippetRow.ExpiryDate,
+                        BackColor = expiryFieldBack,
+                        ForeColor = expiryTextColor,
+                        CalendarForeColor = expiryTextColor,
+                        CalendarMonthBackground = expiryFieldBack
                     };
-                    
                     var btnOk = new WinForms.Button
                     {
-                        Text = "Update",
-                        Left = 220,
-                        Top = 300,
-                        Width = 90,
-                        Height = 45,
+                        Text = "Update", Left = 105, Top = 292, Width = 104, Height = 40,
                         DialogResult = WinForms.DialogResult.OK,
-                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(0, 120, 80) : Drawing.Color.LightGreen,
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(0, 120, 80) : Drawing.Color.FromArgb(0, 145, 90),
                         ForeColor = Drawing.Color.White,
                         FlatStyle = WinForms.FlatStyle.Flat,
                         Font = new Drawing.Font("Segoe UI", 10f, Drawing.FontStyle.Bold),
-                        Cursor = WinForms.Cursors.Hand
+                        Cursor = WinForms.Cursors.Hand,
+                        UseVisualStyleBackColor = false,
+                        TabStop = false
                     };
                     btnOk.FlatAppearance.BorderSize = 0;
-                    
+                    btnOk.FlatAppearance.MouseOverBackColor = btnOk.BackColor;
+                    btnOk.FlatAppearance.MouseDownBackColor = btnOk.BackColor;
                     var btnCancel = new WinForms.Button
                     {
-                        Text = "Cancel",
-                        Left = 320,
-                        Top = 300,
-                        Width = 90,
-                        Height = 45,
+                        Text = "Cancel", Left = 221, Top = 292, Width = 104, Height = 40,
                         DialogResult = WinForms.DialogResult.Cancel,
-                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(80, 40, 40) : Drawing.Color.LightCoral,
-                        ForeColor = Drawing.Color.White,
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(60, 60, 68) : Drawing.Color.FromArgb(225, 226, 230),
+                        ForeColor = _isDarkTheme ? Drawing.Color.White : Drawing.Color.FromArgb(40, 40, 40),
                         FlatStyle = WinForms.FlatStyle.Flat,
-                        Font = new Drawing.Font("Segoe UI", 10f, Drawing.FontStyle.Bold),
-                        Cursor = WinForms.Cursors.Hand
+                        Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
+                        Cursor = WinForms.Cursors.Hand,
+                        UseVisualStyleBackColor = false,
+                        TabStop = false
                     };
                     btnCancel.FlatAppearance.BorderSize = 0;
-                    
-                    inputForm.Controls.Add(entryLabel);
-                    inputForm.Controls.Add(label1);
-                    inputForm.Controls.Add(label2);
-                    inputForm.Controls.Add(label3);
-                    inputForm.Controls.Add(separatorLabel);
-                    inputForm.Controls.Add(datePicker);
-                    inputForm.Controls.Add(btnOk);
-                    inputForm.Controls.Add(btnCancel);
+                    btnCancel.FlatAppearance.MouseOverBackColor = btnCancel.BackColor;
+                    btnCancel.FlatAppearance.MouseDownBackColor = btnCancel.BackColor;
+
+                    expiryCard.Controls.AddRange(new WinForms.Control[]
+                    {
+                        expiryIcon, entryLabel, entryNameLabel, label1, label1Value, label2, label2Value,
+                        label3, label3Value, separatorLabel, datePicker, btnOk, btnCancel
+                    });
+                    inputForm.Controls.Add(expiryCard);
                     inputForm.AcceptButton = btnOk;
                     inputForm.CancelButton = btnCancel;
                     
@@ -2667,6 +3467,956 @@ public partial class MainWindow : Window
                     UpdateStatusColor();
                     // Refresh the eye icon display
                     grid.InvalidateCell(3, ev.RowIndex);
+                }
+            }
+            // Value column (column 2) - copy value with blink highlight
+            else if (ev.ColumnIndex == 2 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count - 1)
+            {
+                var row = grid.Rows[ev.RowIndex];
+                if (row.Tag is SnippetRow snippetRow)
+                {
+                    var value = snippetRow.ActualValue;
+                    if (string.IsNullOrWhiteSpace(value)) return;
+
+                    if (!TrySetClipboardWithoutHistory(value))
+                        System.Windows.Clipboard.SetText(value);
+
+                    // Clear any row selection to prevent whole row highlighting
+                    grid.ClearSelection();
+
+                    // Blink effect: briefly highlight the value cell with background color
+                    var originalBackColor = row.Cells[2].Style.BackColor;
+                    var highlightColor = _isDarkTheme ? Drawing.Color.FromArgb(60, 120, 80) : Drawing.Color.FromArgb(180, 220, 180);
+                    row.Cells[2].Style.BackColor = highlightColor;
+
+                    if (btnDecryptAll.Text == "Show All")
+                    {
+                        btnDecryptAll.Visible = false;
+                        btnDecryptAll.Enabled = false;
+                    }
+
+                    var blinkTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+                    blinkTimer.Tick += (_, _) =>
+                    {
+                        blinkTimer.Stop();
+                        blinkTimer.Dispose();
+                        row.Cells[2].Style.BackColor = originalBackColor;
+                    };
+                    blinkTimer.Start();
+                }
+            }
+            // TOTP column - copy TOTP or manage TOTP secret with blink highlight
+            else if (ev.ColumnIndex == 4 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count - 1)
+            {
+                var row = grid.Rows[ev.RowIndex];
+                if (row.Tag is SnippetRow snippetRow && !string.IsNullOrWhiteSpace(snippetRow.TotpSecret))
+                {
+                    bool ctrlHeld = (WinForms.Control.ModifierKeys & WinForms.Keys.Control) != 0;
+                    var totp = snippetRow.CurrentTotp;
+                    if (string.IsNullOrWhiteSpace(totp)) return;
+
+                    var highlightColor = _isDarkTheme ? Drawing.Color.FromArgb(60, 120, 80) : Drawing.Color.FromArgb(180, 220, 180);
+                    var blinkDuration = 1000;
+
+                    // Clear any row selection to prevent whole row highlighting
+                    grid.ClearSelection();
+
+                    if (ctrlHeld)
+                    {
+                        var textToCopy = $"{snippetRow.ActualValue}{totp}";
+                        if (!TrySetClipboardWithoutHistory(textToCopy))
+                            System.Windows.Clipboard.SetText(textToCopy);
+
+                        // Blink effect: highlight only value (2) and TOTP (4) cells, NOT label (1)
+                        var originalBackColor2 = row.Cells[2].Style.BackColor;
+                        var originalBackColor4 = row.Cells[4].Style.BackColor;
+                        row.Cells[2].Style.BackColor = highlightColor;
+                        row.Cells[4].Style.BackColor = highlightColor;
+
+                        if (btnDecryptAll.Text == "Show All")
+                        {
+                            btnDecryptAll.Visible = false;
+                            btnDecryptAll.Enabled = false;
+                        }
+
+                        var blinkTimer = new System.Windows.Forms.Timer { Interval = blinkDuration };
+                        blinkTimer.Tick += (_, _) =>
+                        {
+                            blinkTimer.Stop();
+                            blinkTimer.Dispose();
+                            row.Cells[2].Style.BackColor = originalBackColor2;
+                            row.Cells[4].Style.BackColor = originalBackColor4;
+                        };
+                        blinkTimer.Start();
+                    }
+                    else
+                    {
+                        if (!TrySetClipboardWithoutHistory(totp))
+                            System.Windows.Clipboard.SetText(totp);
+
+                        // Blink effect: briefly highlight only the TOTP cell
+                        var originalBackColor = row.Cells[4].Style.BackColor;
+                        row.Cells[4].Style.BackColor = highlightColor;
+
+                        if (btnDecryptAll.Text == "Show All")
+                        {
+                            btnDecryptAll.Visible = false;
+                            btnDecryptAll.Enabled = false;
+                        }
+
+                        var blinkTimer = new System.Windows.Forms.Timer { Interval = blinkDuration };
+                        blinkTimer.Tick += (_, _) =>
+                        {
+                            blinkTimer.Stop();
+                            blinkTimer.Dispose();
+                            row.Cells[4].Style.BackColor = originalBackColor;
+                        };
+                        blinkTimer.Start();
+                    }
+                }
+            }
+        };
+
+        // Helper function to generate a secure password
+        string GenerateSecurePassword(int length = 16)
+        {
+            const string uppercase = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+            const string lowercase = "abcdefghijklmnopqrstuvwxyz";
+            const string digits = "0123456789";
+            const string specialChars = "!@#$%^&*-_+="; // RHEL-safe characters
+            
+            var rng = new System.Random();
+            var password = new System.Text.StringBuilder();
+            
+            // Ensure at least one of each required character type
+            password.Append(uppercase[rng.Next(uppercase.Length)]);
+            password.Append(lowercase[rng.Next(lowercase.Length)]);
+            password.Append(digits[rng.Next(digits.Length)]);
+            password.Append(specialChars[rng.Next(specialChars.Length)]);
+            
+            // Fill the rest randomly
+            var allChars = uppercase + lowercase + digits + specialChars;
+            while (password.Length < length)
+            {
+                var nextChar = allChars[rng.Next(allChars.Length)];
+                
+                // Avoid repeating characters back-to-back
+                if (password.Length > 0 && password[password.Length - 1] != nextChar)
+                {
+                    password.Append(nextChar);
+                }
+            }
+            
+            // Shuffle to mix required chars with random ones
+            var shuffled = password.ToString().ToCharArray();
+            for (int i = shuffled.Length - 1; i > 0; i--)
+            {
+                int randomIndex = rng.Next(i + 1);
+                var temp = shuffled[i];
+                shuffled[i] = shuffled[randomIndex];
+                shuffled[randomIndex] = temp;
+            }
+            
+            return new string(shuffled);
+        }
+
+        // Handle right-click on TOTP column to edit/manage TOTP secret
+        grid.CellMouseDown += (s, ev) =>
+        {
+            if (ev.Button == WinForms.MouseButtons.Right && ev.ColumnIndex == 4 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count - 1)
+            {
+                var row = grid.Rows[ev.RowIndex];
+                if (row.Tag is SnippetRow snippetRow)
+                {
+                    // Open TOTP management dialog — borderless glass card, styled like the About page.
+                    var dimColor = _isDarkTheme ? Drawing.Color.FromArgb(150, 150, 156) : Drawing.Color.FromArgb(120, 120, 120);
+                    var accentColor = _isDarkTheme ? Drawing.Color.FromArgb(110, 195, 60) : Drawing.Color.FromArgb(70, 140, 35);
+                    var textColor = _isDarkTheme ? Drawing.Color.FromArgb(210, 210, 216) : Drawing.Color.FromArgb(40, 40, 40);
+                    var separatorColor = _isDarkTheme ? Drawing.Color.FromArgb(70, 70, 78) : Drawing.Color.FromArgb(225, 225, 230);
+                    var cardTopColor = _isDarkTheme ? Drawing.Color.FromArgb(48, 48, 55) : Drawing.Color.FromArgb(255, 255, 255);
+                    var cardBottomColor = _isDarkTheme ? Drawing.Color.FromArgb(38, 38, 44) : Drawing.Color.FromArgb(246, 247, 249);
+                    var cardBorderColor = _isDarkTheme ? Drawing.Color.FromArgb(255, 255, 255) : Drawing.Color.FromArgb(0, 0, 0);
+                    var fieldBg = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 52) : Drawing.Color.FromArgb(244, 245, 247);
+
+                    const int cardWidth = 440;
+                    const int cornerRadius = 18;
+                    const int pad = 26;
+                    const int collapsedHeight = 368;
+                    const int expandedHeight = 624;
+                    var contentWidth = cardWidth - pad * 2;
+
+                    using var totpForm = new WinForms.Form
+                    {
+                        FormBorderStyle = WinForms.FormBorderStyle.None,
+                        StartPosition = WinForms.FormStartPosition.CenterParent,
+                        ClientSize = new Drawing.Size(cardWidth, collapsedHeight),
+                        Text = "Manage TOTP",
+                        ShowInTaskbar = false,
+                        TopMost = true,
+                        AutoScaleMode = WinForms.AutoScaleMode.None,
+                        BackColor = cardBottomColor,
+                        KeyPreview = true
+                    };
+                    using (var formRegionPath = RoundedRectPath(new Drawing.Rectangle(0, 0, totpForm.Width - 1, totpForm.Height - 1), cornerRadius))
+                    {
+                        totpForm.Region = new Drawing.Region(formRegionPath);
+                    }
+
+                    var card = new WinForms.Panel
+                    {
+                        Left = 0,
+                        Top = 0,
+                        Width = cardWidth,
+                        Height = collapsedHeight,
+                        BackColor = cardBottomColor
+                    };
+                    card.Paint += (s3, e3) =>
+                    {
+                        var rect = new Drawing.Rectangle(0, 0, card.Width - 1, card.Height - 1);
+                        e3.Graphics.SmoothingMode = Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                        using var path = RoundedRectPath(rect, cornerRadius);
+                        using var fill = new Drawing.Drawing2D.LinearGradientBrush(rect, cardTopColor, cardBottomColor, 90f);
+                        e3.Graphics.FillPath(fill, path);
+                        using var borderPen = new Drawing.Pen(Drawing.Color.FromArgb(_isDarkTheme ? 22 : 18, cardBorderColor), 1f);
+                        e3.Graphics.DrawPath(borderPen, path);
+                        using var highlightPen = new Drawing.Pen(Drawing.Color.FromArgb(_isDarkTheme ? 14 : 130, Drawing.Color.White), 1f);
+                        e3.Graphics.DrawLine(highlightPen, 18, 1, card.Width - 18, 1);
+                    };
+                    using (var cardRegionPath = RoundedRectPath(new Drawing.Rectangle(0, 0, card.Width - 1, card.Height - 1), cornerRadius))
+                    {
+                        card.Region = new Drawing.Region(cardRegionPath);
+                    }
+
+                    // Fancy circular close button, top-right corner (matches the About page).
+                    const int closeSize = 26;
+                    var closeButtonNormalBack = _isDarkTheme ? Drawing.Color.FromArgb(58, 58, 66) : Drawing.Color.FromArgb(228, 229, 233);
+                    var closeButton = new WinForms.Button
+                    {
+                        Left = cardWidth - closeSize - 14,
+                        Top = 14,
+                        Width = closeSize,
+                        Height = closeSize,
+                        Text = "✕",
+                        Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
+                        FlatStyle = WinForms.FlatStyle.Flat,
+                        ForeColor = dimColor,
+                        BackColor = closeButtonNormalBack,
+                        Cursor = WinForms.Cursors.Hand,
+                        TabStop = false,
+                        UseVisualStyleBackColor = false
+                    };
+                    closeButton.FlatAppearance.BorderSize = 0;
+                    using (var closeRegionPath = RoundedRectPath(new Drawing.Rectangle(0, 0, closeSize - 1, closeSize - 1), closeSize / 2))
+                    {
+                        closeButton.Region = new Drawing.Region(closeRegionPath);
+                    }
+                    closeButton.MouseEnter += (_, _) =>
+                    {
+                        closeButton.BackColor = Drawing.Color.FromArgb(232, 17, 35);
+                        closeButton.ForeColor = Drawing.Color.White;
+                    };
+                    closeButton.MouseLeave += (_, _) =>
+                    {
+                        closeButton.BackColor = closeButtonNormalBack;
+                        closeButton.ForeColor = dimColor;
+                    };
+
+                    // Header: key icon + title, built as separate emoji/text labels so the glyph renders correctly.
+                    var headerFont = new Drawing.Font("Segoe UI Emoji", 15f);
+                    var titleFont = new Drawing.Font("Segoe UI", 15f, Drawing.FontStyle.Bold);
+                    const string headerEmoji = "🔐";
+                    const string headerText = "Manage TOTP";
+                    var headerEmojiWidth = WinForms.TextRenderer.MeasureText(headerEmoji, headerFont).Width + 4;
+                    var headerTextWidth = WinForms.TextRenderer.MeasureText(headerText, titleFont).Width + 4;
+                    var headerRowWidth = headerEmojiWidth + headerTextWidth;
+
+                    var headerRow = new WinForms.Panel
+                    {
+                        Left = pad + (contentWidth - headerRowWidth) / 2,
+                        Top = 24,
+                        Width = headerRowWidth,
+                        Height = 30,
+                        BackColor = Drawing.Color.Transparent
+                    };
+                    var headerEmojiLbl = new WinForms.Label
+                    {
+                        Left = 0,
+                        Top = 0,
+                        Width = headerEmojiWidth,
+                        Height = 30,
+                        Text = headerEmoji,
+                        Font = headerFont,
+                        ForeColor = accentColor,
+                        BackColor = Drawing.Color.Transparent,
+                        TextAlign = Drawing.ContentAlignment.MiddleCenter
+                    };
+                    var headerTextLbl = new WinForms.Label
+                    {
+                        Left = headerEmojiWidth,
+                        Top = 0,
+                        Width = headerTextWidth,
+                        Height = 30,
+                        Text = headerText,
+                        Font = titleFont,
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(230, 230, 235) : Drawing.Color.FromArgb(25, 25, 25),
+                        BackColor = Drawing.Color.Transparent,
+                        TextAlign = Drawing.ContentAlignment.MiddleLeft
+                    };
+                    headerRow.Controls.AddRange(new WinForms.Control[] { headerEmojiLbl, headerTextLbl });
+
+                    var labelEntry = new WinForms.Label
+                    {
+                        Left = pad,
+                        Top = 64,
+                        Width = contentWidth,
+                        Height = 22,
+                        Text = $"Entry: {snippetRow.Label}",
+                        ForeColor = dimColor,
+                        Font = new Drawing.Font("Segoe UI", 9.5f),
+                        BackColor = Drawing.Color.Transparent,
+                        TextAlign = Drawing.ContentAlignment.MiddleCenter
+                    };
+
+                    var separator1 = new WinForms.Panel { Left = pad, Top = 92, Width = contentWidth, Height = 1, BackColor = separatorColor };
+
+                    var labelSecret = new WinForms.Label
+                    {
+                        Left = pad,
+                        Top = 106,
+                        Width = contentWidth,
+                        Height = 18,
+                        Text = "SECRET (BASE32)",
+                        Font = new Drawing.Font("Segoe UI", 8.5f, Drawing.FontStyle.Bold),
+                        ForeColor = accentColor,
+                        BackColor = Drawing.Color.Transparent
+                    };
+
+                    var textSecret = new WinForms.TextBox
+                    {
+                        Left = pad,
+                        Top = 126,
+                        Width = contentWidth,
+                        Height = 56,
+                        Font = new Drawing.Font("Consolas", 10f),
+                        BackColor = fieldBg,
+                        ForeColor = textColor,
+                        Multiline = true,
+                        Text = snippetRow.TotpSecret ?? string.Empty,
+                        BorderStyle = WinForms.BorderStyle.FixedSingle
+                    };
+
+                    var labelInfo = new WinForms.Label
+                    {
+                        Left = pad,
+                        Top = 190,
+                        Width = contentWidth,
+                        Height = 42,
+                        Text = "To get the secret: ipa otptoken-show <USERNAME> (look for 'Key')",
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(120, 190, 230) : Drawing.Color.FromArgb(0, 100, 150),
+                        Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Italic),
+                        AutoSize = false
+                    };
+
+                    var separator2 = new WinForms.Panel { Left = pad, Top = 230, Width = contentWidth, Height = 1, BackColor = separatorColor };
+
+                    var qrToggleButton = new WinForms.Button
+                    {
+                        Text = "▦  Show QR Code",
+                        Left = pad + (contentWidth - 200) / 2,
+                        Top = 246,
+                        Width = 200,
+                        Height = 34,
+                        FlatStyle = WinForms.FlatStyle.Flat,
+                        BackColor = fieldBg,
+                        ForeColor = accentColor,
+                        Font = new Drawing.Font("Segoe UI", 9.5f, Drawing.FontStyle.Bold),
+                        Cursor = WinForms.Cursors.Hand
+                    };
+                    qrToggleButton.FlatAppearance.BorderColor = separatorColor;
+                    qrToggleButton.FlatAppearance.BorderSize = 1;
+                    using (var qrBtnRegionPath = RoundedRectPath(new Drawing.Rectangle(0, 0, qrToggleButton.Width - 1, qrToggleButton.Height - 1), 10))
+                    {
+                        qrToggleButton.Region = new Drawing.Region(qrBtnRegionPath);
+                    }
+
+                    var qrPictureBox = new WinForms.PictureBox
+                    {
+                        Left = pad + (contentWidth - 200) / 2,
+                        Top = 298,
+                        Width = 200,
+                        Height = 200,
+                        BackColor = Drawing.Color.White,
+                        SizeMode = WinForms.PictureBoxSizeMode.Zoom,
+                        Visible = false
+                    };
+
+                    var qrCaptionLabel = new WinForms.Label
+                    {
+                        Left = pad,
+                        Top = 508,
+                        Width = contentWidth,
+                        Height = 32,
+                        Text = "Scan with Google Authenticator, Microsoft Authenticator, or a similar app.",
+                        Font = new Drawing.Font("Segoe UI", 8f),
+                        ForeColor = dimColor,
+                        BackColor = Drawing.Color.Transparent,
+                        TextAlign = Drawing.ContentAlignment.MiddleCenter,
+                        Visible = false
+                    };
+
+                    var btnSaveTOTP = new WinForms.Button
+                    {
+                        Text = "Save",
+                        Left = pad + (contentWidth - 264) / 2,
+                        Top = collapsedHeight - 24 - 40,
+                        Width = 128,
+                        Height = 40,
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(0, 120, 80) : Drawing.Color.FromArgb(0, 150, 100),
+                        ForeColor = Drawing.Color.White,
+                        FlatStyle = WinForms.FlatStyle.Flat,
+                        Font = new Drawing.Font("Segoe UI", 10f, Drawing.FontStyle.Bold),
+                        Cursor = WinForms.Cursors.Hand
+                    };
+                    btnSaveTOTP.FlatAppearance.BorderSize = 0;
+                    using (var saveBtnRegionPath = RoundedRectPath(new Drawing.Rectangle(0, 0, btnSaveTOTP.Width - 1, btnSaveTOTP.Height - 1), 10))
+                    {
+                        btnSaveTOTP.Region = new Drawing.Region(saveBtnRegionPath);
+                    }
+
+                    var btnCancelTOTP = new WinForms.Button
+                    {
+                        Text = "Cancel",
+                        Left = btnSaveTOTP.Left + 128 + 8,
+                        Top = collapsedHeight - 24 - 40,
+                        Width = 128,
+                        Height = 40,
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(60, 60, 68) : Drawing.Color.FromArgb(225, 226, 230),
+                        ForeColor = _isDarkTheme ? Drawing.Color.White : Drawing.Color.FromArgb(40, 40, 40),
+                        FlatStyle = WinForms.FlatStyle.Flat,
+                        Font = new Drawing.Font("Segoe UI", 10f, Drawing.FontStyle.Bold),
+                        Cursor = WinForms.Cursors.Hand
+                    };
+                    btnCancelTOTP.FlatAppearance.BorderSize = 0;
+                    using (var cancelBtnRegionPath = RoundedRectPath(new Drawing.Rectangle(0, 0, btnCancelTOTP.Width - 1, btnCancelTOTP.Height - 1), 10))
+                    {
+                        btnCancelTOTP.Region = new Drawing.Region(cancelBtnRegionPath);
+                    }
+
+                    // Track edits so closing (Escape/X/Cancel) with unsaved text always confirms first.
+                    var totpHasChanges = false;
+                    textSecret.TextChanged += (_, _) => totpHasChanges = true;
+
+                    var qrExpanded = false;
+                    void ApplyQrState(bool expanded)
+                    {
+                        var newHeight = expanded ? expandedHeight : collapsedHeight;
+                        totpForm.ClientSize = new Drawing.Size(cardWidth, newHeight);
+                        using (var formRegionPath2 = RoundedRectPath(new Drawing.Rectangle(0, 0, totpForm.Width - 1, totpForm.Height - 1), cornerRadius))
+                        {
+                            totpForm.Region = new Drawing.Region(formRegionPath2);
+                        }
+                        card.Height = newHeight;
+                        using (var cardRegionPath2 = RoundedRectPath(new Drawing.Rectangle(0, 0, card.Width - 1, card.Height - 1), cornerRadius))
+                        {
+                            card.Region = new Drawing.Region(cardRegionPath2);
+                        }
+                        card.Invalidate();
+
+                        qrPictureBox.Visible = expanded;
+                        qrCaptionLabel.Visible = expanded;
+                        qrToggleButton.Text = expanded ? "▲  Hide QR Code" : "▦  Show QR Code";
+
+                        var buttonsTop = newHeight - 24 - 40;
+                        btnSaveTOTP.Top = buttonsTop;
+                        btnCancelTOTP.Top = buttonsTop;
+                    }
+
+                    qrToggleButton.Click += (_, _) =>
+                    {
+                        if (!qrExpanded)
+                        {
+                            var secretForQr = textSecret.Text.Trim();
+                            if (string.IsNullOrWhiteSpace(secretForQr) || !TotpSetupHelper.IsValidBase32Secret(secretForQr))
+                            {
+                                WinForms.MessageBox.Show(
+                                    "Enter a valid Base32 TOTP secret first.",
+                                    "PinBubble",
+                                    WinForms.MessageBoxButtons.OK,
+                                    WinForms.MessageBoxIcon.Warning);
+                                return;
+                            }
+
+                            try
+                            {
+                                var uri = TotpProvider.GetProvisioningUri(secretForQr, snippetRow.Label, "PinBubble");
+                                using var qrData = QRCodeGenerator.GenerateQrCode(uri, QRCodeGenerator.ECCLevel.Q);
+                                using var qrRenderer = new QRCode(qrData);
+                                var oldImage = qrPictureBox.Image;
+                                qrPictureBox.Image = qrRenderer.GetGraphic(8);
+                                oldImage?.Dispose();
+                            }
+                            catch
+                            {
+                                WinForms.MessageBox.Show(
+                                    "Failed to generate the QR code.",
+                                    "PinBubble",
+                                    WinForms.MessageBoxButtons.OK,
+                                    WinForms.MessageBoxIcon.Error);
+                                return;
+                            }
+                        }
+
+                        qrExpanded = !qrExpanded;
+                        ApplyQrState(qrExpanded);
+                    };
+
+                    // Closing with unsaved text (Escape, the X button, or Cancel) always confirms first.
+                    void CloseTotpDialog()
+                    {
+                        if (!totpHasChanges)
+                        {
+                            totpForm.DialogResult = WinForms.DialogResult.Cancel;
+                            totpForm.Close();
+                            return;
+                        }
+
+                        var result = WinForms.MessageBox.Show(
+                            "You have an unsaved TOTP secret. Do you want to save before closing?",
+                            "PinBubble - Unsaved Changes",
+                            WinForms.MessageBoxButtons.YesNoCancel,
+                            WinForms.MessageBoxIcon.Question);
+
+                        if (result == WinForms.DialogResult.Cancel)
+                            return;
+
+                        totpHasChanges = false;
+                        totpForm.DialogResult = result == WinForms.DialogResult.Yes
+                            ? WinForms.DialogResult.OK
+                            : WinForms.DialogResult.Cancel;
+                        totpForm.Close();
+                    }
+
+                    closeButton.Click += (_, _) => CloseTotpDialog();
+                    btnCancelTOTP.Click += (_, _) => CloseTotpDialog();
+                    btnSaveTOTP.Click += (_, _) =>
+                    {
+                        totpHasChanges = false;
+                        totpForm.DialogResult = WinForms.DialogResult.OK;
+                        totpForm.Close();
+                    };
+                    totpForm.KeyDown += (_, ke) =>
+                    {
+                        if (ke.KeyCode == WinForms.Keys.Escape)
+                            CloseTotpDialog();
+                    };
+                    totpForm.FormClosed += (_, _) => qrPictureBox.Image?.Dispose();
+
+                    // Borderless window needs manual drag support via the card's empty background.
+                    bool totpDragging = false;
+                    Drawing.Point totpDragCursor = Drawing.Point.Empty;
+                    Drawing.Point totpDragForm = Drawing.Point.Empty;
+                    card.MouseDown += (_, _) =>
+                    {
+                        totpDragging = true;
+                        totpDragCursor = WinForms.Cursor.Position;
+                        totpDragForm = totpForm.Location;
+                    };
+                    card.MouseMove += (_, _) =>
+                    {
+                        if (!totpDragging) return;
+                        var diff = Drawing.Point.Subtract(WinForms.Cursor.Position, new Drawing.Size(totpDragCursor));
+                        totpForm.Location = Drawing.Point.Add(totpDragForm, new Drawing.Size(diff));
+                    };
+                    card.MouseUp += (_, _) => totpDragging = false;
+
+                    card.Controls.AddRange(new WinForms.Control[]
+                    {
+                        headerRow,
+                        labelEntry,
+                        separator1,
+                        labelSecret,
+                        textSecret,
+                        labelInfo,
+                        separator2,
+                        qrToggleButton,
+                        qrPictureBox,
+                        qrCaptionLabel,
+                        btnSaveTOTP,
+                        btnCancelTOTP,
+                        closeButton
+                    });
+                    totpForm.Controls.Add(card);
+                    totpForm.AcceptButton = btnSaveTOTP;
+
+                    if (totpForm.ShowDialog() == WinForms.DialogResult.OK)
+                    {
+                        snippetRow.TotpSecret = textSecret.Text.Trim();
+                        if (string.IsNullOrWhiteSpace(snippetRow.TotpSecret))
+                        {
+                            snippetRow.TotpSecret = null;
+                        }
+                        hasChanges = true;
+                        btnSave.Visible = true;
+                        // Refresh TOTP display
+                        grid.InvalidateCell(4, ev.RowIndex);
+                    }
+                }
+            }
+            else if (ev.Button == WinForms.MouseButtons.Right && ev.ColumnIndex == 2 && ev.RowIndex >= 0 && ev.RowIndex < grid.Rows.Count - 1)
+            {
+                // Handle right-click on Value column to open password generator
+                var row = grid.Rows[ev.RowIndex];
+                if (row.Tag is SnippetRow snippetRow)
+                {
+                    var currentValue = snippetRow.ActualValue;
+                    var hasExistingValue = !string.IsNullOrWhiteSpace(currentValue);
+
+                    // Open password generator dialog - larger to accommodate slider
+                    using var genDialog = new WinForms.Form
+                    {
+                        ClientSize = new Drawing.Size(500, hasExistingValue ? 402 : 342),
+                        FormBorderStyle = WinForms.FormBorderStyle.None,
+                        StartPosition = WinForms.FormStartPosition.CenterParent,
+                        Text = "Password Generator",
+                        KeyPreview = true,
+                        ShowInTaskbar = false,
+                        TopMost = true,
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(38, 38, 44) : Drawing.Color.FromArgb(248, 249, 251)
+                    };
+
+                    // Apply rounded corners
+                    using (var genRegionPath = RoundedRectPath(new Drawing.Rectangle(0, 0, genDialog.Width - 1, genDialog.Height - 1), 18))
+                        genDialog.Region = new Drawing.Region(genRegionPath);
+                    genDialog.Paint += (_, pe) =>
+                    {
+                        pe.Graphics.SmoothingMode = Drawing.Drawing2D.SmoothingMode.AntiAlias;
+                        using var path = RoundedRectPath(new Drawing.Rectangle(0, 0, genDialog.Width - 1, genDialog.Height - 1), 18);
+                        using var pen = new Drawing.Pen(_isDarkTheme ? Drawing.Color.FromArgb(72, 72, 82) : Drawing.Color.FromArgb(210, 214, 220), 1f);
+                        pe.Graphics.DrawPath(pen, path);
+                    };
+
+                    // Title label (for window dragging)
+                    var titleLabel = new WinForms.Label
+                    {
+                        Text = "Password Generator",
+                        Font = new Drawing.Font("Segoe UI", 12f, Drawing.FontStyle.Bold),
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.FromArgb(30, 32, 36),
+                        AutoSize = false,
+                        Left = 20,
+                        Top = 20,
+                        Width = 460,
+                        Height = 24,
+                        Cursor = WinForms.Cursors.Hand
+                    };
+
+                    var entryLabel = new WinForms.Label
+                    {
+                        Text = snippetRow.Label,
+                        Font = new Drawing.Font("Segoe UI", 10f, Drawing.FontStyle.Bold),
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(190, 190, 198) : Drawing.Color.FromArgb(65, 68, 76),
+                        AutoSize = true,
+                        Left = 20,
+                        Top = 50,
+                        Cursor = WinForms.Cursors.Hand
+                    };
+
+                    // Last modified label
+                    var modifiedLabel = new WinForms.Label
+                    {
+                        Text = $"Last modified: {snippetRow.Modified:G}",
+                        Font = new Drawing.Font("Segoe UI", 8f),
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(155, 155, 165) : Drawing.Color.FromArgb(95, 100, 108),
+                        AutoSize = true,
+                        Left = 20,
+                        Top = 72
+                    };
+
+                    // Enable window dragging from title label
+                    bool genDragging = false;
+                    Drawing.Point genDragCursor = Drawing.Point.Empty;
+                    Drawing.Point genDragDialog = Drawing.Point.Empty;
+                    WinForms.MouseEventHandler dragMouseDown = (_, mouseArgs) =>
+                    {
+                        if (mouseArgs.Button != WinForms.MouseButtons.Left) return;
+                        genDragging = true;
+                        genDragCursor = WinForms.Cursor.Position;
+                        genDragDialog = genDialog.Location;
+                    };
+                    WinForms.MouseEventHandler dragMouseMove = (_, _) =>
+                    {
+                        if (!genDragging) return;
+                        var diff = Drawing.Point.Subtract(WinForms.Cursor.Position, new Drawing.Size(genDragCursor));
+                        genDialog.Location = Drawing.Point.Add(genDragDialog, new Drawing.Size(diff));
+                    };
+                    WinForms.MouseEventHandler dragMouseUp = (_, _) => genDragging = false;
+                    titleLabel.MouseDown += dragMouseDown;
+                    titleLabel.MouseMove += dragMouseMove;
+                    titleLabel.MouseUp += dragMouseUp;
+                    modifiedLabel.MouseDown += dragMouseDown;
+                    modifiedLabel.MouseMove += dragMouseMove;
+                    modifiedLabel.MouseUp += dragMouseUp;
+                    entryLabel.MouseDown += dragMouseDown;
+                    entryLabel.MouseMove += dragMouseMove;
+                    entryLabel.MouseUp += dragMouseUp;
+                    genDialog.MouseDown += dragMouseDown;
+                    genDialog.MouseMove += dragMouseMove;
+                    genDialog.MouseUp += dragMouseUp;
+                    genDialog.KeyDown += (_, keyArgs) =>
+                    {
+                        if (keyArgs.KeyCode != WinForms.Keys.Escape) return;
+                        keyArgs.Handled = true;
+                        genDialog.DialogResult = WinForms.DialogResult.Cancel;
+                    };
+
+                    // Password length control (default 16, range 16-32)
+                    var selectedLength = 16;
+
+                    // If there's an existing value, show it with eye toggle
+                    WinForms.TextBox? existingValueBox = null;
+                    WinForms.Button? toggleEyeBtn = null;
+                    var showingExistingValue = false;
+
+                    if (hasExistingValue)
+                    {
+                        var existingLabel = new WinForms.Label
+                        {
+                            Text = $"Current Value ({currentValue.Length} chars):",
+                            Font = new Drawing.Font("Segoe UI", 10f),
+                            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(155, 155, 165) : Drawing.Color.FromArgb(95, 100, 108),
+                            AutoSize = true,
+                            Left = 20,
+                            Top = 92
+                        };
+                        genDialog.Controls.Add(existingLabel);
+
+                        existingValueBox = new WinForms.TextBox
+                        {
+                            Text = "••••••••",
+                            ReadOnly = true,
+                            Left = 20,
+                            Top = 117,
+                            Width = 412,
+                            Height = 35,
+                            Font = new Drawing.Font("Consolas", 10f),
+                            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 52) : Drawing.Color.FromArgb(244, 245, 247),
+                            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
+                            BorderStyle = WinForms.BorderStyle.FixedSingle
+                        };
+                        genDialog.Controls.Add(existingValueBox);
+
+                        toggleEyeBtn = new WinForms.Button
+                        {
+                            Text = "👁",
+                            Left = 440,
+                            Top = 117,
+                            Width = 40,
+                            Height = 35,
+                            Font = new Drawing.Font("Segoe UI Emoji", 12f),
+                            FlatStyle = WinForms.FlatStyle.Flat,
+                            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(60, 60, 68) : Drawing.Color.FromArgb(225, 226, 230),
+                            ForeColor = _isDarkTheme ? Drawing.Color.White : Drawing.Color.FromArgb(40, 40, 40),
+                            Cursor = WinForms.Cursors.Hand
+                        };
+                        toggleEyeBtn.FlatAppearance.BorderSize = 0;
+                        toggleEyeBtn.Click += (_, _) =>
+                        {
+                            showingExistingValue = !showingExistingValue;
+                            if (existingValueBox != null)
+                                existingValueBox.Text = showingExistingValue ? currentValue : "••••••••";
+                        };
+                        genDialog.Controls.Add(toggleEyeBtn);
+                    }
+
+                    // Generated value label and textbox
+                    var genLabel = new WinForms.Label
+                    {
+                        Text = hasExistingValue ? "Generated Value:" : "New Value:",
+                        Font = new Drawing.Font("Segoe UI", 10f),
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(155, 155, 165) : Drawing.Color.FromArgb(95, 100, 108),
+                        AutoSize = true,
+                        Left = 20,
+                        Top = hasExistingValue ? 167 : 92
+                    };
+                    genDialog.Controls.Add(genLabel);
+
+                    var generatedValue = GenerateSecurePassword(selectedLength);
+                    var genValueBox = new WinForms.TextBox
+                    {
+                        Text = generatedValue,
+                        ReadOnly = true,
+                        Left = 20,
+                        Top = hasExistingValue ? 192 : 117,
+                        Width = 460,
+                        Height = 35,
+                        Font = new Drawing.Font("Consolas", 10f),
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 52) : Drawing.Color.FromArgb(244, 245, 247),
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(0, 180, 0) : Drawing.Color.FromArgb(0, 120, 0),
+                        BorderStyle = WinForms.BorderStyle.FixedSingle
+                    };
+                    genDialog.Controls.Add(genValueBox);
+
+                    // Password length slider (positioned under generated value)
+                    var lengthLabel = new WinForms.Label
+                    {
+                        Text = "Length:",
+                        Font = new Drawing.Font("Segoe UI", 9f),
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(155, 155, 165) : Drawing.Color.FromArgb(95, 100, 108),
+                        AutoSize = true,
+                        Left = 20,
+                        Top = hasExistingValue ? 237 : 162
+                    };
+                    genDialog.Controls.Add(lengthLabel);
+
+                    var lengthSlider = new WinForms.TrackBar
+                    {
+                        Left = 80,
+                        Top = hasExistingValue ? 232 : 157,
+                        Width = 350,
+                        Height = 30,
+                        Minimum = 16,
+                        Maximum = 32,
+                        Value = 16,
+                        TickFrequency = 1,
+                        TickStyle = WinForms.TickStyle.BottomRight,
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(38, 38, 44) : Drawing.Color.FromArgb(248, 249, 251)
+                    };
+                    genDialog.Controls.Add(lengthSlider);
+
+                    var lengthValueLabel = new WinForms.Label
+                    {
+                        Text = "16",
+                        Font = new Drawing.Font("Segoe UI", 10f, Drawing.FontStyle.Bold),
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(0, 180, 0) : Drawing.Color.FromArgb(0, 120, 0),
+                        AutoSize = true,
+                        Left = 440,
+                        Top = hasExistingValue ? 235 : 160
+                    };
+                    genDialog.Controls.Add(lengthValueLabel);
+
+                    lengthSlider.ValueChanged += (_, _) =>
+                    {
+                        selectedLength = lengthSlider.Value;
+                        lengthValueLabel.Text = selectedLength.ToString();
+                        genValueBox.Text = GenerateSecurePassword(selectedLength);
+                    };
+
+                    // Regenerate button
+                    var regenBtn = new WinForms.Button
+                    {
+                        Text = "↻ Regenerate",
+                        Left = 20,
+                        Top = hasExistingValue ? 277 : 202,
+                        Width = 460,
+                        Height = 35,
+                        Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
+                        FlatStyle = WinForms.FlatStyle.Flat,
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(60, 60, 68) : Drawing.Color.FromArgb(225, 226, 230),
+                        ForeColor = _isDarkTheme ? Drawing.Color.White : Drawing.Color.FromArgb(40, 40, 40),
+                        Cursor = WinForms.Cursors.Hand
+                    };
+                    regenBtn.FlatAppearance.BorderSize = 0;
+                    regenBtn.Click += (_, _) =>
+                    {
+                        genValueBox.Text = GenerateSecurePassword(selectedLength);
+                    };
+                    genDialog.Controls.Add(regenBtn);
+
+                    // Accept button
+                    var acceptBtn = new WinForms.Button
+                    {
+                        Text = hasExistingValue ? "Use Generated" : "Use Value",
+                        Left = 20,
+                        Top = hasExistingValue ? 327 : 252,
+                        Width = 225,
+                        Height = 40,
+                        Font = new Drawing.Font("Segoe UI", 10f, Drawing.FontStyle.Bold),
+                        FlatStyle = WinForms.FlatStyle.Flat,
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(0, 120, 80) : Drawing.Color.FromArgb(0, 145, 90),
+                        ForeColor = Drawing.Color.White,
+                        DialogResult = WinForms.DialogResult.OK,
+                        Cursor = WinForms.Cursors.Hand
+                    };
+                    acceptBtn.FlatAppearance.BorderSize = 0;
+                    
+                    // Handle Ctrl+Click for save + copy to clipboard
+                    acceptBtn.Click += (_, _) =>
+                    {
+                        // Check if Ctrl key is pressed during click
+                        if ((WinForms.Control.ModifierKeys & WinForms.Keys.Control) == WinForms.Keys.Control)
+                        {
+                            // Copy the generated password to clipboard
+                            try
+                            {
+                                WinForms.Clipboard.SetText(genValueBox.Text);
+                                
+                                // Show tooltip/hint about clipboard copy
+                                var copiedHint = new WinForms.ToolTip();
+                                copiedHint.Show("Password copied to clipboard! Will auto-clear if configured.", acceptBtn, 0, -40, 2000);
+                            }
+                            catch (Exception ex)
+                            {
+                                WinForms.MessageBox.Show($"Failed to copy to clipboard: {ex.Message}", "Copy Error", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Error);
+                            }
+                        }
+                    };
+                    
+                    genDialog.Controls.Add(acceptBtn);
+
+                    // Cancel button
+                    var cancelBtn = new WinForms.Button
+                    {
+                        Text = "Cancel",
+                        Left = 255,
+                        Top = hasExistingValue ? 327 : 252,
+                        Width = 225,
+                        Height = 40,
+                        Font = new Drawing.Font("Segoe UI", 10f, Drawing.FontStyle.Bold),
+                        FlatStyle = WinForms.FlatStyle.Flat,
+                        BackColor = _isDarkTheme ? Drawing.Color.FromArgb(60, 60, 68) : Drawing.Color.FromArgb(225, 226, 230),
+                        ForeColor = _isDarkTheme ? Drawing.Color.White : Drawing.Color.FromArgb(40, 40, 40),
+                        DialogResult = WinForms.DialogResult.Cancel,
+                        Cursor = WinForms.Cursors.Hand
+                    };
+                    cancelBtn.FlatAppearance.BorderSize = 0;
+                    genDialog.Controls.Add(cancelBtn);
+
+                    // Hint label for Ctrl+Click feature
+                    var hintLabel = new WinForms.Label
+                    {
+                        Text = "Ctrl+Click: Save + Copy",
+                        Font = new Drawing.Font("Segoe UI", 8f),
+                        ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(155, 155, 165) : Drawing.Color.FromArgb(95, 100, 108),
+                        AutoSize = true,
+                        Left = 20,
+                        Top = hasExistingValue ? 372 : 297
+                    };
+                    genDialog.Controls.Add(hintLabel);
+
+                    genDialog.Controls.Add(titleLabel);
+                    genDialog.Controls.Add(entryLabel);
+                    genDialog.Controls.Add(modifiedLabel);
+
+                    if (genDialog.ShowDialog() == WinForms.DialogResult.OK)
+                    {
+                        // Update the snippet value with generated password
+                        snippetRow.ActualValue = genValueBox.Text;
+                        snippetRow.IsEncrypted = false;
+                        grid.Rows[ev.RowIndex].Cells[2].Value = genValueBox.Text;
+                        hasChanges = true;
+                        btnSave.Visible = true;
+
+                        // Auto-save the snippets
+                        try
+                        {
+                            EncryptedTextStore.EncryptAndSave(_textFilePath, _masterPassword!, BuildGridSaveJson(grid));
+                            hasChanges = false;
+                            btnSave.Visible = false;
+                        }
+                        catch
+                        {
+                            WinForms.MessageBox.Show("Failed to save generated password.", "PinBubble", WinForms.MessageBoxButtons.OK, WinForms.MessageBoxIcon.Error);
+                        }
+                    }
                 }
             }
         };
@@ -2889,9 +4639,65 @@ public partial class MainWindow : Window
             }
         };
 
-        dialog.Controls.Add(grid);
+        // Enable window dragging from toolbar
+        bool dragging = false;
+        Drawing.Point dragCursor = Drawing.Point.Empty;
+        Drawing.Point dragDialog = Drawing.Point.Empty;
+        toolbar.MouseDown += (_, mouseArgs) =>
+        {
+            if (mouseArgs.Button != WinForms.MouseButtons.Left) return;
+            dragging = true;
+            dragCursor = WinForms.Cursor.Position;
+            dragDialog = dialog.Location;
+        };
+        toolbar.MouseMove += (_, _) =>
+        {
+            if (!dragging) return;
+            var diff = Drawing.Point.Subtract(WinForms.Cursor.Position, new Drawing.Size(dragCursor));
+            dialog.Location = Drawing.Point.Add(dragDialog, new Drawing.Size(diff));
+        };
+        toolbar.MouseUp += (_, _) => dragging = false;
+        foreach (var dragTarget in new WinForms.Control[] { statusLED, titleLabel, infoLabel })
+        {
+            dragTarget.MouseDown += (_, mouseArgs) =>
+            {
+                if (mouseArgs.Button != WinForms.MouseButtons.Left) return;
+                dragging = true;
+                dragCursor = WinForms.Cursor.Position;
+                dragDialog = dialog.Location;
+            };
+            dragTarget.MouseMove += (_, _) =>
+            {
+                if (!dragging) return;
+                var diff = Drawing.Point.Subtract(WinForms.Cursor.Position, new Drawing.Size(dragCursor));
+                dialog.Location = Drawing.Point.Add(dragDialog, new Drawing.Size(diff));
+            };
+            dragTarget.MouseUp += (_, _) => dragging = false;
+        }
+
+        gridFrame.Controls.Add(grid);
         dialog.Controls.Add(toolbar);
+        dialog.Controls.Add(gridFrame);
         dialog.AcceptButton = btnSave;
+
+        // Add a timer to refresh TOTP display every second
+        var totpRefreshTimer = new System.Windows.Forms.Timer
+        {
+            Interval = 1000 // Refresh every second
+        };
+        totpRefreshTimer.Tick += (s, e) =>
+        {
+            // Invalidate all TOTP cells (column 4) to trigger repaint
+            for (int i = 0; i < grid.Rows.Count - 1; i++)
+            {
+                if (grid.Rows[i].Tag is SnippetRow row && !string.IsNullOrWhiteSpace(row.TotpSecret))
+                {
+                    grid.InvalidateCell(4, i);
+                }
+            }
+        };
+        totpRefreshTimer.Start();
+        dialog.FormClosed += (s, e) => totpRefreshTimer.Dispose();
 
         if (dialog.ShowDialog() != WinForms.DialogResult.OK)
             return;
@@ -2997,6 +4803,67 @@ public partial class MainWindow : Window
         UpdateBiometricMenuText();
     }
 
+    private void ChangeMasterPassword_Click(object sender, RoutedEventArgs e)
+    {
+        if (string.IsNullOrWhiteSpace(_masterPassword))
+        {
+            System.Windows.MessageBox.Show(
+                "Unlock the vault before changing its master password.",
+                "PinBubble",
+                MessageBoxButton.OK,
+                MessageBoxImage.Information);
+            return;
+        }
+
+        var newPassword = PromptForNewMasterPassword();
+        if (newPassword is null || string.Equals(newPassword, _masterPassword, StringComparison.Ordinal))
+            return;
+
+        var oldPassword = _masterPassword;
+        var biometricCacheEnabled = BiometricMasterPasswordStore.HasCachedPassword();
+
+        if (!EncryptedTextStore.TryChangePassword(_textFilePath, oldPassword, newPassword, out var error))
+        {
+            System.Windows.MessageBox.Show(
+                error,
+                "Master Password Not Changed",
+                MessageBoxButton.OK,
+                MessageBoxImage.Error);
+            return;
+        }
+
+        if (biometricCacheEnabled && !BiometricMasterPasswordStore.CachePassword(newPassword))
+        {
+            var rollbackSucceeded = EncryptedTextStore.TryChangePassword(_textFilePath, newPassword, oldPassword, out _);
+            if (rollbackSucceeded)
+            {
+                System.Windows.MessageBox.Show(
+                    "The biometric credential could not be updated, so the vault was safely left with its previous password.",
+                    "Master Password Not Changed",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+            }
+            else
+            {
+                System.Windows.MessageBox.Show(
+                    "The vault password changed, but the biometric credential could not be updated. Use the new password to unlock.",
+                    "PinBubble",
+                    MessageBoxButton.OK,
+                    MessageBoxImage.Warning);
+            }
+
+            return;
+        }
+
+        _masterPassword = newPassword;
+        UpdateBiometricUi();
+        System.Windows.MessageBox.Show(
+            "Master password changed. Your vault contents and app settings were preserved.",
+            "PinBubble",
+            MessageBoxButton.OK,
+            MessageBoxImage.Information);
+    }
+
     private void UpdateBiometricMenuText()
     {
         var enabled = BiometricMasterPasswordStore.HasCachedPassword();
@@ -3047,6 +4914,7 @@ public partial class MainWindow : Window
         _isDarkTheme = DefaultIsDarkTheme;
         ShowInTaskbar = DefaultShowInTaskbar;
         _quickEnterEnabled = false;
+        _clipboardClearSeconds = DefaultClipboardClearSeconds;
 
         Topmost = _isPinned;
         DarkThemeMenuItem.IsChecked = _isDarkTheme;
@@ -3056,6 +4924,7 @@ public partial class MainWindow : Window
         UpdateBackdropOpacityMenuChecks();
         UpdatePinMenuText();
         UpdateTaskbarMenuText();
+        UpdateClearClipMenuChecks();
         SaveUiSettings();
     }
 
@@ -3118,6 +4987,8 @@ public partial class MainWindow : Window
                 _savedMonitorDeviceName = settings.MonitorDeviceName;
                 _clipboardClearSeconds = settings.ClipboardClearSeconds;
                 _quickEnterEnabled = settings.QuickEnterEnabled;
+                _copyTotpTogether = settings.CopyTotpTogether;
+                _defaultExpiryDays = Math.Max(1, settings.DefaultExpiryDays);
             }
         }
         catch
@@ -3151,7 +5022,9 @@ public partial class MainWindow : Window
                 WindowTop = Top,
                 MonitorDeviceName = currentScreen.DeviceName,
                 ClipboardClearSeconds = _clipboardClearSeconds,
-                QuickEnterEnabled = _quickEnterEnabled
+                QuickEnterEnabled = _quickEnterEnabled,
+                CopyTotpTogether = _copyTotpTogether,
+                DefaultExpiryDays = _defaultExpiryDays
             };
             var json = JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true });
             File.WriteAllText(_settingsFilePath, json);
@@ -3164,12 +5037,23 @@ public partial class MainWindow : Window
 
     // ── Clipboard auto-clear ────────────────────────────────────────────────
 
-    private void CopySnippetToClipboard(string text)
+    private void CopySnippetToClipboard(string text, SnippetRow? snippetRow = null)
     {
-        if (!TrySetClipboardWithoutHistory(text))
-            System.Windows.Clipboard.SetText(text);
+        // If snippet has TOTP and config says to copy together, append TOTP to text
+        var textToCopy = text;
+        if (_copyTotpTogether && snippetRow != null && !string.IsNullOrWhiteSpace(snippetRow.TotpSecret))
+        {
+            var totpCode = snippetRow.CurrentTotp;
+            if (!string.IsNullOrWhiteSpace(totpCode))
+            {
+                textToCopy = $"{text}{totpCode}";
+            }
+        }
 
-        ScheduleClipboardClear(text);
+        if (!TrySetClipboardWithoutHistory(textToCopy))
+            System.Windows.Clipboard.SetText(textToCopy);
+
+        ScheduleClipboardClear(textToCopy);
     }
 
     private static bool TrySetClipboardWithoutHistory(string text)
@@ -3245,6 +5129,13 @@ public partial class MainWindow : Window
         ClearClip120MenuItem.IsChecked      = _clipboardClearSeconds == 120;
     }
 
+    private void CopyTotpTogether_Click(object sender, RoutedEventArgs e)
+    {
+        _copyTotpTogether = !_copyTotpTogether;
+        CopyTotpTogetherMenuItem.IsChecked = _copyTotpTogether;
+        SaveUiSettings();
+    }
+
     private void Window_StateChanged(object? sender, EventArgs e)
     {
         // Allow normal minimize/restore behavior when clicking taskbar icon
@@ -3263,26 +5154,50 @@ public partial class MainWindow : Window
         base.OnClosed(e);
     }
 
+    private static Drawing.Drawing2D.GraphicsPath RoundedRectPath(Drawing.Rectangle bounds, int radius)
+    {
+        var diameter = radius * 2;
+        var path = new Drawing.Drawing2D.GraphicsPath();
+        path.AddArc(bounds.X, bounds.Y, diameter, diameter, 180, 90);
+        path.AddArc(bounds.Right - diameter, bounds.Y, diameter, diameter, 270, 90);
+        path.AddArc(bounds.Right - diameter, bounds.Bottom - diameter, diameter, diameter, 0, 90);
+        path.AddArc(bounds.X, bounds.Bottom - diameter, diameter, diameter, 90, 90);
+        path.CloseFigure();
+        return path;
+    }
+
     private void About_Click(object sender, RoutedEventArgs e)
     {
-        var dimColor = _isDarkTheme ? Drawing.Color.FromArgb(140, 140, 145) : Drawing.Color.FromArgb(120, 120, 120);
-        var accentColor = _isDarkTheme ? Drawing.Color.FromArgb(102, 185, 51) : Drawing.Color.FromArgb(80, 150, 40);
-        var textColor = _isDarkTheme ? Drawing.Color.FromArgb(200, 200, 205) : Drawing.Color.Black;
+        var dimColor = _isDarkTheme ? Drawing.Color.FromArgb(150, 150, 156) : Drawing.Color.FromArgb(120, 120, 120);
+        var accentColor = _isDarkTheme ? Drawing.Color.FromArgb(110, 195, 60) : Drawing.Color.FromArgb(70, 140, 35);
+        var textColor = _isDarkTheme ? Drawing.Color.FromArgb(210, 210, 216) : Drawing.Color.FromArgb(40, 40, 40);
+        var separatorColor = _isDarkTheme ? Drawing.Color.FromArgb(70, 70, 78) : Drawing.Color.FromArgb(225, 225, 230);
+        var cardTopColor = _isDarkTheme ? Drawing.Color.FromArgb(48, 48, 55) : Drawing.Color.FromArgb(255, 255, 255);
+        var cardBottomColor = _isDarkTheme ? Drawing.Color.FromArgb(38, 38, 44) : Drawing.Color.FromArgb(246, 247, 249);
+        var cardBorderColor = _isDarkTheme ? Drawing.Color.FromArgb(255, 255, 255) : Drawing.Color.FromArgb(0, 0, 0);
+
+        // The rounded card *is* the window: borderless, region-clipped to match the drawn shape.
+        const int cardWidth = 492;
+        const int cardHeight = 612;
+        const int cornerRadius = 18;
 
         using var aboutDialog = new WinForms.Form
         {
-            Width = 500,
-            Height = 560,
-            FormBorderStyle = WinForms.FormBorderStyle.FixedDialog,
+            FormBorderStyle = WinForms.FormBorderStyle.None,
             StartPosition = WinForms.FormStartPosition.CenterScreen,
+            ClientSize = new Drawing.Size(cardWidth, cardHeight),
             Text = "About PinBubble",
-            MaximizeBox = false,
-            MinimizeBox = false,
             ShowInTaskbar = false,
             TopMost = true,
-            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White,
+            AutoScaleMode = WinForms.AutoScaleMode.None,
+            BackColor = cardBottomColor,
             KeyPreview = true
         };
+
+        using (var formRegionPath = RoundedRectPath(new Drawing.Rectangle(0, 0, aboutDialog.Width - 1, aboutDialog.Height - 1), cornerRadius))
+        {
+            aboutDialog.Region = new Drawing.Region(formRegionPath);
+        }
 
         aboutDialog.KeyDown += (s, e) =>
         {
@@ -3290,38 +5205,144 @@ public partial class MainWindow : Window
                 aboutDialog.Close();
         };
 
-        // ── Pin icon ────────────────────────────────────────────────────────
-        var pinIcon = new WinForms.PictureBox { Left = 220, Top = 15, Width = 60, Height = 60, BackColor = Drawing.Color.Transparent };
-        var pinBitmap = new System.Drawing.Bitmap(60, 60);
-        using (var g = System.Drawing.Graphics.FromImage(pinBitmap))
+        // ── Glass card: fills the whole window, rounded corners, subtle gradient + border ──
+        var card = new WinForms.Panel
         {
-            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            using (var brush = new System.Drawing.SolidBrush(accentColor))
-            {
-                g.FillEllipse(brush, 15, 5, 30, 30);
-                g.FillPolygon(brush, new System.Drawing.Point[] {
-                    new(26, 35), new(34, 35), new(30, 52) });
-            }
+            Left = 0,
+            Top = 0,
+            Width = cardWidth,
+            Height = cardHeight,
+            BackColor = cardBottomColor
+        };
+        card.Paint += (s, e) =>
+        {
+            var rect = new Drawing.Rectangle(0, 0, card.Width - 1, card.Height - 1);
+            e.Graphics.SmoothingMode = Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using var path = RoundedRectPath(rect, cornerRadius);
+            using var fill = new Drawing.Drawing2D.LinearGradientBrush(rect, cardTopColor, cardBottomColor, 90f);
+            e.Graphics.FillPath(fill, path);
+            using var borderPen = new Drawing.Pen(Drawing.Color.FromArgb(_isDarkTheme ? 22 : 18, cardBorderColor), 1f);
+            e.Graphics.DrawPath(borderPen, path);
+            using var highlightPen = new Drawing.Pen(Drawing.Color.FromArgb(_isDarkTheme ? 14 : 130, Drawing.Color.White), 1f);
+            e.Graphics.DrawLine(highlightPen, 18, 1, card.Width - 18, 1);
+        };
+        using (var cardRegionPath = RoundedRectPath(new Drawing.Rectangle(0, 0, card.Width - 1, card.Height - 1), cornerRadius))
+        {
+            card.Region = new Drawing.Region(cardRegionPath);
+        }
+
+        // Fancy circular close button, top-right corner.
+        const int closeSize = 28;
+        var closeButtonNormalBack = _isDarkTheme ? Drawing.Color.FromArgb(58, 58, 66) : Drawing.Color.FromArgb(228, 229, 233);
+        var closeButton = new WinForms.Button
+        {
+            Left = card.Width - closeSize - 16,
+            Top = 16,
+            Width = closeSize,
+            Height = closeSize,
+            Text = "✕",
+            Font = new Drawing.Font("Segoe UI", 9.5f, Drawing.FontStyle.Bold),
+            FlatStyle = WinForms.FlatStyle.Flat,
+            ForeColor = dimColor,
+            BackColor = closeButtonNormalBack,
+            Cursor = WinForms.Cursors.Hand,
+            TabStop = false,
+            UseVisualStyleBackColor = false
+        };
+        closeButton.FlatAppearance.BorderSize = 0;
+        using (var closeRegionPath = RoundedRectPath(new Drawing.Rectangle(0, 0, closeSize - 1, closeSize - 1), closeSize / 2))
+        {
+            closeButton.Region = new Drawing.Region(closeRegionPath);
+        }
+        closeButton.MouseEnter += (_, _) =>
+        {
+            closeButton.BackColor = Drawing.Color.FromArgb(232, 17, 35);
+            closeButton.ForeColor = Drawing.Color.White;
+        };
+        closeButton.MouseLeave += (_, _) =>
+        {
+            closeButton.BackColor = closeButtonNormalBack;
+            closeButton.ForeColor = dimColor;
+        };
+        closeButton.Click += (_, _) => aboutDialog.Close();
+
+        // Content is laid out relative to the card, with equal left/right padding.
+        const int pad = 28;
+        var sectionWidth = card.Width - pad * 2;
+        const int sectionLeft = pad;
+
+        var pinIcon = new WinForms.PictureBox
+        {
+            Left = sectionLeft + (sectionWidth - 60) / 2,
+            Top = 24,
+            Width = 60,
+            Height = 60,
+            BackColor = Drawing.Color.Transparent
+        };
+        var pinBitmap = new Drawing.Bitmap(60, 60);
+        using (var g = Drawing.Graphics.FromImage(pinBitmap))
+        {
+            g.SmoothingMode = Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using var brush = new Drawing.SolidBrush(accentColor);
+            g.FillEllipse(brush, 15, 5, 30, 30);
+            g.FillPolygon(brush, new Drawing.Point[] { new(26, 35), new(34, 35), new(30, 52) });
         }
         pinIcon.Image = pinBitmap;
 
-        // ── Title ───────────────────────────────────────────────────────────
+        // Idle bounce for the main pin icon.
+        var pinBaseTop = pinIcon.Top;
+        var pinBounceTimer = new WinForms.Timer { Interval = 18 };
+        double pinBouncePhase = 0;
+        pinBounceTimer.Tick += (_, _) =>
+        {
+            pinBouncePhase += 0.085;
+            pinIcon.Top = pinBaseTop + (int)Math.Round(Math.Sin(pinBouncePhase) * 4.5);
+        };
+        pinBounceTimer.Start();
+
         var titleLabel = new WinForms.Label
         {
-            Left = 20, Top = 80, Width = 460, Height = 35,
+            Left = sectionLeft,
+            Top = 98,
+            Width = sectionWidth,
+            Height = 40,
             Text = "PinBubble",
             Font = new Drawing.Font("Segoe UI", 24f, Drawing.FontStyle.Bold),
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(230, 230, 235) : Drawing.Color.FromArgb(25, 25, 25),
             BackColor = Drawing.Color.Transparent,
             TextAlign = Drawing.ContentAlignment.MiddleCenter
         };
 
-        // ── Version (right of centre) + GitHub link (left of centre) ───────
+        // Meta row (version | star | github link) — built as one unit and centered as a whole.
+        var versionText = $"Version {s_appVersion}";
+        var versionFont = new Drawing.Font("Segoe UI", 9f);
+        var starFont = new Drawing.Font("Segoe UI Emoji", 13f);
+        var githubFont = new Drawing.Font("Segoe UI", 9f);
+        const string githubLinkText = "View on GitHub";
+        var versionWidth = WinForms.TextRenderer.MeasureText(versionText, versionFont).Width + 2;
+        var starWidth = WinForms.TextRenderer.MeasureText("⭐", starFont).Width + 2;
+        var githubWidth = WinForms.TextRenderer.MeasureText(githubLinkText, githubFont).Width + 4;
+        const int pipeWidth = 18;
+        const int starGap = 2;
+        var metaRowWidth = versionWidth + pipeWidth + starWidth + starGap + githubWidth;
+
+        var metaRow = new WinForms.Panel
+        {
+            Left = sectionLeft + (sectionWidth - metaRowWidth) / 2,
+            Top = 148,
+            Width = metaRowWidth,
+            Height = 22,
+            BackColor = Drawing.Color.Transparent
+        };
+
         var versionLabel = new WinForms.Label
         {
-            Left = 20, Top = 120, Width = 200, Height = 22,
-            Text = "Version 2.0.0",
-            Font = new Drawing.Font("Segoe UI", 9f),
+            Left = 0,
+            Top = 0,
+            Width = versionWidth,
+            Height = 22,
+            Text = versionText,
+            Font = versionFont,
             ForeColor = dimColor,
             BackColor = Drawing.Color.Transparent,
             TextAlign = Drawing.ContentAlignment.MiddleRight
@@ -3329,19 +5350,48 @@ public partial class MainWindow : Window
 
         var pipeLbl = new WinForms.Label
         {
-            Left = 223, Top = 120, Width = 12, Height = 22,
+            Left = versionWidth,
+            Top = 0,
+            Width = pipeWidth,
+            Height = 22,
             Text = "│",
-            Font = new Drawing.Font("Segoe UI", 9f),
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(70, 70, 75) : Drawing.Color.FromArgb(200, 200, 200),
+            Font = versionFont,
+            ForeColor = separatorColor,
             BackColor = Drawing.Color.Transparent,
             TextAlign = Drawing.ContentAlignment.MiddleCenter
         };
 
+        var starLabel = new WinForms.Label
+        {
+            Left = versionWidth + pipeWidth,
+            Top = 0,
+            Width = starWidth,
+            Height = 22,
+            Text = "⭐",
+            Font = starFont,
+            ForeColor = accentColor,
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.MiddleCenter,
+            Cursor = WinForms.Cursors.Hand
+        };
+        starLabel.Click += (_, _) =>
+        {
+            try
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                    "https://github.com/niravp-0x/PinBubble") { UseShellExecute = true });
+            }
+            catch { }
+        };
+
         var githubLink = new WinForms.LinkLabel
         {
-            Left = 238, Top = 120, Width = 200, Height = 22,
-            Text = "⭐ View on GitHub",
-            Font = new Drawing.Font("Segoe UI", 9f),
+            Left = versionWidth + pipeWidth + starWidth + starGap,
+            Top = 0,
+            Width = githubWidth,
+            Height = 22,
+            Text = githubLinkText,
+            Font = githubFont,
             BackColor = Drawing.Color.Transparent,
             TextAlign = Drawing.ContentAlignment.MiddleLeft,
             LinkColor = accentColor,
@@ -3350,64 +5400,70 @@ public partial class MainWindow : Window
         };
         githubLink.LinkClicked += (_, _) =>
         {
-            try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
-                "https://github.com/niravp-0x/PinBubble") { UseShellExecute = true }); }
+            try
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                    "https://github.com/niravp-0x/PinBubble") { UseShellExecute = true });
+            }
             catch { }
         };
+        metaRow.Controls.AddRange(new WinForms.Control[] { versionLabel, pipeLbl, starLabel, githubLink });
 
-        // ── Separator 1 ─────────────────────────────────────────────────────
-        var separator1 = new WinForms.Panel
-        {
-            Left = 20, Top = 152, Width = 440, Height = 1,
-            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(70, 70, 75) : Drawing.Color.FromArgb(200, 200, 200)
-        };
+        var separator1 = new WinForms.Panel { Left = sectionLeft, Top = 188, Width = sectionWidth, Height = 1, BackColor = separatorColor };
 
-        // ── Description ─────────────────────────────────────────────────────
         var descriptionLabel = new WinForms.Label
         {
-            Left = 30, Top = 162, Width = 440, Height = 45,
+            Left = sectionLeft,
+            Top = 204,
+            Width = sectionWidth,
+            Height = 64,
             Text = "A lightweight, always-on-screen snippet manager\nthat keeps your frequently used text snippets\nat your fingertips.",
-            Font = new Drawing.Font("Segoe UI", 9f),
+            Font = new Drawing.Font("Segoe UI", 10f),
             ForeColor = textColor,
             BackColor = Drawing.Color.Transparent,
             TextAlign = Drawing.ContentAlignment.TopCenter
         };
 
-        // ── Features ────────────────────────────────────────────────────────
         var featuresLabel = new WinForms.Label
         {
-            Left = 40, Top = 218, Width = 420, Height = 20,
+            Left = sectionLeft + 12,
+            Top = 282,
+            Width = sectionWidth - 12,
+            Height = 20,
             Text = "KEY FEATURES",
             Font = new Drawing.Font("Segoe UI", 8.5f, Drawing.FontStyle.Bold),
             ForeColor = accentColor,
-            BackColor = Drawing.Color.Transparent
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.MiddleLeft
         };
 
         WinForms.Label MakeFeat(string text, int top) => new WinForms.Label
         {
-            Left = 60, Top = top, Width = 390, Height = 22,
+            Left = sectionLeft + 18,
+            Top = top,
+            Width = sectionWidth - 18,
+            Height = 22,
             Text = text,
             Font = new Drawing.Font("Segoe UI", 8.5f),
             ForeColor = textColor,
-            BackColor = Drawing.Color.Transparent
-        };
-        var feature1 = MakeFeat("> Encrypted snippet storage with master password", 244);
-        var feature2 = MakeFeat("> Global hotkeys & QWERTY picker for instant copy",  266);
-        var feature3 = MakeFeat("> Pin/unpin to stay on top of other windows",         288);
-        var feature4 = MakeFeat("> Dark theme support for comfortable viewing",         310);
-        var feature5 = MakeFeat("> Auto-clear clipboard after copy (configurable)",     332);
-
-        // ── Separator 2 ─────────────────────────────────────────────────────
-        var separator2 = new WinForms.Panel
-        {
-            Left = 20, Top = 366, Width = 440, Height = 1,
-            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(70, 70, 75) : Drawing.Color.FromArgb(200, 200, 200)
+            BackColor = Drawing.Color.Transparent,
+            TextAlign = Drawing.ContentAlignment.MiddleLeft
         };
 
-        // ── Authors ─────────────────────────────────────────────────────────
+        var feature1 = MakeFeat("•  Encrypted snippet storage with master password", 310);
+        var feature2 = MakeFeat("•  TOTP support with quick copy and Ctrl+click behavior", 334);
+        var feature3 = MakeFeat("•  Global hotkeys, QWERTY picker, and instant paste", 358);
+        var feature4 = MakeFeat("•  Pin/unpin and dark theme support for comfortable viewing", 382);
+        var feature5 = MakeFeat("•  Configurable default expiry and clipboard auto-clear", 406);
+
+        var separator2 = new WinForms.Panel { Left = sectionLeft, Top = 444, Width = sectionWidth, Height = 1, BackColor = separatorColor };
+
         var authorsHeaderLbl = new WinForms.Label
         {
-            Left = 20, Top = 378, Width = 460, Height = 18,
+            Left = sectionLeft,
+            Top = 460,
+            Width = sectionWidth,
+            Height = 20,
             Text = "AUTHORS",
             Font = new Drawing.Font("Segoe UI", 8.5f, Drawing.FontStyle.Bold),
             ForeColor = accentColor,
@@ -3417,7 +5473,10 @@ public partial class MainWindow : Window
 
         var authorNamesLbl = new WinForms.Label
         {
-            Left = 20, Top = 398, Width = 460, Height = 20,
+            Left = sectionLeft,
+            Top = 486,
+            Width = sectionWidth,
+            Height = 24,
             Text = "niravp-0x  ·  biggrocer",
             Font = new Drawing.Font("Segoe UI", 9f),
             ForeColor = dimColor,
@@ -3425,11 +5484,55 @@ public partial class MainWindow : Window
             TextAlign = Drawing.ContentAlignment.MiddleCenter
         };
 
+        // Hidden easter egg: hovering the main pin icon flashes the author names.
+        var authorOriginalColor = authorNamesLbl.ForeColor;
+        var authorOriginalFont = authorNamesLbl.Font;
+        var authorFlashFont = new Drawing.Font(authorOriginalFont, Drawing.FontStyle.Bold);
+        var authorFlashColors = new[]
+        {
+            Drawing.Color.FromArgb(255, 90, 90),
+            Drawing.Color.FromArgb(255, 170, 60),
+            Drawing.Color.FromArgb(255, 225, 60),
+            Drawing.Color.FromArgb(120, 220, 120),
+            Drawing.Color.FromArgb(90, 170, 255),
+            Drawing.Color.FromArgb(190, 120, 255)
+        };
+        var authorFlashTimer = new WinForms.Timer { Interval = 90 };
+        var authorFlashIndex = 0;
+        authorFlashTimer.Tick += (_, _) =>
+        {
+            authorNamesLbl.ForeColor = authorFlashColors[authorFlashIndex % authorFlashColors.Length];
+            authorFlashIndex++;
+        };
+        pinIcon.MouseEnter += (_, _) =>
+        {
+            authorNamesLbl.Font = authorFlashFont;
+            authorFlashIndex = 0;
+            authorFlashTimer.Start();
+        };
+        pinIcon.MouseLeave += (_, _) =>
+        {
+            authorFlashTimer.Stop();
+            authorNamesLbl.ForeColor = authorOriginalColor;
+            authorNamesLbl.Font = authorOriginalFont;
+        };
+        aboutDialog.FormClosed += (_, _) =>
+        {
+            pinBounceTimer.Stop();
+            pinBounceTimer.Dispose();
+            authorFlashTimer.Stop();
+            authorFlashTimer.Dispose();
+            authorFlashFont.Dispose();
+        };
+
         var licenseLink = new WinForms.LinkLabel
         {
-            Left = 20, Top = 420, Width = 460, Height = 18,
+            Left = sectionLeft,
+            Top = 516,
+            Width = sectionWidth,
+            Height = 20,
             Text = "Released under the MIT License",
-            Font = new Drawing.Font("Segoe UI", 8f),
+            Font = new Drawing.Font("Segoe UI", 8.5f),
             BackColor = Drawing.Color.Transparent,
             TextAlign = Drawing.ContentAlignment.MiddleCenter,
             LinkColor = dimColor,
@@ -3438,61 +5541,351 @@ public partial class MainWindow : Window
         };
         licenseLink.LinkClicked += (_, _) =>
         {
-            try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
-                "https://github.com/niravp-0x/PinBubble/blob/main/LICENSE") { UseShellExecute = true }); }
+            try
+            {
+                System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(
+                    "https://github.com/niravp-0x/PinBubble/blob/main/LICENSE") { UseShellExecute = true });
+            }
             catch { }
         };
 
-        // ── Separator 3 ─────────────────────────────────────────────────────
-        var separator3 = new WinForms.Panel
+        var separator3 = new WinForms.Panel { Left = sectionLeft, Top = 552, Width = sectionWidth, Height = 1, BackColor = separatorColor };
+
+        // Credit row (robot icon + text) — measured and built as one unit so the icon never overlaps the text.
+        const string creditText = "Proudly vibecoded with GitHub Copilot";
+        var creditFont = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Italic);
+        var creditTextWidth = WinForms.TextRenderer.MeasureText(creditText, creditFont).Width + 4;
+        const int robotSize = 32;
+        const int robotTextGap = 6;
+        var creditRowWidth = robotSize + robotTextGap + creditTextWidth;
+        var creditRowHeight = robotSize + 4;
+
+        var creditRow = new WinForms.Panel
         {
-            Left = 20, Top = 448, Width = 440, Height = 1,
-            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(70, 70, 75) : Drawing.Color.FromArgb(200, 200, 200)
+            Left = sectionLeft + (sectionWidth - creditRowWidth) / 2,
+            Top = 562,
+            Width = creditRowWidth,
+            Height = creditRowHeight,
+            BackColor = Drawing.Color.Transparent
         };
 
-        // ── Copilot credit (centered) ────────────────────────────────────────
-        // "Proudly vibecoded with GitHub Copilot" ≈ 258px at 9f italic
-        // icon 18px + 5px gap + text 258px = 281px → left = 20 + (460-281)/2 = 110
-        var robotIcon = new WinForms.PictureBox { Left = 110, Top = 463, Width = 18, Height = 18, BackColor = Drawing.Color.Transparent };
-        var robotBitmap = new System.Drawing.Bitmap(18, 18);
-        using (var g = System.Drawing.Graphics.FromImage(robotBitmap))
+        var robotEyeColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White;
+
+        Drawing.Bitmap DrawRobotBitmap(float angleDeg)
         {
-            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
-            using (var brush = new System.Drawing.SolidBrush(dimColor))
-                g.FillRectangle(brush, 3, 5, 12, 10);
-            using (var brush = new System.Drawing.SolidBrush(_isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White))
+            var bmp = new Drawing.Bitmap(robotSize, robotSize);
+            using var g = Drawing.Graphics.FromImage(bmp);
+            g.SmoothingMode = Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            g.TranslateTransform(robotSize / 2f, robotSize / 2f);
+            g.RotateTransform(angleDeg);
+            g.TranslateTransform(-robotSize / 2f, -robotSize / 2f);
+            var scale = robotSize / 18f;
+            using (var brush = new Drawing.SolidBrush(dimColor))
+                g.FillRectangle(brush, 3 * scale, 5 * scale, 12 * scale, 10 * scale);
+            using (var brush = new Drawing.SolidBrush(robotEyeColor))
             {
-                g.FillEllipse(brush, 6, 8, 3, 3);
-                g.FillEllipse(brush, 11, 8, 3, 3);
+                g.FillEllipse(brush, 6 * scale, 8 * scale, 3 * scale, 3 * scale);
+                g.FillEllipse(brush, 11 * scale, 8 * scale, 3 * scale, 3 * scale);
             }
-            using (var pen = new System.Drawing.Pen(dimColor, 1.5f))
-                g.DrawLine(pen, 9, 2, 9, 5);
-            using (var brush = new System.Drawing.SolidBrush(dimColor))
-                g.FillEllipse(brush, 7, 0, 4, 4);
+            using (var pen = new Drawing.Pen(dimColor, 1.5f * scale))
+                g.DrawLine(pen, 9 * scale, 2 * scale, 9 * scale, 5 * scale);
+            using (var brush = new Drawing.SolidBrush(dimColor))
+                g.FillEllipse(brush, 7 * scale, 0, 4 * scale, 4 * scale);
+            return bmp;
         }
-        robotIcon.Image = robotBitmap;
+
+        var robotIcon = new WinForms.PictureBox
+        {
+            Left = 0,
+            Top = 2,
+            Width = robotSize,
+            Height = robotSize,
+            BackColor = Drawing.Color.Transparent,
+            Cursor = WinForms.Cursors.Hand,
+            Image = DrawRobotBitmap(0f)
+        };
+
+        // Hidden easter egg: click the robot for a spin + a random message; every 5th click throws confetti.
+        var robotRng = new Random();
+        var robotClickCount = 0;
+        var robotMessages = new (string Emoji, string Text)[]
+        {
+            ("🤖", "Beep boop! You found me!"),
+            ("☕", "Powered by coffee & Copilot"),
+            ("🎉", "Shhh… it's a secret!"),
+            ("🚀", "To the moon and back!"),
+            ("🐛", "No bugs here (probably)"),
+            ("✨", "You have curious hands!"),
+            ("🎯", "Bullseye! Nice click!"),
+            ("🧠", "Beep... calculating awesomeness"),
+            ("🍪", "Here, have a virtual cookie!"),
+            ("🌈", "You just found a bit of magic"),
+            ("🔋", "Recharging... beep beep!"),
+            ("🎈", "Pop! Another secret found")
+        };
+        WinForms.Panel? robotBubble = null;
+        WinForms.Timer? robotBubbleTimer = null;
+
+        // Emoji glyphs need the dedicated emoji font; mixing them into a plain "Segoe UI"
+        // string leaves them as blank squares, so the icon and text are separate labels.
+        void ShowRobotBubble(string emoji, string text)
+        {
+            robotBubbleTimer?.Stop();
+            robotBubbleTimer?.Dispose();
+            robotBubble?.Dispose();
+
+            var emojiFont = new Drawing.Font("Segoe UI Emoji", 12f);
+            var textFont = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Regular);
+            var emojiWidth = WinForms.TextRenderer.MeasureText(emoji, emojiFont).Width + 4;
+            var textWidth = WinForms.TextRenderer.MeasureText(text, textFont).Width + 4;
+            var rowWidth = Math.Min(sectionWidth, emojiWidth + textWidth);
+
+            robotBubble = new WinForms.Panel
+            {
+                Left = creditRow.Left + (creditRow.Width - rowWidth) / 2,
+                Top = creditRow.Top - 24,
+                Width = rowWidth,
+                Height = 22,
+                BackColor = Drawing.Color.Transparent
+            };
+
+            var emojiLbl = new WinForms.Label
+            {
+                Left = 0,
+                Top = 0,
+                Width = emojiWidth,
+                Height = 22,
+                Text = emoji,
+                Font = emojiFont,
+                ForeColor = accentColor,
+                BackColor = Drawing.Color.Transparent,
+                TextAlign = Drawing.ContentAlignment.MiddleCenter
+            };
+            var textLbl = new WinForms.Label
+            {
+                Left = emojiWidth,
+                Top = 0,
+                Width = textWidth,
+                Height = 22,
+                Text = text,
+                Font = textFont,
+                ForeColor = accentColor,
+                BackColor = Drawing.Color.Transparent,
+                TextAlign = Drawing.ContentAlignment.MiddleLeft
+            };
+            robotBubble.Controls.AddRange(new WinForms.Control[] { emojiLbl, textLbl });
+            card.Controls.Add(robotBubble);
+            robotBubble.BringToFront();
+
+            robotBubbleTimer = new WinForms.Timer { Interval = 1700 };
+            robotBubbleTimer.Tick += (_, _) =>
+            {
+                robotBubbleTimer?.Stop();
+                robotBubbleTimer?.Dispose();
+                robotBubbleTimer = null;
+                robotBubble?.Dispose();
+                robotBubble = null;
+            };
+            robotBubbleTimer.Start();
+        }
+
+        void SpinRobot()
+        {
+            var step = 0;
+            const int totalSteps = 16;
+            var spinTimer = new WinForms.Timer { Interval = 25 };
+            spinTimer.Tick += (_, _) =>
+            {
+                step++;
+                var oldImage = robotIcon.Image;
+                robotIcon.Image = DrawRobotBitmap(step * (720f / totalSteps) % 360);
+                oldImage?.Dispose();
+                if (step >= totalSteps)
+                {
+                    spinTimer.Stop();
+                    spinTimer.Dispose();
+                }
+            };
+            spinTimer.Start();
+        }
+
+        var authorBigFont = new Drawing.Font(authorOriginalFont.FontFamily, authorOriginalFont.Size + 7, Drawing.FontStyle.Bold);
+
+        Drawing.Bitmap DrawCoinBitmap(int size)
+        {
+            var bmp = new Drawing.Bitmap(size, size);
+            using var g = Drawing.Graphics.FromImage(bmp);
+            g.SmoothingMode = Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using (var fill = new Drawing.Drawing2D.LinearGradientBrush(
+                new Drawing.Rectangle(0, 0, size, size),
+                Drawing.Color.FromArgb(255, 235, 180), Drawing.Color.FromArgb(230, 170, 40), 45f))
+                g.FillEllipse(fill, 0, 0, size - 1, size - 1);
+            using (var pen = new Drawing.Pen(Drawing.Color.FromArgb(160, 110, 20), 1.2f))
+                g.DrawEllipse(pen, 0, 0, size - 1, size - 1);
+            using (var innerPen = new Drawing.Pen(Drawing.Color.FromArgb(120, 255, 255, 255), 1f))
+                g.DrawEllipse(innerPen, size * 0.22f, size * 0.22f, size * 0.56f, size * 0.56f);
+            return bmp;
+        }
+
+        // The robot throws a big burst of confetti + coins up toward the authors, who
+        // briefly grow larger while it happens.
+        void ConfettiBurst()
+        {
+            var confettiColors = new[]
+            {
+                Drawing.Color.FromArgb(255, 90, 90),
+                Drawing.Color.FromArgb(255, 170, 60),
+                Drawing.Color.FromArgb(255, 225, 60),
+                Drawing.Color.FromArgb(120, 220, 120),
+                Drawing.Color.FromArgb(90, 170, 255),
+                Drawing.Color.FromArgb(190, 120, 255)
+            };
+            var originX = creditRow.Left + robotIcon.Width / 2;
+            var originY = creditRow.Top + 4;
+
+            authorNamesLbl.Font = authorBigFont;
+
+            const int pieceCount = 28;
+            var pieces = new List<WinForms.Control>();
+            var velocities = new List<(int dx, int dy)>();
+            for (var i = 0; i < pieceCount; i++)
+            {
+                WinForms.Control piece;
+                var jitterX = robotRng.Next(-5, 6);
+                var jitterY = robotRng.Next(-4, 5);
+
+                if (i % 3 == 0)
+                {
+                    var coinSize = robotRng.Next(14, 19);
+                    piece = new WinForms.PictureBox
+                    {
+                        Width = coinSize,
+                        Height = coinSize,
+                        BackColor = Drawing.Color.Transparent,
+                        Left = originX - coinSize / 2 + jitterX,
+                        Top = originY - coinSize / 2 + jitterY,
+                        Image = DrawCoinBitmap(coinSize)
+                    };
+                }
+                else
+                {
+                    var dotSize = robotRng.Next(12, 18);
+                    piece = new WinForms.Label
+                    {
+                        AutoSize = false,
+                        Text = "●",
+                        Font = new Drawing.Font("Segoe UI", dotSize * 0.7f, Drawing.FontStyle.Bold),
+                        ForeColor = confettiColors[robotRng.Next(confettiColors.Length)],
+                        BackColor = Drawing.Color.Transparent,
+                        Width = dotSize,
+                        Height = dotSize,
+                        Left = originX - dotSize / 2 + jitterX,
+                        Top = originY - dotSize / 2 + jitterY
+                    };
+                }
+
+                card.Controls.Add(piece);
+                piece.BringToFront();
+                pieces.Add(piece);
+                velocities.Add((robotRng.Next(-8, 9), robotRng.Next(-13, -6)));
+            }
+
+            var frame = 0;
+            const int totalFrames = 50;
+            var confettiTimer = new WinForms.Timer { Interval = 28 };
+            confettiTimer.Tick += (_, _) =>
+            {
+                frame++;
+                for (var i = 0; i < pieces.Count; i++)
+                {
+                    pieces[i].Left += velocities[i].dx;
+                    pieces[i].Top += velocities[i].dy + frame / 3;
+                }
+                if (frame > totalFrames)
+                {
+                    confettiTimer.Stop();
+                    confettiTimer.Dispose();
+                    foreach (var piece in pieces)
+                    {
+                        if (piece is WinForms.PictureBox pb) pb.Image?.Dispose();
+                        piece.Dispose();
+                    }
+                    authorNamesLbl.Font = authorOriginalFont;
+                }
+            };
+            confettiTimer.Start();
+        }
+
+
+        robotIcon.Click += (_, _) =>
+        {
+            robotClickCount++;
+            SpinRobot();
+            var msg = robotMessages[robotRng.Next(robotMessages.Length)];
+            ShowRobotBubble(msg.Emoji, msg.Text);
+            if (robotClickCount % 5 == 0)
+                ConfettiBurst();
+        };
+
+        aboutDialog.FormClosed += (_, _) =>
+        {
+            robotIcon.Image?.Dispose();
+            robotBubbleTimer?.Stop();
+            robotBubbleTimer?.Dispose();
+            authorBigFont.Dispose();
+        };
 
         var copilotLabel = new WinForms.Label
         {
-            Left = 133, Top = 463, Width = 260, Height = 22,
-            Text = "Proudly vibecoded with GitHub Copilot",
-            Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Italic),
+            Left = robotSize + robotTextGap,
+            Top = (creditRowHeight - 22) / 2,
+            Width = creditTextWidth,
+            Height = 22,
+            Text = creditText,
+            Font = creditFont,
             ForeColor = dimColor,
             BackColor = Drawing.Color.Transparent,
             TextAlign = Drawing.ContentAlignment.MiddleLeft
         };
+        creditRow.Controls.AddRange(new WinForms.Control[] { robotIcon, copilotLabel });
 
-        aboutDialog.Controls.AddRange(new WinForms.Control[]
+        // Borderless window needs manual drag support via the card's empty background.
+        bool dragging = false;
+        Drawing.Point dragCursor = Drawing.Point.Empty;
+        Drawing.Point dragForm = Drawing.Point.Empty;
+        card.MouseDown += (s, e) =>
         {
-            pinIcon, titleLabel, versionLabel, pipeLbl, githubLink,
-            separator1, descriptionLabel,
-            featuresLabel, feature1, feature2, feature3, feature4, feature5,
+            dragging = true;
+            dragCursor = WinForms.Cursor.Position;
+            dragForm = aboutDialog.Location;
+        };
+        card.MouseMove += (s, e) =>
+        {
+            if (!dragging) return;
+            var diff = Drawing.Point.Subtract(WinForms.Cursor.Position, new Drawing.Size(dragCursor));
+            aboutDialog.Location = Drawing.Point.Add(dragForm, new Drawing.Size(diff));
+        };
+        card.MouseUp += (s, e) => dragging = false;
+
+        card.Controls.AddRange(new WinForms.Control[]
+        {
+            pinIcon,
+            titleLabel,
+            metaRow,
+            separator1,
+            descriptionLabel,
+            featuresLabel,
+            feature1, feature2, feature3, feature4, feature5,
             separator2,
-            authorsHeaderLbl, authorNamesLbl, licenseLink,
+            authorsHeaderLbl,
+            authorNamesLbl,
+            licenseLink,
             separator3,
-            robotIcon, copilotLabel
+            creditRow,
+            closeButton
         });
 
+        aboutDialog.Controls.Add(card);
         aboutDialog.ShowDialog();
     }
 
