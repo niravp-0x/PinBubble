@@ -2473,17 +2473,27 @@ public partial class MainWindow : Window
 
         using var dialog = new WinForms.Form
         {
-            Width = 800,
-            Height = 600,
-            FormBorderStyle = WinForms.FormBorderStyle.Sizable,
+            ClientSize = new Drawing.Size(900, 600),
+            FormBorderStyle = WinForms.FormBorderStyle.None,
             StartPosition = WinForms.FormStartPosition.CenterScreen,
             Text = "PinBubble - Edit Snippets",
             MinimizeBox = false,
             MaximizeBox = false,
             TopMost = true,
             KeyPreview = true,
-            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(38, 38, 44) : Drawing.Color.FromArgb(248, 249, 251),
             ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black
+        };
+
+        // Apply rounded corners and border
+        using (var dialogRegionPath = RoundedRectPath(new Drawing.Rectangle(0, 0, dialog.Width - 1, dialog.Height - 1), 18))
+            dialog.Region = new Drawing.Region(dialogRegionPath);
+        dialog.Paint += (_, pe) =>
+        {
+            pe.Graphics.SmoothingMode = Drawing.Drawing2D.SmoothingMode.AntiAlias;
+            using var path = RoundedRectPath(new Drawing.Rectangle(0, 0, dialog.Width - 1, dialog.Height - 1), 18);
+            using var pen = new Drawing.Pen(_isDarkTheme ? Drawing.Color.FromArgb(72, 72, 82) : Drawing.Color.FromArgb(210, 214, 220), 1f);
+            pe.Graphics.DrawPath(pen, path);
         };
 
         var isDecrypted = false;
@@ -2494,25 +2504,25 @@ public partial class MainWindow : Window
         var toolbar = new WinForms.Panel
         {
             Dock = WinForms.DockStyle.Top,
-            Height = 70,
-            BorderStyle = WinForms.BorderStyle.FixedSingle,
-            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 48) : Drawing.Color.FromArgb(240, 240, 240)
+            Height = 82,
+            BorderStyle = WinForms.BorderStyle.None,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(38, 38, 44) : Drawing.Color.FromArgb(248, 249, 251)
         };
 
         // Status indicator - LED Light
         var statusLED = new WinForms.PictureBox
         {
-            Left = 30,
-            Top = 20,
-            Width = 30,
-            Height = 30,
+            Left = 20,
+            Top = 18,
+            Width = 34,
+            Height = 34,
             BackColor = Drawing.Color.Transparent
         };
         
         // Function to draw LED with given color
         void DrawLED(Drawing.Color color)
         {
-            var ledBitmap = new System.Drawing.Bitmap(30, 30);
+            var ledBitmap = new System.Drawing.Bitmap(34, 34);
             using (var g = System.Drawing.Graphics.FromImage(ledBitmap))
             {
                 g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
@@ -2520,36 +2530,36 @@ public partial class MainWindow : Window
                 // Outer dark ring
                 using (var brush = new System.Drawing.SolidBrush(Drawing.Color.FromArgb(40, 40, 45)))
                 {
-                    g.FillEllipse(brush, 0, 0, 30, 30);
+                    g.FillEllipse(brush, 0, 0, 34, 34);
                 }
                 
                 // Main LED body
                 using (var brush = new System.Drawing.SolidBrush(color))
                 {
-                    g.FillEllipse(brush, 3, 3, 24, 24);
+                    g.FillEllipse(brush, 3, 3, 28, 28);
                 }
                 
                 // Inner glow effect
                 using (var path = new System.Drawing.Drawing2D.GraphicsPath())
                 {
-                    path.AddEllipse(6, 6, 18, 18);
+                    path.AddEllipse(6, 6, 22, 22);
                     using (var pgb = new System.Drawing.Drawing2D.PathGradientBrush(path))
                     {
-                        pgb.CenterPoint = new System.Drawing.PointF(15, 15);
+                        pgb.CenterPoint = new System.Drawing.PointF(17, 17);
                         pgb.CenterColor = Drawing.Color.FromArgb(180, 255, 255, 255);
                         pgb.SurroundColors = new[] { Drawing.Color.FromArgb(0, 255, 255, 255) };
-                        g.FillEllipse(pgb, 6, 6, 18, 18);
+                        g.FillEllipse(pgb, 6, 6, 22, 22);
                     }
                 }
                 
                 // Highlight (glossy effect)
                 using (var brush = new System.Drawing.Drawing2D.LinearGradientBrush(
-                    new System.Drawing.Rectangle(8, 8, 10, 8),
+                    new System.Drawing.Rectangle(10, 10, 12, 10),
                     Drawing.Color.FromArgb(200, 255, 255, 255),
                     Drawing.Color.FromArgb(0, 255, 255, 255),
                     45f))
                 {
-                    g.FillEllipse(brush, 8, 8, 10, 8);
+                    g.FillEllipse(brush, 10, 10, 12, 10);
                 }
             }
             statusLED.Image = ledBitmap;
@@ -2559,57 +2569,93 @@ public partial class MainWindow : Window
         DrawLED(Drawing.Color.FromArgb(0, 220, 0));
         toolbar.Controls.Add(statusLED);
 
+        // Title label
+        var titleLabel = new WinForms.Label
+        {
+            Left = 66,
+            Top = 14,
+            Width = 200,
+            Height = 28,
+            Text = "Manage Snippets",
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(232, 232, 238) : Drawing.Color.FromArgb(30, 32, 36),
+            Font = new Drawing.Font("Segoe UI", 12f, Drawing.FontStyle.Bold),
+            BackColor = Drawing.Color.Transparent
+        };
+        toolbar.Controls.Add(titleLabel);
+
+        // Info label
+        var infoLabel = new WinForms.Label
+        {
+            Left = 66,
+            Top = 43,
+            Width = 300,
+            Height = 22,
+            Text = "Click value or TOTP column to copy",
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(155, 155, 165) : Drawing.Color.FromArgb(95, 100, 108),
+            Font = new Drawing.Font("Segoe UI", 9f),
+            BackColor = Drawing.Color.Transparent
+        };
+        toolbar.Controls.Add(infoLabel);
+
         // Button: Decrypt All (toggle) - only visible when Control key is held
         var btnDecryptAll = new WinForms.Button
         {
             Text = "Show All",
-            Left = 80,
-            Top = 12,
-            Width = 110,
-            Height = 46,
+            Left = 450,
+            Top = 21,
+            Width = 100,
+            Height = 40,
             FlatStyle = WinForms.FlatStyle.Flat,
-            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(55, 55, 60) : Drawing.Color.White,
-            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
-            Font = new Drawing.Font("Segoe UI", 9, Drawing.FontStyle.Bold),
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(55, 55, 60) : Drawing.Color.FromArgb(240, 240, 240),
+            ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.FromArgb(40, 40, 40),
+            Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
             Cursor = WinForms.Cursors.Hand,
             Visible = false,
             Enabled = false
         };
-        btnDecryptAll.FlatAppearance.BorderColor = _isDarkTheme ? Drawing.Color.FromArgb(80, 80, 85) : Drawing.Color.Gray;
+        btnDecryptAll.FlatAppearance.BorderSize = 0;
+        btnDecryptAll.FlatAppearance.MouseOverBackColor = btnDecryptAll.BackColor;
+        btnDecryptAll.FlatAppearance.MouseDownBackColor = btnDecryptAll.BackColor;
 
         // Button: Save - only visible when changes are made
         var btnSave = new WinForms.Button
         {
             Text = "Save",
-            Left = 580,
-            Top = 12,
+            Left = 630,
+            Top = 21,
             Width = 90,
-            Height = 46,
+            Height = 40,
             FlatStyle = WinForms.FlatStyle.Flat,
-            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(0, 100, 70) : Drawing.Color.LightGreen,
-            ForeColor = _isDarkTheme ? Drawing.Color.White : Drawing.Color.Black,
-            Font = new Drawing.Font("Segoe UI", 9, Drawing.FontStyle.Bold),
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(0, 120, 80) : Drawing.Color.FromArgb(0, 145, 90),
+            ForeColor = Drawing.Color.White,
+            Font = new Drawing.Font("Segoe UI", 10f, Drawing.FontStyle.Bold),
             Cursor = WinForms.Cursors.Hand,
             DialogResult = WinForms.DialogResult.OK,
-            Visible = false
+            Visible = false,
+            TabStop = false
         };
-        btnSave.FlatAppearance.BorderColor = _isDarkTheme ? Drawing.Color.FromArgb(0, 120, 80) : Drawing.Color.DarkGreen;
+        btnSave.FlatAppearance.BorderSize = 0;
+        btnSave.FlatAppearance.MouseOverBackColor = btnSave.BackColor;
+        btnSave.FlatAppearance.MouseDownBackColor = btnSave.BackColor;
 
         // Button: Cancel
         var btnCancel = new WinForms.Button
         {
             Text = "Cancel",
-            Left = 680,
-            Top = 12,
+            Left = 750,
+            Top = 21,
             Width = 90,
-            Height = 46,
+            Height = 40,
             FlatStyle = WinForms.FlatStyle.Flat,
-            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(80, 40, 40) : Drawing.Color.LightCoral,
-            ForeColor = _isDarkTheme ? Drawing.Color.White : Drawing.Color.Black,
-            Font = new Drawing.Font("Segoe UI", 9, Drawing.FontStyle.Bold),
-            Cursor = WinForms.Cursors.Hand
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(60, 60, 68) : Drawing.Color.FromArgb(225, 226, 230),
+            ForeColor = _isDarkTheme ? Drawing.Color.White : Drawing.Color.FromArgb(40, 40, 40),
+            Font = new Drawing.Font("Segoe UI", 9f, Drawing.FontStyle.Bold),
+            Cursor = WinForms.Cursors.Hand,
+            TabStop = false
         };
-        btnCancel.FlatAppearance.BorderColor = _isDarkTheme ? Drawing.Color.FromArgb(100, 50, 50) : Drawing.Color.DarkRed;
+        btnCancel.FlatAppearance.BorderSize = 0;
+        btnCancel.FlatAppearance.MouseOverBackColor = btnCancel.BackColor;
+        btnCancel.FlatAppearance.MouseDownBackColor = btnCancel.BackColor;
 
         toolbar.Controls.Add(btnDecryptAll);
         toolbar.Controls.Add(btnSave);
@@ -2618,13 +2664,24 @@ public partial class MainWindow : Window
         // Parse snippets from JSON (or legacy comma-delimited format)
         var snippetRows = ParseSnippets(plaintext);
 
+        // Create DataGridView with wrapper panel for border
+        var gridFrame = new WinForms.Panel
+        {
+            BorderStyle = WinForms.BorderStyle.FixedSingle,
+            BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White,
+            Location = new Drawing.Point(20, 82),
+            Size = new Drawing.Size(900 - 40, 600 - 102),
+            Anchor = WinForms.AnchorStyles.Top | WinForms.AnchorStyles.Bottom | WinForms.AnchorStyles.Left | WinForms.AnchorStyles.Right
+        };
+        gridFrame.Padding = new WinForms.Padding(1);
+
         // Create DataGridView
         var grid = new WinForms.DataGridView
         {
             Dock = WinForms.DockStyle.Fill,
             BackgroundColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White,
             ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black,
-            GridColor = _isDarkTheme ? Drawing.Color.FromArgb(60, 60, 65) : Drawing.Color.Gray,
+            GridColor = _isDarkTheme ? Drawing.Color.FromArgb(60, 60, 65) : Drawing.Color.FromArgb(200, 200, 200),
             BorderStyle = WinForms.BorderStyle.None,
             AllowUserToResizeRows = false,
             AllowUserToAddRows = true,
@@ -2640,7 +2697,7 @@ public partial class MainWindow : Window
 
         // Style the grid
         grid.ColumnHeadersDefaultCellStyle.BackColor = _isDarkTheme ? Drawing.Color.FromArgb(45, 45, 48) : Drawing.Color.FromArgb(240, 240, 240);
-        grid.ColumnHeadersDefaultCellStyle.ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black;
+        grid.ColumnHeadersDefaultCellStyle.ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.FromArgb(40, 40, 40);
         grid.EnableHeadersVisualStyles = false;
         grid.DefaultCellStyle.BackColor = _isDarkTheme ? Drawing.Color.FromArgb(30, 30, 35) : Drawing.Color.White;
         grid.DefaultCellStyle.ForeColor = _isDarkTheme ? Drawing.Color.FromArgb(220, 220, 225) : Drawing.Color.Black;
@@ -4017,8 +4074,45 @@ public partial class MainWindow : Window
             }
         };
 
-        dialog.Controls.Add(grid);
+        // Enable window dragging from toolbar
+        bool dragging = false;
+        Drawing.Point dragCursor = Drawing.Point.Empty;
+        Drawing.Point dragDialog = Drawing.Point.Empty;
+        toolbar.MouseDown += (_, mouseArgs) =>
+        {
+            if (mouseArgs.Button != WinForms.MouseButtons.Left) return;
+            dragging = true;
+            dragCursor = WinForms.Cursor.Position;
+            dragDialog = dialog.Location;
+        };
+        toolbar.MouseMove += (_, _) =>
+        {
+            if (!dragging) return;
+            var diff = Drawing.Point.Subtract(WinForms.Cursor.Position, new Drawing.Size(dragCursor));
+            dialog.Location = Drawing.Point.Add(dragDialog, new Drawing.Size(diff));
+        };
+        toolbar.MouseUp += (_, _) => dragging = false;
+        foreach (var dragTarget in new WinForms.Control[] { statusLED, titleLabel, infoLabel })
+        {
+            dragTarget.MouseDown += (_, mouseArgs) =>
+            {
+                if (mouseArgs.Button != WinForms.MouseButtons.Left) return;
+                dragging = true;
+                dragCursor = WinForms.Cursor.Position;
+                dragDialog = dialog.Location;
+            };
+            dragTarget.MouseMove += (_, _) =>
+            {
+                if (!dragging) return;
+                var diff = Drawing.Point.Subtract(WinForms.Cursor.Position, new Drawing.Size(dragCursor));
+                dialog.Location = Drawing.Point.Add(dragDialog, new Drawing.Size(diff));
+            };
+            dragTarget.MouseUp += (_, _) => dragging = false;
+        }
+
+        gridFrame.Controls.Add(grid);
         dialog.Controls.Add(toolbar);
+        dialog.Controls.Add(gridFrame);
         dialog.AcceptButton = btnSave;
 
         // Add a timer to refresh TOTP display every second
